@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hestia — TUI design spec</title>
+<style>
+  :root {
+    /* github-dark-default — hunk's default theme */
+    --bg: #0d1117;
+    --term: #010409;
+    --panel: #161b22;
+    --panel2: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #c9d1d9;
+    --muted: #8b949e;
+    --faint: #6e7681;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --orange: #ffa657;
+    --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.65 -apple-system, "Inter", system-ui, sans-serif; padding: 48px 24px 96px; }
+  main { max-width: 980px; margin: 0 auto; }
+  h1 { font-family: var(--mono); font-size: 28px; margin: 0 0 4px; }
+  .tagline { color: var(--muted); margin: 0 0 40px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 2px; color: var(--accent); font-family: var(--mono); margin: 56px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  p { margin: 0 0 14px; }
+  code { font-family: var(--mono); font-size: .88em; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 12px 0 20px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  td:first-child { white-space: nowrap; font-family: var(--mono); color: var(--accent); }
+  .caption { color: var(--muted); font-size: 13px; text-align: center; margin: 8px 0 0; }
+
+  /* ───────── terminal chrome ───────── */
+  .term {
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+    background: var(--term); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; margin: 20px 0 6px; box-shadow: 0 16px 48px rgba(0,0,0,.55);
+  }
+  .titlebar { background: var(--panel2); padding: 7px 14px; color: var(--muted); display: flex; gap: 8px; align-items: center; font-size: 12px; border-bottom: 1px solid var(--border); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+  .menubar { display: flex; gap: 0; background: rgba(255,255,255,.02); border-bottom: 1px solid var(--border); padding: 3px 8px; color: var(--muted); font-size: 12px; }
+  .menubar span { padding: 1px 10px; }
+  .menubar span.open { background: rgba(88,166,255,.15); color: var(--text); border-radius: 3px; }
+  .menubar span u { text-decoration: underline; text-underline-offset: 2px; }
+  .cols { display: flex; min-height: 430px; }
+  .sidebar { width: 262px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 8px 0; background: rgba(255,255,255,.015); display: flex; flex-direction: column; }
+  .hd { color: var(--faint); font-size: 10.5px; letter-spacing: 1.5px; padding: 4px 14px 5px; text-transform: uppercase; }
+  .row { padding: 2px 14px; white-space: pre; color: var(--dim); overflow: hidden; }
+  .row.sel { background: rgba(88,166,255,.15); border-left: 2px solid var(--accent); padding-left: 12px; }
+  .main { flex: 1; padding: 8px 0; display: flex; flex-direction: column; min-width: 0; }
+  .svc-row { padding: 2px 16px; white-space: pre; color: var(--dim); }
+  .svc-row.sel { background: rgba(88,166,255,.12); }
+  .logs { margin: 6px 12px 2px; border-top: 1px dashed var(--border); padding: 7px 6px 2px; color: var(--muted); white-space: pre; overflow: hidden; flex: 1; font-size: 12px; }
+  .statusbar { background: var(--panel2); border-top: 1px solid var(--border); padding: 5px 14px; display: flex; gap: 16px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .key { color: var(--text); background: var(--border); border-radius: 3px; padding: 0 5px; margin-right: 5px; font-size: 11px; }
+  .up { color: var(--green); } .warn { color: var(--yellow); } .bad { color: var(--red); }
+  .qd { color: var(--purple); } .off { color: var(--faint); } .acc { color: var(--accent); }
+  .org { color: var(--orange); } .dm { color: var(--faint); }
+  .b-docker { color: var(--accent); } .b-proc { color: var(--purple); } .b-tun { color: var(--orange); }
+  .badge { border-radius: 3px; padding: 0 5px; font-size: 10.5px; }
+  .badge.pub { background: rgba(255,166,87,.16); color: var(--orange); border: 1px solid rgba(255,166,87,.4); }
+  .badge.agent { background: rgba(188,140,255,.14); color: var(--purple); border: 1px solid rgba(188,140,255,.4); }
+
+  /* modal overlay mock */
+  .overlay-wrap { position: relative; }
+  .modal {
+    position: absolute; top: 46px; left: 50%; transform: translateX(-50%);
+    width: 560px; max-width: 92%; background: var(--term);
+    border: 1px solid var(--accent); border-radius: 8px;
+    box-shadow: 0 24px 64px rgba(0,0,0,.75); padding: 10px 0 12px; z-index: 2;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .modal .mtitle { text-align: center; color: var(--accent); padding: 2px 0 8px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+  .modal .row { padding: 2px 18px; }
+  .dimmed { opacity: .35; filter: saturate(.6); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 28px; margin: 12px 0 20px; }
+  .prim { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 13px 16px; }
+  .prim h4 { margin: 0 0 5px; font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .prim p { font-size: 13px; color: var(--muted); margin: 0; }
+  .prim .keys { margin-top: 7px; font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+  .prim .keys b { color: var(--accent); font-weight: 600; }
+  footer { margin-top: 64px; color: var(--muted); font-size: 12.5px; font-family: var(--mono); border-top: 1px solid var(--border); padding-top: 16px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } .sidebar { width: 200px; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>hestia · TUI design spec</h1>
+<p class="tagline">Agents drive everything through the CLI; the TUI is the human's live window onto the same session state — hunk's exact model. Primitive-first, keyboard-first, one stream.</p>
+
+<h2>Design stance (what we take from hunk)</h2>
+<p>Hunk's TUI works because it is a <em>projection of primitives</em>, not a dashboard: one navigable stream (files → hunks → comments), paired prev/next keys per primitive level (<code>, .</code> files, <code>[ ]</code> hunks, <code>{ }</code> comments), single-letter toggles, layout modes <code>1/2/0</code> (split/stack/auto), a menu bar for mouse users, and — critically — <strong>every TUI action has a CLI twin operating on the same live session</strong>, so agent actions appear in the UI the moment they happen. Hestia adopts all five rules. The TUI never has a capability the CLI lacks, and vice versa.</p>
+
+<h2>Primitives</h2>
+<div class="grid2">
+  <div class="prim"><h4>stack</h4><p>One worktree's whole environment. Identity = branch. Holds a slot (or a queue position). States: queued · starting · up · degraded · stopped.</p><div class="keys"><b>, / .</b> prev / next stack &nbsp; <b>u / d</b> up / down &nbsp; <b>Enter</b> focus</div></div>
+  <div class="prim"><h4>service</h4><p>A unit inside a stack, tagged by backend: <span class="b-docker">docker</span> · <span class="b-proc">proc</span> (wrangler, vite) · <span class="b-tun">tunnel</span>. Has health, endpoint, resources.</p><div class="keys"><b>[ / ]</b> prev / next service &nbsp; <b>R</b> restart &nbsp; <b>s</b> shell &nbsp; <b>l</b> focus logs</div></div>
+  <div class="prim"><h4>endpoint</h4><p>How you reach a service: named URL (<code>web.salem.modem.localhost</code>), public URL (via hestiad's tunnel), or TCP port + injected env (<code>DATABASE_URL</code>).</p><div class="keys"><b>o</b> open in browser &nbsp; <b>y</b> yank URL &nbsp; <b>Y</b> yank env block &nbsp; <b>t</b> expose / unexpose public</div></div>
+  <div class="prim"><h4>event</h4><p>An inbound callback at the canonical URL, journaled with its routing decision (matched / affinity / broadcast / primary). Replayable into any stack.</p><div class="keys"><b>{ / }</b> prev / next event &nbsp; <b>e</b> events view &nbsp; <b>r</b> replay to selected stack</div></div>
+  <div class="prim"><h4>slot</h4><p>A concurrency lease — 5 in v1. The queue is visible, ordered, and steerable; a stack without a slot renders exactly where it will run next.</p><div class="keys"><b>+ / -</b> reprioritize queued stack &nbsp; <b>K</b> revoke slot (with confirm)</div></div>
+  <div class="prim"><h4>log line</h4><p>Attributed to stack + service + actor (human or agent). One merged, filterable stream — per stack or fleet-wide.</p><div class="keys"><b>/</b> filter &nbsp; <b>f</b> follow &nbsp; <b>L</b> fleet-wide log mode &nbsp; <b>g / G</b> top / bottom</div></div>
+</div>
+
+<h2>Screen 1 · Fleet — the default view</h2>
+<div class="term">
+  <div class="titlebar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span style="margin-left:8px">hestia — modem</span></div>
+  <div class="menubar"><span><u>F</u>leet</span><span><u>S</u>tacks</span><span><u>E</u>vents</span><span><u>V</u>iew</span><span><u>H</u>elp</span></div>
+  <div class="cols">
+    <div class="sidebar">
+      <div class="hd">Stacks · 4/5 slots</div>
+      <div class="row"><span class="up">●</span> main          <span class="dm">4 svc  ·  you</span></div>
+      <div class="row sel"><span class="up">●</span> <span class="warn">salem</span>         <span class="dm">5 svc</span>  <span class="badge agent">agent</span></div>
+      <div class="row"><span class="up">●</span> feat-auth     <span class="dm">4 svc</span>  <span class="badge agent">agent</span></div>
+      <div class="row"><span class="bad">◆</span> fix-search    <span class="bad">api crashlooping</span></div>
+      <div class="row"><span class="qd">◌</span> agent-wt-5    <span class="qd">queued #1 · ~40s</span></div>
+      <div class="row"><span class="off">○</span> agent-wt-6    <span class="off">stopped 2h</span></div>
+      <div class="hd" style="margin-top:8px">Canonical ingress</div>
+      <div class="row"><span class="org">⛅</span> tri <span class="dm">tunnel · 1 connector</span> <span class="up">✔</span></div>
+      <div class="row"><span class="dm">  *.dev.modem.dev → hestiad</span></div>
+      <div class="hd" style="margin-top:8px">Events · last 10m</div>
+      <div class="row"><span class="dm">stripe ×4 · github ×2 · <span class="qd">1 broadcast</span></span></div>
+    </div>
+    <div class="main">
+      <div class="hd">salem · up 12m · slot 2 · worktree ~/conductor/workspaces/hestia/salem</div>
+      <div class="svc-row">    NAME      BACKEND   ENDPOINT                        HEALTH     RES</div>
+      <div class="svc-row"><span class="up">  ● </span>web       <span class="b-proc">proc</span>      web.salem.modem.localhost       <span class="up">healthy</span>    <span class="dm">vite · :4121</span></div>
+      <div class="svc-row sel"><span class="up">▸ ● </span>api       <span class="b-proc">proc</span>      api.salem.modem.localhost <span class="badge pub">pub</span>   <span class="up">healthy</span>    <span class="dm">wrangler · reg private</span></div>
+      <div class="svc-row"><span class="up">  ● </span>postgres  <span class="b-docker">docker</span>    tcp :41203 → DATABASE_URL       <span class="up">healthy</span>    <span class="dm">156MB</span></div>
+      <div class="svc-row"><span class="up">  ● </span>redis     <span class="b-docker">docker</span>    internal → REDIS_URL            <span class="up">healthy</span>    <span class="dm">12MB</span></div>
+      <div class="svc-row"><span class="org">  ⛅ </span>expose    <span class="b-tun">tunnel</span>    salem.dev.modem.dev             <span class="up">routed</span>     <span class="dm">via tri · hestiad</span></div>
+      <div class="logs"><span class="dm">─ logs · api · following ────────────────────────────────────────────</span>
+<span class="dm">12:04:31</span> <span class="qd">api</span> │ Ready on http://127.0.0.1:4123 <span class="dm">(inspector :9241)</span>
+<span class="dm">12:04:33</span> <span class="qd">api</span> │ D1 migrations: 42 applied <span class="up">✔</span>
+<span class="dm">12:05:02</span> <span class="qd">api</span> │ GET /health 200 2ms
+<span class="dm">12:05:19</span> <span class="acc">hestiad</span> │ event stripe:checkout.completed → <span class="warn">salem</span> <span class="dm">(payload match)</span>
+<span class="dm">12:05:19</span> <span class="qd">api</span> │ POST /webhooks/stripe 200 41ms
+<span class="dm">12:06:07</span> <span class="acc">hestiad</span> │ <span class="badge agent">agent</span> claude/salem: hestia status --json <span class="dm">(cli)</span></div>
+      <div class="statusbar">
+        <span><span class="key">, .</span>stack</span>
+        <span><span class="key">[ ]</span>svc</span>
+        <span><span class="key">u d</span>up/down</span>
+        <span><span class="key">s</span>shell</span>
+        <span><span class="key">o</span>open</span>
+        <span><span class="key">y</span>yank</span>
+        <span><span class="key">e</span>events</span>
+        <span><span class="key">?</span>help</span>
+        <span style="margin-left:auto"><span class="up">4/5</span> · <span class="qd">1 queued</span> · <span class="org">⛅ tri</span> · <span class="up">daemon ok</span></span>
+      </div>
+    </div>
+  </div>
+</div>
+<p class="caption">Default split layout (auto-collapses to stacked under ~110 cols, hunk-style <code>1/2/0</code>). Sidebar = stack list with slots, queue ETA, and actor badges; main = selected stack's services + focused log tail. The hestiad log lines show agent CLI activity live — the hunk trick.</p>
+
+<h2>Screen 2 · Events — the callback journal</h2>
+<div class="term">
+  <div class="titlebar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span style="margin-left:8px">hestia — modem · events</span></div>
+  <div class="menubar"><span><u>F</u>leet</span><span><u>S</u>tacks</span><span class="open"><u>E</u>vents</span><span><u>V</u>iew</span><span><u>H</u>elp</span></div>
+  <div class="cols" style="min-height:340px">
+    <div class="main">
+      <div class="hd">inbound @ *.dev.modem.dev · journal (2h retained) · filter: <span class="acc">all</span></div>
+      <div class="svc-row">    TIME      PROVIDER   EVENT                        ROUTED TO      VIA                STATUS</div>
+      <div class="svc-row"><span class="up">  ● </span><span class="dm">12:05:19</span>  stripe     checkout.session.completed   <span class="warn">salem</span>          payload match      <span class="up">200</span></div>
+      <div class="svc-row sel"><span class="up">▸ ● </span><span class="dm">12:03:44</span>  github     pull_request.synchronize     <span class="warn">feat-auth</span>      branch in payload  <span class="up">200</span></div>
+      <div class="svc-row"><span class="qd">  ◈ </span><span class="dm">12:01:12</span>  stripe     invoice.payment_failed       <span class="qd">broadcast ×4</span>   no match           <span class="up">200</span> <span class="dm">(primary)</span></div>
+      <div class="svc-row"><span class="up">  ● </span><span class="dm">11:58:03</span>  google     oauth callback               <span class="warn">salem</span>          affinity cookie    <span class="up">302</span></div>
+      <div class="svc-row"><span class="bad">  ● </span><span class="dm">11:54:40</span>  stripe     charge.refunded              <span class="warn">fix-search</span>     payload match      <span class="bad">500</span> <span class="dm">· r to replay</span></div>
+      <div class="logs"><span class="dm">─ selected · github pull_request.synchronize ─────────────────────────</span>
+<span class="dm">delivery</span>  X-GitHub-Delivery: 72c1a9e0-…   <span class="dm">sig verified ✔</span>
+<span class="dm">routing</span>   payload.pull_request.head.ref = "feat-auth" → stack feat-auth
+<span class="dm">actions</span>   <span class="acc">r</span> replay to selected stack · <span class="acc">Shift+R</span> replay to all · <span class="acc">y</span> yank curl</div>
+      <div class="statusbar">
+        <span><span class="key">{ }</span>event</span>
+        <span><span class="key">r</span>replay</span>
+        <span><span class="key">/</span>filter</span>
+        <span><span class="key">Esc</span>back</span>
+        <span style="margin-left:auto"><span class="dm">6 events · 1 broadcast · 1 failed</span></span>
+      </div>
+    </div>
+  </div>
+</div>
+<p class="caption">The event primitive made visible: every callback that hit the canonical URL, the routing decision hestiad made, and one-key replay — the same journal agents query with <code>hestia events list --json</code> / <code>replay</code>.</p>
+
+<h2>Screen 3 · Modals — queue &amp; doctor (hunk's ModalFrame pattern)</h2>
+<div class="overlay-wrap">
+  <div class="term dimmed" style="min-height:0">
+    <div class="titlebar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span style="margin-left:8px">hestia — modem</span></div>
+    <div class="cols" style="min-height:300px">
+      <div class="sidebar"><div class="hd">Stacks · 5/5 slots</div>
+        <div class="row"><span class="up">●</span> main</div><div class="row"><span class="up">●</span> salem</div><div class="row"><span class="up">●</span> feat-auth</div><div class="row"><span class="up">●</span> fix-search</div><div class="row"><span class="up">●</span> perf-idx</div>
+        <div class="row"><span class="qd">◌</span> agent-wt-5 <span class="qd">queued #1</span></div><div class="row"><span class="qd">◌</span> agent-wt-6 <span class="qd">queued #2</span></div>
+      </div>
+      <div class="main"><div class="hd">…</div></div>
+    </div>
+  </div>
+  <div class="modal">
+    <div class="mtitle">Slots — 5/5 in use, 2 queued</div>
+    <div class="row"><span class="dm"> SLOT  STACK        HELD    IDLE    ACTOR</span></div>
+    <div class="row">  1    main         3h12m   <span class="dm">4m</span>     you</div>
+    <div class="row">  2    salem        12m     <span class="up">live</span>   <span class="qd">claude/salem</span></div>
+    <div class="row">  3    feat-auth    41m     <span class="up">live</span>   <span class="qd">claude/feat-auth</span></div>
+    <div class="row">  4    fix-search   1h02m   <span class="warn">22m</span>    <span class="qd">codex/fix-search</span></div>
+    <div class="row">  5    perf-idx     2h55m   <span class="bad">1h48m</span>  <span class="qd">claude/perf-idx</span> <span class="dm">← reap candidate</span></div>
+    <div class="row"><span class="dm"> ────────────────────────────────────────────</span></div>
+    <div class="row">  <span class="qd">#1</span>   agent-wt-5   <span class="dm">waiting 38s · ETA on slot 5 idle-reap (2m)</span></div>
+    <div class="row">  <span class="qd">#2</span>   agent-wt-6   <span class="dm">waiting 12s</span></div>
+    <div class="row" style="margin-top:6px"><span class="dm">  <span class="acc">K</span> revoke slot · <span class="acc">+/-</span> reorder queue · <span class="acc">Esc</span> close</span></div>
+  </div>
+</div>
+<p class="caption">The slot modal: who holds what, idle times, reap candidates, and the queue with ETAs. <code>hestia doctor</code> renders in the same ModalFrame: a checklist of hardcoded ports/URLs found in source, compose/wrangler config status, per-item fix hints.</p>
+
+<h2>CLI ↔ TUI parity (the hunk rule)</h2>
+<table>
+  <tr><th>Agent runs (CLI)</th><th>Human sees / does (TUI)</th></tr>
+  <tr><td>hestia up --json</td><td>Stack flips <span class="qd">◌ queued</span> → <span class="up">● up</span> in the sidebar; slot count ticks; <code>u</code> on a selected stack does the identical thing.</td></tr>
+  <tr><td>hestia status --json</td><td>The fleet screen <em>is</em> this projection, live over the broker websocket.</td></tr>
+  <tr><td>hestia endpoint list --json</td><td>Endpoint column; <code>o</code> opens, <code>y</code>/<code>Y</code> yanks URL / full env block.</td></tr>
+  <tr><td>hestia expose / unexpose</td><td><span class="badge pub">pub</span> badge appears on the service row + ingress entry in sidebar; <code>t</code> toggles.</td></tr>
+  <tr><td>hestia events replay --to salem</td><td>Event row flashes in Events view with a new delivery record; <code>r</code> is the same call.</td></tr>
+  <tr><td>hestia logs -f api</td><td>The focused log pane; <code>L</code> widens to fleet-wide merged stream.</td></tr>
+  <tr><td>hestia down / gc</td><td><code>d</code> / <code>x</code>; reaper events narrate in the hestiad log line stream.</td></tr>
+</table>
+
+<h2>Full keymap</h2>
+<table>
+  <tr><th>Group</th><th>Keys</th></tr>
+  <tr><td>navigate</td><td><code>, / .</code> stack · <code>[ / ]</code> service · <code>{ / }</code> event · <code>↑↓</code> rows/scroll · <code>g / G</code> top/bottom · <code>/</code> filter · <code>Tab</code> cycle panes · mouse wheel + click throughout</td></tr>
+  <tr><td>act</td><td><code>u / d</code> up/down stack · <code>R</code> restart service · <code>s</code> shell into service · <code>o</code> open endpoint · <code>y / Y</code> yank URL / env · <code>t</code> expose/unexpose · <code>r</code> replay event · <code>x</code> gc stale · <code>K</code> revoke slot</td></tr>
+  <tr><td>view</td><td><code>1 / 2 / 0</code> split / stack / auto · <code>e</code> events · <code>L</code> fleet logs · <code>f</code> follow · <code>D</code> doctor · <code>m</code> menu bar · <code>?</code> help · <code>q</code> quit</td></tr>
+</table>
+
+<h2>Deliberately not in the TUI</h2>
+<p>One theme: <strong>github-dark-default</strong> (hunk's default), no theme selector in v1 — the palette above <em>is</em> the spec. No editing of <code>hestia.yml</code> in-app, no metrics dashboards, no container inspector (that's lazydocker's job — <code>s</code> drops you into a shell instead), no multi-repo view in v1. Hunk stays sharp by refusing to become a git client; hestia stays sharp by refusing to become Docker Desktop. The TUI answers exactly three questions: <strong>what's running, how do I reach it, and what just happened</strong> — everything else is one keypress into a shell or one CLI call away.</p>
+
+<footer>hestia TUI spec · primitives &amp; chrome patterned on modem-dev/hunk (OpenTUI: MenuBar/StatusBar/ModalFrame/SidebarPane + stream navigation) · 2026-07-09</footer>
+</main>
+</body>
+</html>
