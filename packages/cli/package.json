@@ -1,0 +1,11 @@
+{
+  "name": "@hestia/cli",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "bin": { "hestia": "./src/index.ts" },
+  "dependencies": {
+    "@hestia/core": "workspace:*",
+    "@hestia/engine": "workspace:*"
+  }
+}

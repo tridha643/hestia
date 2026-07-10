@@ -1,0 +1,4 @@
+node_modules/
+.hestia/
+*.log
+.DS_Store

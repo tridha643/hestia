@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# hestia CLI launcher — runs the TypeScript CLI entrypoint with Bun.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bun run "$HERE/../packages/cli/src/index.ts" "$@"
