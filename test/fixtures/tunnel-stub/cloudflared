@@ -1,0 +1,86 @@
+#!/usr/bin/env bun
+/**
+ * Stub cloudflared for the no-network tunnel e2e. Honors exactly the surface
+ * hestia drives, records every invocation into $HESTIA_STUB_STATE, and serves
+ * a real /ready + /quicktunnel metrics endpoint so the shipped ownership +
+ * readiness machinery runs unmodified.
+ *
+ *   tunnel list -o json            → cat $HESTIA_STUB_STATE/tunnels.json
+ *   tunnel route dns [...]         → append argv to route.log; conflict if the
+ *                                    hostname is listed in dns-existing.json
+ *                                    and --overwrite-dns was not passed
+ *   tunnel ... run <uuid>          → connector: bind --metrics, /ready 200
+ *   tunnel ... --url <origin>      → quick connector: /quicktunnel has a URL
+ */
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const state = process.env.HESTIA_STUB_STATE;
+if (!state) {
+  console.error("stub cloudflared: HESTIA_STUB_STATE not set");
+  process.exit(64);
+}
+const args = process.argv.slice(2);
+
+function readJson(file: string, fallback: unknown): unknown {
+  const p = join(state!, file);
+  if (!existsSync(p)) return fallback;
+  return JSON.parse(readFileSync(p, "utf8"));
+}
+
+if (args[0] !== "tunnel") {
+  console.error(`stub cloudflared: unsupported command ${args.join(" ")}`);
+  process.exit(64);
+}
+
+if (args.includes("list")) {
+  process.stdout.write(JSON.stringify(readJson("tunnels.json", [])) + "\n");
+  process.exit(0);
+}
+
+if (args.includes("route")) {
+  appendFileSync(join(state, "route.log"), JSON.stringify(args) + "\n");
+  const hostname = args[args.length - 1]!;
+  const existing = readJson("dns-existing.json", []) as string[];
+  if (existing.includes(hostname) && !args.includes("--overwrite-dns")) {
+    console.error(
+      `Failed to add route: code: 1003, reason: An A, AAAA, or CNAME record with that host already exists.`,
+    );
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+const isRun = args.includes("run");
+const isQuick = args.includes("--url");
+if (isRun || isQuick) {
+  const mi = args.indexOf("--metrics");
+  const addr = mi >= 0 ? args[mi + 1]! : "127.0.0.1:0";
+  const [host, portStr] = addr.split(":") as [string, string];
+  appendFileSync(join(state, "run.log"), JSON.stringify(args) + "\n");
+  const quickHost = isQuick
+    ? `stub-${Math.random().toString(36).slice(2, 10)}.trycloudflare.com`
+    : "";
+  Bun.serve({
+    hostname: host,
+    port: Number(portStr),
+    fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (path === "/ready") {
+        return Response.json({
+          status: 200,
+          readyConnections: 1,
+          connectorId: "00000000-0000-0000-0000-000000000000",
+        });
+      }
+      if (path === "/quicktunnel") return Response.json({ hostname: quickHost });
+      if (path === "/healthcheck") return new Response("OK\n");
+      return new Response("not found", { status: 404 });
+    },
+  });
+  // connector runs until signaled, like the real thing
+  setInterval(() => {}, 60_000);
+} else {
+  console.error(`stub cloudflared: unsupported tunnel invocation ${args.join(" ")}`);
+  process.exit(64);
+}

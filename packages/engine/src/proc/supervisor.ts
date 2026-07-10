@@ -155,6 +155,7 @@ export async function startProc(
       inspectorPort: spec.inspectorPort,
       logPath,
       configPath: spec.configPath,
+      originService: spec.originService,
     };
 
     switch (outcome.kind) {

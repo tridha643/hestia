@@ -27,6 +27,12 @@ export interface Endpoint {
    * Present from day one so consumers can key on it before the proxy exists.
    */
   reservedName?: string;
+  /**
+   * Public URL once the service is exposed through a cloudflare tunnel
+   * (named: https://<hostname>; quick: the *.trycloudflare.com URL).
+   * Enriches the existing endpoint entry — never a second same-name entry.
+   */
+  publicUrl?: string;
 }
 
 export interface ServiceRecord {
@@ -50,6 +56,8 @@ export interface ServiceRecord {
   logPath?: string;
   /** wrangler backend: the wrangler config this worker was started from. */
   configPath?: string;
+  /** tunnel backend (quick mode): the stack service this tunnel fronts. */
+  originService?: string;
 }
 
 /** Spec for a supervised host process (`hestia run` / the wrangler adapter). */
@@ -69,10 +77,37 @@ export interface ProcSpec {
   readyTimeoutMs?: number;
   /** Prefix the spawn with the repo's varlock resolver (composition, not integration). */
   varlock?: boolean;
-  backend?: "proc" | "wrangler";
+  backend?: "proc" | "wrangler" | "tunnel";
   /** wrangler backend metadata carried into the ServiceRecord. */
   inspectorPort?: number;
   configPath?: string;
+  /** tunnel backend (quick mode): the stack service this tunnel fronts. */
+  originService?: string;
+}
+
+/** One public hostname → local origin rule owned by a stack (named mode). */
+export interface TunnelExposure {
+  /** Stack service this rule fronts. */
+  service: string;
+  /** Single-label public hostname under the zone, e.g. tri-salem-slack.modem.codes. */
+  hostname: string;
+  /** Origin port the rule pointed at when last generated — rotation detector. */
+  originPort: number;
+  /** Forward the public hostname as Host instead of rewriting to the origin. */
+  keepHostHeader?: boolean;
+}
+
+/**
+ * A stack's adoption of the (machine-global) named tunnel. The tunnel itself
+ * is never created or deleted by hestia — it adopts an existing one by name,
+ * and every mutating cloudflared call targets `uuid`, never the name.
+ */
+export interface TunnelRef {
+  name: string;
+  uuid: string;
+  zone: string;
+  credFile: string;
+  exposures: TunnelExposure[];
 }
 
 export interface StackRecord {
@@ -94,6 +129,22 @@ export interface StackRecord {
    */
   composeFile?: string;
   overrideFile?: string;
+  /** Sticky named-tunnel adoption + this stack's public ingress rules. */
+  tunnel?: TunnelRef;
+}
+
+export interface ExposeOptions {
+  /** Named tunnel to adopt. Sticky: persisted, later calls may omit it. */
+  tunnel?: string;
+  /** Zone for public hostnames (default: inferred from the base rules). */
+  zone?: string;
+  /** Keep the public hostname as Host (default rewrites to 127.0.0.1:<port>). */
+  keepHostHeader?: boolean;
+  /** Proceed despite foreign connectors on the tunnel (replica risk). */
+  force?: boolean;
+  /** Re-point an existing DNS record hestia has no ledger memory of. */
+  overwriteDns?: boolean;
+  readyTimeoutMs?: number;
 }
 
 export interface UpOptions {
@@ -139,6 +190,12 @@ export interface IsolationEngine {
   run(worktree: string, spec: ProcSpec): Promise<StackRecord>;
   /** Stop one supervised proc. Idempotent: unknown/dead names succeed. */
   stopService(worktree: string, name: string): Promise<void>;
+  /** Publish running stack services through a cloudflare tunnel. */
+  expose(
+    worktree: string,
+    services: string[],
+    opts?: ExposeOptions,
+  ): Promise<StackRecord>;
   /** Tear down by project name from the ~/.hestia mirror — works with the worktree gone. */
   downProject?(project: string, opts?: DownOptions): Promise<void>;
 
@@ -163,6 +220,9 @@ export class NotImplemented extends Error {
  * proc-ready-timeout · proc-exited · name-conflict · ownership-tool-missing ·
  * varlock-missing. Wrangler: no-workers-found · wrangler-missing ·
  * worktree-busy · remote-binding-blocked · registry-leak.
+ * Tunnel: cloudflared-missing · tunnel-not-found · tunnel-auth-missing ·
+ * tunnel-busy · tunnel-ready-timeout · dns-route-failed · dns-record-conflict ·
+ * hostname-conflict · service-not-found.
  */
 export class HestiaError extends Error {
   code: string;

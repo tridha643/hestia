@@ -24,7 +24,7 @@ export interface Pidfile {
   inspectorPort?: number;
   logPath: string;
   signal: "term" | "int";
-  backend: "proc" | "wrangler";
+  backend: "proc" | "wrangler" | "tunnel";
   configPath?: string;
   /**
    * Descendant snapshot taken at ready time. Wrapper runners (varlock) start

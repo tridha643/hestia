@@ -19,6 +19,10 @@ interface Flags {
   signal?: "term" | "int";
   readyTimeout?: number;
   project?: string;
+  tunnel?: string;
+  zone?: string;
+  keepHostHeader: boolean;
+  overwriteDns: boolean;
   /** everything after `--` (the `run` command argv) */
   rest: string[];
   _: string[];
@@ -33,6 +37,8 @@ function parseFlags(argv: string[]): Flags {
     noVarlock: false,
     varlock: false,
     noPort: false,
+    keepHostHeader: false,
+    overwriteDns: false,
     env: {},
     rest: [],
     _: [],
@@ -55,6 +61,10 @@ function parseFlags(argv: string[]): Flags {
     else if (a === "--signal") f.signal = argv[++i] === "int" ? "int" : "term";
     else if (a === "--ready-timeout") f.readyTimeout = Number(argv[++i]) * 1000;
     else if (a === "--project") f.project = argv[++i];
+    else if (a === "--tunnel") f.tunnel = argv[++i];
+    else if (a === "--zone") f.zone = argv[++i];
+    else if (a === "--keep-host-header") f.keepHostHeader = true;
+    else if (a === "--overwrite-dns") f.overwriteDns = true;
     else if (a === "--env") {
       const kv = argv[++i] ?? "";
       const eq = kv.indexOf("=");
@@ -87,7 +97,11 @@ function printStackHuman(r: StackRecord): void {
   out.push(`${r.project}  ${r.state}  (${r.branch} @ ${r.worktree})`);
   for (const s of r.services) {
     const port = s.publishedPort ? `127.0.0.1:${s.publishedPort}` : "-";
-    out.push(`  ● ${s.name.padEnd(12)} ${s.backend.padEnd(7)} ${port.padEnd(20)} ${s.state}`);
+    const pub = r.endpoints.find((e) => e.name === s.name)?.publicUrl;
+    out.push(
+      `  ● ${s.name.padEnd(12)} ${s.backend.padEnd(7)} ${port.padEnd(20)} ${s.state}` +
+        (pub !== undefined ? `  ${pub}` : ""),
+    );
   }
   process.stdout.write(out.join("\n") + "\n");
 }
@@ -104,6 +118,20 @@ usage:
              -- <command...>
         supervise a host process in this worktree's stack; {port} in the
         command and $PORT in its env carry the assigned port ({{port}} escapes)
+  hestia expose <service...> [--tunnel <name>] [--zone <zone>]
+               [--keep-host-header] [--overwrite-dns] [--force]
+               [--ready-timeout <s>] [--json]
+        publish running stack services through a cloudflare tunnel.
+        Without --tunnel (and no prior adoption): one QUICK tunnel per
+        service — no account needed, URL rotates per run. With --tunnel:
+        adopts your existing named tunnel (sticky) as the machine's SINGLE
+        connector serving hostname <tunnel>-<branch>-<svc>.<zone> per
+        service alongside your static rules — never run \`cloudflared
+        tunnel run\` yourself alongside it (HA replicas cross-wire
+        worktrees). URLs land in endpoints[] + HESTIA_<SVC>_URL. These are
+        public URLs guarded only by obscurity. Tip: a one-time wildcard
+        CNAME  *.<zone> → <tunnel-uuid>.cfargotunnel.com  makes hestia's
+        per-branch DNS writes unnecessary.
   hestia stop <name> [--json]             stop one supervised proc (idempotent)
   hestia down [--destroy] [--project <name>] [--json]
         tear down procs + containers (--destroy also removes volumes);
@@ -152,6 +180,23 @@ async function main(): Promise<void> {
         else printStackHuman(r);
         break;
       }
+      case "expose": {
+        const services = flags._.slice(1);
+        if (services.length === 0) {
+          fail("usage", "usage: hestia expose <service...> [--tunnel <name>]", flags.json);
+        }
+        const r = await engine.expose(cwd, services, {
+          tunnel: flags.tunnel,
+          zone: flags.zone,
+          keepHostHeader: flags.keepHostHeader,
+          overwriteDns: flags.overwriteDns,
+          force: flags.force,
+          readyTimeoutMs: flags.readyTimeout,
+        });
+        if (flags.json) process.stdout.write(JSON.stringify(r, null, 2) + "\n");
+        else printStackHuman(r);
+        break;
+      }
       case "stop": {
         const name = flags._[1];
         if (!name) fail("usage", "usage: hestia stop <name>", flags.json);
@@ -195,7 +240,8 @@ async function main(): Promise<void> {
         if (flags.json) process.stdout.write(JSON.stringify(r.endpoints) + "\n");
         else {
           for (const e of r.endpoints) {
-            process.stdout.write(`${e.name.padEnd(12)} ${e.host}:${e.port}  (${e.reservedName})\n`);
+            const pub = e.publicUrl !== undefined ? `  ${e.publicUrl}` : "";
+            process.stdout.write(`${e.name.padEnd(12)} ${e.host}:${e.port}${pub}  (${e.reservedName})\n`);
           }
         }
         break;

@@ -6,10 +6,12 @@ import { parse as parseYaml } from "yaml";
 import {
   type DownOptions,
   type Endpoint,
+  type ExposeOptions,
   type IsolationEngine,
   type ProcSpec,
   type ServiceRecord,
   type StackRecord,
+  type TunnelRef,
   type UpOptions,
   HestiaError,
   NotImplemented,
@@ -57,6 +59,16 @@ import {
   snapshotGlobalRegistry,
   verifyPrivateRegistry,
 } from "./wrangler/verify.ts";
+import { adoptTunnel, routeDns } from "./tunnel/cloudflared.ts";
+import { hostnameFor, importBaseRules, inferZone } from "./tunnel/ingress.ts";
+import {
+  connectorPidfile,
+  isAdopted,
+  ledgerAdd,
+  ledgerHas,
+  reconcileTunnel,
+} from "./tunnel/registry.ts";
+import { isReady, quickTunnelUrl } from "./tunnel/verify.ts";
 
 export { dockerAvailable } from "./compose/cli.ts";
 export * from "./compose/override.ts";
@@ -67,6 +79,17 @@ export * from "./proc/pidfile.ts";
 export * from "./proc/resolver.ts";
 export * from "./wrangler/discover.ts";
 export { privateRegistryDir, globalRegistryDir } from "./wrangler/adapter.ts";
+export * from "./tunnel/ingress.ts";
+export * from "./tunnel/verify.ts";
+export {
+  collectDynamicRules,
+  connectorPidfile,
+  ledgerAdd,
+  ledgerHas,
+  reconcileTunnel,
+  tunnelDir,
+} from "./tunnel/registry.ts";
+export { adoptTunnel, listTunnels, routeDns } from "./tunnel/cloudflared.ts";
 
 const OVERRIDE_FILE = "compose.override.yml";
 
@@ -170,14 +193,63 @@ function recordProc(
   }
 }
 
+function urlKey(name: string): string {
+  return `HESTIA_${envKey(name)}_URL`;
+}
+
+/**
+ * Re-point named-mode exposures at the services' CURRENT ports. Returns true
+ * when the merged ingress derived from this record changed (a port rotated or
+ * an origin stopped) — the caller must reconcile the global connector after
+ * releasing the worktree lock, because an ingress rule aimed at a port this
+ * stack no longer owns is a live cross-worktree misdelivery once the OS
+ * recycles the port.
+ */
+function syncExposures(record: StackRecord): boolean {
+  const t = record.tunnel;
+  if (t === undefined) return false;
+  let changed = false;
+  for (const exp of t.exposures) {
+    const svc = record.services.find((s) => s.name === exp.service);
+    if (svc?.publishedPort === undefined) {
+      changed = true; // origin gone — regen drops the rule (404, never a stale port)
+    } else if (svc.publishedPort !== exp.originPort) {
+      exp.originPort = svc.publishedPort;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 const pexec = promisify(execFile);
 
 export class ComposeEngine implements IsolationEngine {
+  /**
+   * Best-effort convergence of the global connector after a stack mutation.
+   * Failures degrade to warnings — `run`/`down` must not fail because the
+   * tunnel blipped; `status` will show it unhealthy.
+   */
+  async #reconcileAdopted(t: TunnelRef | undefined): Promise<void> {
+    if (t === undefined) return;
+    try {
+      const outcome = await reconcileTunnel(t);
+      for (const w of outcome.warnings) process.stderr.write(`warning: ${w}\n`);
+      if (outcome.error !== undefined) {
+        process.stderr.write(`warning: ${outcome.error.message}\n`);
+      }
+    } catch (err) {
+      process.stderr.write(
+        `warning: tunnel reconcile failed: ${(err as Error).message}\n`,
+      );
+    }
+  }
+
   async up(cwd: string, opts?: UpOptions): Promise<StackRecord> {
     const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
     const project = projectName(repo, branch, worktreeRoot);
+    let tunnelDirty = false;
 
-    return withLock(worktreeRoot, async () => {
+    const done = await withLock(worktreeRoot, async () => {
       const record =
         readState(worktreeRoot) ??
         freshRecord(project, repo, branch, worktreeRoot);
@@ -237,9 +309,12 @@ export class ComposeEngine implements IsolationEngine {
       }
 
       record.state = "up";
+      tunnelDirty = syncExposures(record);
       writeState(worktreeRoot, record);
       return record;
     });
+    if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
+    return done;
   }
 
   /** Spawn one supervised `wrangler dev` per discovered config, in parallel. */
@@ -302,8 +377,9 @@ export class ComposeEngine implements IsolationEngine {
   async run(cwd: string, spec: ProcSpec): Promise<StackRecord> {
     const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
     const project = projectName(repo, branch, worktreeRoot);
+    let tunnelDirty = false;
 
-    return withLock(worktreeRoot, async () => {
+    const done = await withLock(worktreeRoot, async () => {
       const record =
         readState(worktreeRoot) ??
         freshRecord(project, repo, branch, worktreeRoot);
@@ -335,14 +411,19 @@ export class ComposeEngine implements IsolationEngine {
       );
       recordProc(record, result.record);
       record.state = "up";
+      tunnelDirty = syncExposures(record);
       writeState(worktreeRoot, record);
       if (result.error !== undefined) throw result.error;
       return record;
     });
+    if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
+    return done;
   }
 
   async stopService(cwd: string, name: string): Promise<void> {
     const { worktreeRoot } = await getRepoInfo(cwd);
+    let tunnel: TunnelRef | undefined;
+    let tunnelDirty = false;
     await withLock(worktreeRoot, async () => {
       const pf = readPidfile(worktreeRoot, name);
       if (pf !== null) {
@@ -351,7 +432,18 @@ export class ComposeEngine implements IsolationEngine {
       }
       const record = readState(worktreeRoot);
       if (record !== null) {
+        // a quick tunnel going down takes its origin's public URL with it
+        const stopped = record.services.find((s) => s.name === name);
+        if (stopped?.originService !== undefined) {
+          const ep = record.endpoints.find(
+            (e) => e.name === stopped.originService,
+          );
+          if (ep !== undefined) delete ep.publicUrl;
+          delete record.env[urlKey(stopped.originService)];
+        }
         dropService(record, name);
+        tunnel = record.tunnel;
+        tunnelDirty = syncExposures(record);
         if (record.services.length === 0 && record.composeFile === undefined) {
           clearState(worktreeRoot, record.project);
         } else {
@@ -359,12 +451,15 @@ export class ComposeEngine implements IsolationEngine {
         }
       }
     });
+    if (tunnelDirty) await this.#reconcileAdopted(tunnel);
   }
 
   async down(cwd: string, opts?: DownOptions): Promise<void> {
     const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
+    let tunnel: TunnelRef | undefined;
     await withLock(worktreeRoot, async () => {
       const record = readState(worktreeRoot);
+      tunnel = record?.tunnel;
 
       // procs first — they depend on the containers, not vice-versa
       for (const pf of listPidfiles(procsDir(worktreeRoot))) {
@@ -388,6 +483,9 @@ export class ComposeEngine implements IsolationEngine {
       const project = record?.project ?? projectName(repo, branch, worktreeRoot);
       clearState(worktreeRoot, project);
     });
+    // mirror is gone → regen drops this stack's ingress rules; the connector
+    // keeps serving the base rules and other worktrees
+    await this.#reconcileAdopted(tunnel);
   }
 
   /**
@@ -414,6 +512,257 @@ export class ComposeEngine implements IsolationEngine {
       }
     }
     rmSync(mirrorDir(project), { recursive: true, force: true });
+    await this.#reconcileAdopted(record?.tunnel);
+  }
+
+  async expose(
+    cwd: string,
+    services: string[],
+    opts?: ExposeOptions,
+  ): Promise<StackRecord> {
+    const { worktreeRoot } = await getRepoInfo(cwd);
+    if (services.length === 0) {
+      throw new HestiaError("usage", "expose requires at least one service name");
+    }
+    // Mode pick: --tunnel wins, else the sticky adoption, else quick tunnels.
+    const tunnelName = opts?.tunnel ?? readState(worktreeRoot)?.tunnel?.name;
+    if (tunnelName === undefined) {
+      return this.#exposeQuick(worktreeRoot, services, opts);
+    }
+    return this.#exposeNamed(worktreeRoot, services, tunnelName, opts);
+  }
+
+  /** One quick tunnel per service — zero-account, URL rotates per run. */
+  async #exposeQuick(
+    worktreeRoot: string,
+    services: string[],
+    opts?: ExposeOptions,
+  ): Promise<StackRecord> {
+    return withLock(worktreeRoot, async () => {
+      const record = readState(worktreeRoot);
+      if (record === null) {
+        throw new HestiaError(
+          "service-not-found",
+          "no stack in this worktree — `hestia up`/`run` something first",
+        );
+      }
+      // An explicit empty config blocks cloudflared's implicit load of
+      // ~/.cloudflared/config.yml — its ingress rules would silently override
+      // --url and 404 every request (verified against 2026.3.0).
+      const quickCfg = join(hestiaDir(worktreeRoot), "quick-tunnel.yml");
+      ensureDir(hestiaDir(worktreeRoot));
+      writeFileSync(quickCfg, "# empty on purpose: keeps --url in effect\n");
+
+      for (const svc of services) {
+        const target = record.services.find((s) => s.name === svc);
+        if (target?.publishedPort === undefined || target.backend === "tunnel") {
+          throw new HestiaError(
+            "service-not-found",
+            `service "${svc}" is not running with a port in this stack`,
+          );
+        }
+        const name = `tunnel-${svc}`;
+        const argv = [
+          "cloudflared",
+          "tunnel",
+          "--config",
+          quickCfg,
+          "--metrics",
+          "127.0.0.1:{port}",
+          "--grace-period",
+          "5s",
+          "--no-autoupdate",
+          "--url",
+          `http://127.0.0.1:${target.publishedPort}`,
+        ];
+        const existing = readPidfile(worktreeRoot, name);
+        let metricsPort: number | undefined;
+        if (
+          existing !== null &&
+          isLive(existing) &&
+          JSON.stringify(existing.argv) === JSON.stringify(argv)
+        ) {
+          metricsPort = existing.port; // idempotent: same origin, still live
+        } else {
+          if (existing !== null) {
+            if (isLive(existing)) await stopProcTree(existing);
+            removePidfile(worktreeRoot, name);
+          }
+          const result = await startProc(
+            worktreeRoot,
+            {
+              name,
+              argv,
+              port: "auto",
+              backend: "tunnel",
+              originService: svc,
+              readyTimeoutMs: opts?.readyTimeoutMs,
+            },
+            record.env,
+            (pf) => mirrorPidfile(record.project, pf),
+          );
+          // metrics port only — never a public surface, so no recordProc
+          upsertService(record, result.record);
+          metricsPort = result.record.publishedPort;
+          if (result.error !== undefined) {
+            writeState(worktreeRoot, record);
+            throw result.error;
+          }
+        }
+        const url =
+          metricsPort !== undefined
+            ? await quickTunnelUrl(metricsPort, opts?.readyTimeoutMs ?? 30_000)
+            : null;
+        if (url === null) {
+          writeState(worktreeRoot, record);
+          throw new HestiaError(
+            "tunnel-ready-timeout",
+            `quick tunnel for "${svc}" reported no URL in time (offline?) — ` +
+              `left running, logs: .hestia/logs/${name}.log`,
+          );
+        }
+        const ep = record.endpoints.find((e) => e.name === svc);
+        if (ep !== undefined) ep.publicUrl = url;
+        else {
+          setEndpoint(record, {
+            name: svc,
+            host: "127.0.0.1",
+            port: target.publishedPort,
+            publicUrl: url,
+          });
+        }
+        record.env[urlKey(svc)] = url;
+      }
+      writeState(worktreeRoot, record);
+      return record;
+    });
+  }
+
+  /**
+   * Unified named mode: adopt the existing tunnel, record this stack's
+   * exposures (intent first — crash-safe), route DNS outside any lock, then
+   * converge the machine-global connector. Lock order: worktree → global.
+   */
+  async #exposeNamed(
+    worktreeRoot: string,
+    services: string[],
+    tunnelName: string,
+    opts?: ExposeOptions,
+  ): Promise<StackRecord> {
+    // network preflight — no locks held. Foreign connectors (the user's
+    // manual `tunnel run`, a teammate's replica) make the edge load-balance
+    // hostnames across worktrees; hestia never kills processes it didn't
+    // spawn, so it refuses to become connector #2.
+    const adopted = await adoptTunnel(tunnelName);
+    if (adopted.connections > 0 && !isAdopted(adopted.uuid) && !opts?.force) {
+      throw new HestiaError(
+        "tunnel-busy",
+        `tunnel "${tunnelName}" already has ${adopted.connections} live ` +
+          `connector(s) — stop the other cloudflared first (hestia's ` +
+          `connector serves your static hostnames too), or pass --force to ` +
+          `accept nondeterministic routing`,
+      );
+    }
+
+    const newHostnames: string[] = [];
+    await withLock(worktreeRoot, async () => {
+      const record = readState(worktreeRoot);
+      if (record === null) {
+        throw new HestiaError(
+          "service-not-found",
+          "no stack in this worktree — `hestia up`/`run` something first",
+        );
+      }
+      const base = importBaseRules(adopted.uuid, tunnelName);
+      const zone = opts?.zone ?? record.tunnel?.zone ?? inferZone(base);
+      if (zone === undefined) {
+        throw new HestiaError(
+          "usage",
+          "cannot infer a zone from the tunnel's existing rules — pass --zone",
+        );
+      }
+      const t: TunnelRef =
+        record.tunnel !== undefined && record.tunnel.uuid === adopted.uuid
+          ? record.tunnel
+          : {
+              name: tunnelName,
+              uuid: adopted.uuid,
+              zone,
+              credFile: adopted.credFile,
+              exposures: [],
+            };
+      t.name = tunnelName;
+      t.zone = zone;
+      t.credFile = adopted.credFile;
+      record.tunnel = t;
+
+      for (const svc of services) {
+        const target = record.services.find((s) => s.name === svc);
+        if (target?.publishedPort === undefined || target.backend === "tunnel") {
+          throw new HestiaError(
+            "service-not-found",
+            `service "${svc}" is not running with a port in this stack`,
+          );
+        }
+        const hostname = hostnameFor(tunnelName, record.branch, svc, zone);
+        const exp = t.exposures.find((e) => e.service === svc);
+        if (exp !== undefined) {
+          exp.hostname = hostname;
+          exp.originPort = target.publishedPort;
+          exp.keepHostHeader = opts?.keepHostHeader;
+        } else {
+          t.exposures.push({
+            service: svc,
+            hostname,
+            originPort: target.publishedPort,
+            keepHostHeader: opts?.keepHostHeader,
+          });
+        }
+        if (!ledgerHas(adopted.uuid, hostname)) newHostnames.push(hostname);
+      }
+      // exposure intent is on disk (and mirrored) before any account mutation
+      writeState(worktreeRoot, record);
+    });
+
+    // DNS — network, no locks; ledger makes re-runs no-ops
+    for (const hostname of newHostnames) {
+      await routeDns(adopted.uuid, hostname, opts?.overwriteDns ?? false);
+      ledgerAdd(adopted.uuid, hostname);
+    }
+
+    const outcome = await reconcileTunnel(
+      { name: tunnelName, uuid: adopted.uuid, credFile: adopted.credFile },
+      { force: opts?.force, readyTimeoutMs: opts?.readyTimeoutMs },
+    );
+    for (const w of outcome.warnings) process.stderr.write(`warning: ${w}\n`);
+
+    const final = await withLock(worktreeRoot, async () => {
+      const record = readState(worktreeRoot);
+      if (record === null) {
+        throw new HestiaError(
+          "service-not-found",
+          "stack disappeared while exposing (concurrent down?)",
+        );
+      }
+      for (const exp of record.tunnel?.exposures ?? []) {
+        const url = `https://${exp.hostname}`;
+        const ep = record.endpoints.find((e) => e.name === exp.service);
+        if (ep !== undefined) ep.publicUrl = url;
+        else {
+          setEndpoint(record, {
+            name: exp.service,
+            host: "127.0.0.1",
+            port: exp.originPort,
+            publicUrl: url,
+          });
+        }
+        record.env[urlKey(exp.service)] = url;
+      }
+      writeState(worktreeRoot, record);
+      return record;
+    });
+    if (outcome.error !== undefined) throw outcome.error;
+    return final;
   }
 
   async status(cwd: string): Promise<StackRecord | null> {
@@ -477,6 +826,47 @@ export class ComposeEngine implements IsolationEngine {
       } else {
         svc.state = "healthy";
       }
+      // quick tunnel that connected after its expose timed out: surface the URL
+      if (
+        svc.backend === "tunnel" &&
+        svc.originService !== undefined &&
+        svc.state === "healthy" &&
+        svc.publishedPort !== undefined &&
+        record.env[urlKey(svc.originService)] === undefined
+      ) {
+        const url = await quickTunnelUrl(svc.publishedPort, 1_000);
+        if (url !== null) {
+          record.env[urlKey(svc.originService)] = url;
+          const ep = record.endpoints.find((e) => e.name === svc.originService);
+          if (ep !== undefined) ep.publicUrl = url;
+        }
+      }
+    }
+
+    // named mode: the global connector, viewed from this stack
+    if (record.tunnel !== undefined) {
+      const pf = connectorPidfile(record.tunnel.uuid);
+      let state: ServiceRecord["state"] = "exited";
+      if (pf !== null && isLive(pf)) {
+        // an exposure aimed at a port this stack no longer holds is the
+        // misdelivery hazard — report it, don't hide it behind /ready
+        const portsCurrent = record.tunnel.exposures.every((exp) => {
+          const svc = record.services.find((s) => s.name === exp.service);
+          return svc?.publishedPort === exp.originPort;
+        });
+        const ready =
+          pf.port !== undefined ? await isReady(pf.port) : false;
+        state = portsCurrent && ready ? "healthy" : "unhealthy";
+      }
+      upsertService(record, {
+        name: "tunnel",
+        backend: "tunnel",
+        state,
+        pid: pf?.pid,
+        pgid: pf?.pgid,
+        startTime: pf?.startTime,
+        logPath: pf?.logPath,
+      });
     }
 
     record.state = anyUp ? "up" : "stopped";
