@@ -123,6 +123,9 @@ suite("per-worktree wrangler dev-registry isolation", () => {
     for (const wt of [wtA, wtB]) {
       if (wt && existsSync(wt)) runCli(wt, ["down"]);
     }
+    // stop the daemon these runs may have auto-spawned (next real command
+    // respawns a clean one — never leave one carrying test env)
+    if (tmpRoot) runCli(tmpRoot, ["daemon", "stop"]);
     if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true });
   });
 

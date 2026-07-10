@@ -149,6 +149,10 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       if (wt && existsSync(wt)) runCli(wt, ["down"]);
     }
     for (const b of ["tun-a", "tun-b"]) runCli(tmpRoot, ["down", "--project", `tunrepo-${b}`]);
+    // CRITICAL: the daemon these runs auto-spawned inherited the STUB
+    // cloudflared PATH — left alive it would "revive" real tunnels with the
+    // stub. Stop it; the next real command respawns a clean one.
+    runCli(tmpRoot, ["daemon", "stop"]);
     // the global connector has no owning stack — kill it via its pidfile
     const pid = connectorPid();
     if (pid !== null) {
@@ -403,14 +407,31 @@ describe.if(process.env.HESTIA_E2E_TUNNEL === "1")("real quick tunnel through th
       const url = r.env.HESTIA_WEB_URL!;
       expect(url).toMatch(/^https:\/\/.*\.trycloudflare\.com$/);
 
-      // edge DNS + routing can lag a few seconds after the URL is minted
+      // Edge DNS lags a few seconds behind the minted URL, and the FIRST
+      // lookup lands in that gap — macOS's system resolver then negative-
+      // caches the NXDOMAIN (bun's fetch cache does the same), leaving curl
+      // and fetch blind for minutes while the records exist. Resolve via dig
+      // (bypasses the cache) and pin curl with --resolve; SNI/Host stay real,
+      // so this still proves the edge round-trip.
+      const host = url.replace("https://", "");
       let marker: string | undefined;
       const deadline = Date.now() + 90_000;
       while (Date.now() < deadline && marker === undefined) {
         try {
-          const res = await fetch(url, { signal: AbortSignal.timeout(5_000) });
-          if (res.ok) {
-            marker = ((await res.json()) as { marker?: string }).marker;
+          const ip = execFileSync("dig", ["+short", host, "A"], {
+            encoding: "utf8",
+            timeout: 10_000,
+          })
+            .split("\n")
+            .find((l) => /^\d+\.\d+\.\d+\.\d+$/.test(l.trim()))
+            ?.trim();
+          if (ip !== undefined) {
+            const body = execFileSync(
+              "curl",
+              ["-sf", "--max-time", "5", "--resolve", `${host}:443:${ip}`, url],
+              { encoding: "utf8", timeout: 10_000 },
+            );
+            marker = (JSON.parse(body) as { marker?: string }).marker;
             break;
           }
         } catch {}

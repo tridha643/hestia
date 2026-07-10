@@ -7,6 +7,9 @@
   "exports": { ".": "./src/index.ts" },
   "dependencies": {
     "@hestia/core": "workspace:*",
+    "@hunk/session-broker": "workspace:*",
+    "@hunk/session-broker-bun": "workspace:*",
+    "@hunk/session-broker-core": "workspace:*",
     "yaml": "^2.6.0"
   }
 }

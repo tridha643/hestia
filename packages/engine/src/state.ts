@@ -14,6 +14,16 @@ import { procsDir, type Pidfile } from "./proc/pidfile.ts";
 
 const STATE_FILE = "stack.json";
 
+/**
+ * Machine-global hestia root (mirrors, tunnel singleton, daemon). Evaluated at
+ * call time so tests can point a spawned CLI/daemon at a temp dir via
+ * HESTIA_HOME — cap accounting is machine-global, so the daemon e2e must not
+ * see (or pollute) the real ~/.hestia.
+ */
+export function hestiaHome(): string {
+  return process.env.HESTIA_HOME ?? join(homedir(), ".hestia");
+}
+
 export function hestiaDir(worktreeRoot: string): string {
   return join(worktreeRoot, ".hestia");
 }
@@ -23,7 +33,7 @@ function statePath(worktreeRoot: string): string {
 }
 
 export function mirrorDir(project: string): string {
-  return join(homedir(), ".hestia", "stacks", project);
+  return join(hestiaHome(), "stacks", project);
 }
 
 export function mirrorProcsDir(project: string): string {

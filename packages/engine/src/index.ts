@@ -1,9 +1,10 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import {
+  type AdmitOptions,
   type DownOptions,
   type Endpoint,
   type ExposeOptions,
@@ -49,6 +50,7 @@ import {
   procsDir,
   readPidfile,
   removePidfile,
+  startTimeOf,
 } from "./proc/pidfile.ts";
 import { stopProcTree } from "./proc/shutdown.ts";
 import { inspectPort } from "./proc/ports.ts";
@@ -69,6 +71,8 @@ import {
   reconcileTunnel,
 } from "./tunnel/registry.ts";
 import { isReady, quickTunnelUrl } from "./tunnel/verify.ts";
+import { ensureDaemon } from "./daemon/ensure.ts";
+import { acquireSlot, readDaemonJson, releaseSlot } from "./daemon/client.ts";
 
 export { dockerAvailable } from "./compose/cli.ts";
 export * from "./compose/override.ts";
@@ -90,6 +94,20 @@ export {
   tunnelDir,
 } from "./tunnel/registry.ts";
 export { adoptTunnel, listTunnels, routeDns } from "./tunnel/cloudflared.ts";
+export { hestiaHome } from "./state.ts";
+export { type DoctorRow, doctor } from "./doctor.ts";
+export { daemonDir, resolveMaxStacks } from "./daemon/slots.ts";
+export { HESTIAD_PROTOCOL_VERSION } from "./daemon/routes.ts";
+export { ensureDaemon, stopDaemonProcess } from "./daemon/ensure.ts";
+export { fetchHealth, fetchState, readDaemonJson } from "./daemon/client.ts";
+export {
+  LAUNCHD_LABEL,
+  installLaunchd,
+  isBootstrapped,
+  launchdManagesThisHome,
+  plistPath,
+  uninstallLaunchd,
+} from "./daemon/launchd.ts";
 
 const OVERRIDE_FILE = "compose.override.yml";
 
@@ -244,12 +262,93 @@ export class ComposeEngine implements IsolationEngine {
     }
   }
 
+  /**
+   * Machine-wide admission before any start: ensure hestiad, request a slot
+   * (idempotent for already-live projects), and bridge the grant with a
+   * provisional `starting` record so the slot survives a multi-minute cold
+   * `compose up` and a CLI crash frees it (dead starter → sweep). Runs BEFORE
+   * the worktree lock — never long-poll while holding it.
+   * Returns a cleanup that rolls the provisional record back on failure.
+   */
+  async #admit(
+    project: string,
+    repo: string,
+    branch: string,
+    worktreeRoot: string,
+    opts?: AdmitOptions,
+  ): Promise<() => Promise<void>> {
+    if (opts?.noDaemon) {
+      process.stderr.write(
+        "warning: --no-daemon skips the stack cap and daemon supervision\n",
+      );
+      return async () => {};
+    }
+    const handle = await ensureDaemon();
+    const result = await acquireSlot(handle.port, project, opts?.wait ?? 0);
+    if (!result.granted) {
+      const live = result.live.join(", ");
+      throw new HestiaError(
+        "stack-limit",
+        `stack cap reached (live: ${live}) — \`hestia down\` one, or retry with --wait`,
+      );
+    }
+    // Provisional record only when the project has no record at all — an
+    // existing record already carries occupancy through its services.
+    let provisional = false;
+    await withLock(worktreeRoot, async () => {
+      if (readState(worktreeRoot) === null) {
+        const rec = freshRecord(project, repo, branch, worktreeRoot);
+        rec.state = "starting";
+        rec.starter = {
+          pid: process.pid,
+          startTime: startTimeOf(process.pid) ?? "",
+        };
+        writeState(worktreeRoot, rec);
+        provisional = true;
+      }
+    });
+    return async () => {
+      // Failure rollback: drop the record only if it is still our untouched
+      // provisional (a partially-started stack must stay visible for `down`).
+      if (!provisional) return;
+      await withLock(worktreeRoot, async () => {
+        const rec = readState(worktreeRoot);
+        if (rec !== null && rec.state === "starting" && rec.services.length === 0) {
+          clearState(worktreeRoot, project);
+        }
+      });
+      await releaseSlot(handle.port, project);
+    };
+  }
+
   async up(cwd: string, opts?: UpOptions): Promise<StackRecord> {
     const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
     const project = projectName(repo, branch, worktreeRoot);
     let tunnelDirty = false;
 
-    const done = await withLock(worktreeRoot, async () => {
+    const rollback = await this.#admit(project, repo, branch, worktreeRoot, opts);
+    let done: StackRecord;
+    try {
+      done = await this.#upLocked(worktreeRoot, project, repo, branch, opts, (d) => {
+        tunnelDirty = d;
+      });
+    } catch (err) {
+      await rollback();
+      throw err;
+    }
+    if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
+    return done;
+  }
+
+  async #upLocked(
+    worktreeRoot: string,
+    project: string,
+    repo: string,
+    branch: string,
+    opts: UpOptions | undefined,
+    setTunnelDirty: (d: boolean) => void,
+  ): Promise<StackRecord> {
+    return withLock(worktreeRoot, async () => {
       const record =
         readState(worktreeRoot) ??
         freshRecord(project, repo, branch, worktreeRoot);
@@ -309,12 +408,11 @@ export class ComposeEngine implements IsolationEngine {
       }
 
       record.state = "up";
-      tunnelDirty = syncExposures(record);
+      delete record.starter; // no longer provisional — services carry the slot
+      setTunnelDirty(syncExposures(record));
       writeState(worktreeRoot, record);
       return record;
     });
-    if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
-    return done;
   }
 
   /** Spawn one supervised `wrangler dev` per discovered config, in parallel. */
@@ -374,12 +472,34 @@ export class ComposeEngine implements IsolationEngine {
     if (firstError !== undefined) throw firstError;
   }
 
-  async run(cwd: string, spec: ProcSpec): Promise<StackRecord> {
+  async run(cwd: string, spec: ProcSpec, admit?: AdmitOptions): Promise<StackRecord> {
     const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
     const project = projectName(repo, branch, worktreeRoot);
     let tunnelDirty = false;
 
-    const done = await withLock(worktreeRoot, async () => {
+    const rollback = await this.#admit(project, repo, branch, worktreeRoot, admit);
+    let done: StackRecord;
+    try {
+      done = await this.#runLocked(worktreeRoot, project, repo, branch, spec, (d) => {
+        tunnelDirty = d;
+      });
+    } catch (err) {
+      await rollback();
+      throw err;
+    }
+    if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
+    return done;
+  }
+
+  async #runLocked(
+    worktreeRoot: string,
+    project: string,
+    repo: string,
+    branch: string,
+    spec: ProcSpec,
+    setTunnelDirty: (d: boolean) => void,
+  ): Promise<StackRecord> {
+    return withLock(worktreeRoot, async () => {
       const record =
         readState(worktreeRoot) ??
         freshRecord(project, repo, branch, worktreeRoot);
@@ -411,13 +531,12 @@ export class ComposeEngine implements IsolationEngine {
       );
       recordProc(record, result.record);
       record.state = "up";
-      tunnelDirty = syncExposures(record);
+      delete record.starter; // no longer provisional — services carry the slot
+      setTunnelDirty(syncExposures(record));
       writeState(worktreeRoot, record);
       if (result.error !== undefined) throw result.error;
       return record;
     });
-    if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
-    return done;
   }
 
   async stopService(cwd: string, name: string): Promise<void> {
@@ -474,18 +593,35 @@ export class ComposeEngine implements IsolationEngine {
           record?.project ?? projectName(repo, branch, worktreeRoot);
         const overrideFile =
           record?.overrideFile ?? join(hestiaDir(worktreeRoot), OVERRIDE_FILE);
-        await composeDown(
-          { project, baseFile: composeFile, overrideFile, cwd: worktreeRoot },
-          opts?.destroy ?? false,
-        );
+        if (existsSync(overrideFile)) {
+          await composeDown(
+            { project, baseFile: composeFile, overrideFile, cwd: worktreeRoot },
+            opts?.destroy ?? false,
+          );
+        } else if (record?.composeFile !== undefined) {
+          // Recorded compose services but the override is gone — tear down by
+          // project label alone, same as the mirror path (needs no files).
+          const rest = ["compose", "-p", project, "down", "--remove-orphans"];
+          if (opts?.destroy) rest.push("-v");
+          await pexec("docker", rest, { timeout: 180_000 });
+        }
+        // else: the repo has a compose file but this stack never composed
+        // (procs-only `run` in a compose repo) — nothing docker-side to do.
       }
 
       const project = record?.project ?? projectName(repo, branch, worktreeRoot);
       clearState(worktreeRoot, project);
+      await this.#releaseAdmission(project);
     });
     // mirror is gone → regen drops this stack's ingress rules; the connector
     // keeps serving the base rules and other worktrees
     await this.#reconcileAdopted(tunnel);
+  }
+
+  /** Best-effort slot release — waiters get their grant now instead of at the next sweep. */
+  async #releaseAdmission(project: string): Promise<void> {
+    const j = readDaemonJson();
+    if (j !== null) await releaseSlot(j.port, project);
   }
 
   /**
@@ -512,6 +648,7 @@ export class ComposeEngine implements IsolationEngine {
       }
     }
     rmSync(mirrorDir(project), { recursive: true, force: true });
+    await this.#releaseAdmission(project);
     await this.#reconcileAdopted(record?.tunnel);
   }
 

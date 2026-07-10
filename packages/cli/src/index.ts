@@ -1,5 +1,19 @@
 #!/usr/bin/env bun
-import { engine } from "@hestia/engine";
+import {
+  type DoctorRow,
+  doctor,
+  engine,
+  ensureDaemon,
+  fetchHealth,
+  fetchState,
+  installLaunchd,
+  launchdManagesThisHome,
+  plistPath,
+  readDaemonJson,
+  stopDaemonProcess,
+  uninstallLaunchd,
+} from "@hestia/engine";
+import { execFileSync } from "node:child_process";
 import { HestiaError, type ProcSpec, type StackRecord } from "@hestia/core";
 
 interface Flags {
@@ -23,6 +37,10 @@ interface Flags {
   zone?: string;
   keepHostHeader: boolean;
   overwriteDns: boolean;
+  /** seconds to queue for a stack slot at the cap (absent = fail fast). */
+  wait?: number;
+  noDaemon: boolean;
+  print: boolean;
   /** everything after `--` (the `run` command argv) */
   rest: string[];
   _: string[];
@@ -39,6 +57,8 @@ function parseFlags(argv: string[]): Flags {
     noPort: false,
     keepHostHeader: false,
     overwriteDns: false,
+    noDaemon: false,
+    print: false,
     env: {},
     rest: [],
     _: [],
@@ -65,6 +85,15 @@ function parseFlags(argv: string[]): Flags {
     else if (a === "--zone") f.zone = argv[++i];
     else if (a === "--keep-host-header") f.keepHostHeader = true;
     else if (a === "--overwrite-dns") f.overwriteDns = true;
+    else if (a === "--no-daemon") f.noDaemon = true;
+    else if (a === "--print") f.print = true;
+    else if (a.startsWith("--wait=")) f.wait = Number(a.slice("--wait=".length));
+    else if (a === "--wait") {
+      // bare flag = wait a long time; a following number is seconds
+      const next = argv[i + 1];
+      if (next !== undefined && /^\d+$/.test(next)) f.wait = Number(argv[++i]);
+      else f.wait = 3600;
+    }
     else if (a === "--env") {
       const kv = argv[++i] ?? "";
       const eq = kv.indexOf("=");
@@ -130,12 +159,16 @@ const HELP = `hestia — per-worktree isolated dev stacks
 
 usage:
   hestia up   [--services a,b] [--workers[=a,b]] [--allow-remote] [--force]
-              [--no-varlock] [--json]
+              [--no-varlock] [--wait[=secs]] [--no-daemon] [--json]
         compose stack up; --workers also supervises one \`wrangler dev\` per
-        discovered wrangler config (private dev registry per worktree)
+        discovered wrangler config (private dev registry per worktree).
+        Starting a NEW stack takes a machine-wide slot (cap 5, configurable
+        via HESTIA_MAX_STACKS / ~/.hestia/config.json); at the cap it fails
+        with stack-limit — --wait[=secs] queues FIFO instead, --no-daemon
+        skips the cap entirely
   hestia run --name <name> [--env K=V ...] [--no-port] [--varlock]
-             [--signal term|int] [--ready-timeout <s>] [--cwd <rel>] [--json]
-             -- <command...>
+             [--signal term|int] [--ready-timeout <s>] [--cwd <rel>]
+             [--wait[=secs]] [--no-daemon] [--json] -- <command...>
         supervise a host process in this worktree's stack; {port} in the
         command and $PORT in its env carry the assigned port ({{port}} escapes)
   hestia expose <service...> [--tunnel <name>] [--zone <zone>]
@@ -156,6 +189,16 @@ usage:
         resolve a service's public URL (from \`expose\`) and open it in the
         browser; the URL is always printed too, so a headless agent can hand
         the human a direct-click link. HESTIA_NO_OPEN prints only.
+  hestia daemon status|start|stop|install [--print]|uninstall [--json]
+        hestiad enforces the stack cap and revives adopted tunnel connectors;
+        it auto-starts on up/run. \`install\` writes a launchd agent
+        (RunAtLoad + KeepAlive) so the daemon — and your adopted tunnel —
+        survive reboots; --print renders the plist without installing.
+        \`stop\` pauses supervision; running stacks are untouched
+  hestia doctor [--json]
+        report-only preflight + state audit: binaries, repo wiring, dead
+        procs, exposure port drift, orphan mirrors, connector and daemon
+        health. Exit 1 only on error-level rows; never mutates anything
   hestia stop <name> [--json]             stop one supervised proc (idempotent)
   hestia down [--destroy] [--project <name>] [--json]
         tear down procs + containers (--destroy also removes volumes);
@@ -179,6 +222,8 @@ async function main(): Promise<void> {
           allowRemote: flags.allowRemote,
           force: flags.force,
           noVarlock: flags.noVarlock,
+          wait: flags.wait !== undefined ? flags.wait * 1000 : undefined,
+          noDaemon: flags.noDaemon,
         });
         if (flags.json) process.stdout.write(JSON.stringify(r, null, 2) + "\n");
         else printStackHuman(r);
@@ -199,7 +244,10 @@ async function main(): Promise<void> {
           readyTimeoutMs: flags.readyTimeout,
           varlock: flags.varlock,
         };
-        const r = await engine.run(cwd, spec);
+        const r = await engine.run(cwd, spec, {
+          wait: flags.wait !== undefined ? flags.wait * 1000 : undefined,
+          noDaemon: flags.noDaemon,
+        });
         if (flags.json) process.stdout.write(JSON.stringify(r, null, 2) + "\n");
         else printStackHuman(r);
         break;
@@ -290,6 +338,96 @@ async function main(): Promise<void> {
             const pub = e.publicUrl !== undefined ? `  ${e.publicUrl}` : "";
             process.stdout.write(`${e.name.padEnd(12)} ${e.host}:${e.port}${pub}  (${e.reservedName})\n`);
           }
+        }
+        break;
+      }
+      case "doctor": {
+        const rows = await doctor(cwd);
+        if (flags.json) {
+          process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
+        } else {
+          const mark: Record<DoctorRow["level"], string> = {
+            ok: "✓",
+            warn: "!",
+            error: "✗",
+            unknown: "?",
+          };
+          for (const r of rows) {
+            process.stdout.write(`${mark[r.level]} ${r.check.padEnd(28)} ${r.detail}\n`);
+          }
+        }
+        if (rows.some((r) => r.level === "error")) process.exit(1);
+        break;
+      }
+      case "daemon": {
+        const sub = flags._[1];
+        if (sub === "status") {
+          const j = readDaemonJson();
+          const health = j !== null ? await fetchHealth(j.port) : null;
+          if (health === null) {
+            if (flags.json) process.stdout.write(JSON.stringify({ running: false }) + "\n");
+            else process.stdout.write("hestiad not running (starts on the next up/run)\n");
+            break;
+          }
+          const state = await fetchState(j!.port);
+          if (flags.json) {
+            process.stdout.write(JSON.stringify({ running: true, ...health, ...state }) + "\n");
+          } else {
+            process.stdout.write(
+              `hestiad pid ${health.pid} (protocol v${health.protocolVersion}) — ` +
+                `${health.live}/${health.maxStacks} stacks` +
+                (state !== null && state.live.length > 0 ? `: ${state.live.join(", ")}` : "") +
+                (health.queued > 0 ? `, ${health.queued} queued` : "") +
+                "\n",
+            );
+            for (const w of health.warnings) process.stderr.write(`warning: ${w}\n`);
+          }
+        } else if (sub === "stop") {
+          // A launchd-managed daemon must be booted out — SIGTERM alone would
+          // just be respawned (or leave launchd thinking it crashed). Only
+          // when launchd manages THIS home: a HESTIA_HOME'd CLI must never
+          // boot out the machine's real agent.
+          if (launchdManagesThisHome()) {
+            const uid = process.getuid?.() ?? 501;
+            execFileSync("launchctl", ["bootout", `gui/${uid}/dev.hestia.daemon`]);
+            process.stderr.write(
+              "warning: launchd agent booted out — `hestia daemon install` re-enables reboot revival\n",
+            );
+          } else {
+            await stopDaemonProcess();
+          }
+          process.stderr.write(
+            "warning: stacks keep running; cap + connector supervision paused until the next up/run\n",
+          );
+          if (flags.json) process.stdout.write(JSON.stringify({ ok: true }) + "\n");
+          else process.stdout.write("hestiad stopped\n");
+        } else if (sub === "install") {
+          const result = installLaunchd({ print: flags.print });
+          for (const w of result.warnings) process.stderr.write(`warning: ${w}\n`);
+          if (flags.json) {
+            process.stdout.write(JSON.stringify(result) + "\n");
+          } else if (result.installedAt !== undefined) {
+            process.stdout.write(
+              `installed ${result.installedAt} — hestiad (and adopted tunnel connectors) now survive reboots\n`,
+            );
+          } else {
+            process.stdout.write(result.plist);
+          }
+        } else if (sub === "uninstall") {
+          const result = uninstallLaunchd();
+          for (const w of result.warnings) process.stderr.write(`warning: ${w}\n`);
+          if (flags.json) process.stdout.write(JSON.stringify(result) + "\n");
+          else {
+            process.stdout.write(
+              result.removed ? `removed ${plistPath()}\n` : "launchd agent was not installed\n",
+            );
+          }
+        } else if (sub === "start") {
+          const h = await ensureDaemon();
+          if (flags.json) process.stdout.write(JSON.stringify(h.health) + "\n");
+          else process.stdout.write(`hestiad running on 127.0.0.1:${h.port} (pid ${h.health.pid})\n`);
+        } else {
+          fail("usage", "usage: hestia daemon status|start|stop|install [--print]|uninstall", flags.json);
         }
         break;
       }

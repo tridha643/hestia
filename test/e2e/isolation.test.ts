@@ -95,6 +95,9 @@ suite("per-worktree compose isolation (zero-config)", () => {
 
   afterAll(() => {
     for (const wt of [wtA, wtB]) if (wt) runCli(wt, ["down", "--destroy"]);
+    // stop the daemon these runs may have auto-spawned (next real command
+    // respawns a clean one — never leave one carrying test env)
+    if (tmpRoot) runCli(tmpRoot, ["daemon", "stop"]);
     if (tmpRoot) rmSync(tmpRoot, { recursive: true, force: true });
   });
 

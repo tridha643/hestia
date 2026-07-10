@@ -5,10 +5,11 @@ import {
   readdirSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { HestiaError, type StackRecord, type TunnelRef } from "@hestia/core";
+import { hestiaHome } from "../state.ts";
 import { withLock } from "../proc/lock.ts";
+import { credFilePath } from "./cloudflared.ts";
 import { startProc } from "../proc/supervisor.ts";
 import { isLive, readPidfile, removePidfile } from "../proc/pidfile.ts";
 import { stopProcTree } from "../proc/shutdown.ts";
@@ -35,7 +36,7 @@ export const CONNECTOR = "connector";
 const READY_TIMEOUT_MS = 30_000;
 
 export function tunnelDir(uuid: string): string {
-  return join(homedir(), ".hestia", "tunnel", uuid);
+  return join(hestiaHome(), "tunnel", uuid);
 }
 
 function configPath(uuid: string): string {
@@ -54,6 +55,67 @@ function adoptedMarker(uuid: string): string {
  */
 export function isAdopted(uuid: string): boolean {
   return existsSync(adoptedMarker(uuid));
+}
+
+export interface AdoptedRef {
+  uuid: string;
+  name: string;
+  credFile: string;
+  /** True when a legacy `{at}`-only marker was rebuilt from conventions/mirrors. */
+  reconstructed: boolean;
+}
+
+/**
+ * Read the adopted-tunnel ref for connector revival with no live CLI context.
+ * Markers written before the ref was persisted (legacy `{at}`-only) are
+ * reconstructed: uuid = the dir name, credFile by ~/.cloudflared convention,
+ * name from any stack mirror pinned to this uuid (falls back to the uuid —
+ * base-rule import matches by uuid too, so only name-keyed user configs
+ * degrade, and callers can warn via `reconstructed`). The marker heals itself:
+ * every successful reconcile rewrites it enriched.
+ */
+export function readAdopted(uuid: string): AdoptedRef | null {
+  const p = adoptedMarker(uuid);
+  if (!existsSync(p)) return null;
+  let marker: { name?: string; credFile?: string };
+  try {
+    marker = JSON.parse(readFileSync(p, "utf8")) as typeof marker;
+  } catch {
+    marker = {};
+  }
+  if (typeof marker.name === "string" && typeof marker.credFile === "string") {
+    return { uuid, name: marker.name, credFile: marker.credFile, reconstructed: false };
+  }
+  let name: string | undefined;
+  const stacksDir = join(hestiaHome(), "stacks");
+  if (existsSync(stacksDir)) {
+    for (const project of readdirSync(stacksDir)) {
+      const sp = join(stacksDir, project, "stack.json");
+      if (!existsSync(sp)) continue;
+      try {
+        const record = JSON.parse(readFileSync(sp, "utf8")) as StackRecord;
+        if (record.tunnel?.uuid === uuid) {
+          name = record.tunnel.name;
+          break;
+        }
+      } catch {
+        // unreadable mirror — keep scanning
+      }
+    }
+  }
+  return {
+    uuid,
+    name: name ?? uuid,
+    credFile: marker.credFile ?? credFilePath(uuid),
+    reconstructed: true,
+  };
+}
+
+/** Every tunnel uuid this machine has adopted (daemon supervision set). */
+export function listAdopted(): string[] {
+  const root = join(hestiaHome(), "tunnel");
+  if (!existsSync(root)) return [];
+  return readdirSync(root).filter((uuid) => isAdopted(uuid));
 }
 
 /** Hostnames hestia has route-dns'ed — the ledger that makes re-routing a no-op. */
@@ -93,7 +155,7 @@ export function collectDynamicRules(uuid: string): {
   rules: DynamicRule[];
   dropped: Array<{ project: string; service: string; hostname: string }>;
 } {
-  const stacksDir = join(homedir(), ".hestia", "stacks");
+  const stacksDir = join(hestiaHome(), "stacks");
   const rules: DynamicRule[] = [];
   const dropped: Array<{ project: string; service: string; hostname: string }> = [];
   if (!existsSync(stacksDir)) return { rules, dropped };
@@ -227,7 +289,17 @@ export async function reconcileTunnel(
       };
     }
 
-    writeFileSync(adoptedMarker(ref.uuid), JSON.stringify({ at: new Date().toISOString() }));
+    // Enriched so revival (daemon duties) can rebuild the ref with zero live
+    // stacks; also heals legacy `{at}`-only markers on their first reconcile.
+    writeFileSync(
+      adoptedMarker(ref.uuid),
+      JSON.stringify({
+        at: new Date().toISOString(),
+        uuid: ref.uuid,
+        name: ref.name,
+        credFile: ref.credFile,
+      }),
+    );
 
     const metricsPort = result.record.publishedPort!;
     const ready = await pollReady(

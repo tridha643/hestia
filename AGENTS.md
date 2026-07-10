@@ -9,9 +9,11 @@ over ports, DBs, container names, wrangler service bindings, or public
 hostnames.
 
 This branch (`scope-hestia-terminal-tool`) holds the **docker-compose MVP**,
-the **phase-2 proc + wrangler backend**, and the **phase-3 unified-tunnel
-public ingress**. A concurrency daemon, logs, TUI, and the portless localhost
-URL router are later efforts layered on the same `IsolationEngine` seam.
+the **phase-2 proc + wrangler backend**, the **phase-3 unified-tunnel public
+ingress**, and the **phase-4 hestiad daemon** (machine-wide stack cap +
+connector supervision) with `hestia doctor` and the agent skill. Logs, TUI,
+and the portless localhost URL router are later efforts layered on the same
+`IsolationEngine` seam.
 
 ## Layout
 
@@ -31,10 +33,21 @@ URL router are later efforts layered on the same `IsolationEngine` seam.
   - `tunnel/` — public ingress: `cloudflared` (CLI wrapper — adopt/route,
     uuid-only mutations), `ingress` (hostname derivation, base-rule import,
     merged-config generation), `registry` (the machine-global single-connector
-    singleton + hostname ledger), `verify` (`/ready`+`/quicktunnel` polling).
-- `packages/cli` — the `hestia` CLI
-  (`up`/`run`/`expose`/`stop`/`down`/`status`/`env`/`endpoint`), `--json` on
-  every command, no daemon.
+    singleton + hostname ledger + enriched `adopted.json`), `verify`
+    (`/ready`+`/quicktunnel` polling).
+  - `daemon/` — hestiad: `main` (entrypoint + in-process single-instance
+    guard), `slots` (derived occupancy + persisted reservations), `routes`
+    (`Admission` FIFO + `/hestia/*` HTTP), `duties` (sweep: recount, grant,
+    connector revival), `ensure` (CLI-side spawn/restart), `client` (HTTP
+    client + `daemon.json` discovery), `launchd` (plist gen/install).
+  - `doctor.ts` — report-only, concurrently budgeted preflight/state audit.
+- `packages/session-broker{-core,,-bun}` — **vendored** from modem-dev/hunk
+  (not on npm; see `packages/VENDORED.md` for the pinned commit and the
+  no-fork rule). hestiad composes them as an external consumer would.
+- `packages/cli` — the `hestia` CLI (`up`/`run`/`expose`/`open`/`stop`/`down`/
+  `status`/`env`/`endpoint`/`daemon`/`doctor`), `--json` on every command.
+- `skills/hestia/SKILL.md` — the agent skill: workflow, `--json` contract,
+  error-code table with remedies, invariants agents must respect.
 - `bin/hestia` — bash launcher that execs `bun run packages/cli/src/index.ts`.
 - `test/e2e/isolation.test.ts` — docker-gated compose e2e (two real worktrees,
   distinct ephemeral ports, isolated teardown).
@@ -49,6 +62,9 @@ URL router are later efforts layered on the same `IsolationEngine` seam.
   **stub cloudflared** (`test/fixtures/tunnel-stub/`, always runs, no network);
   generated ingress vs the **real cloudflared parser** offline (auto-gated on
   the binary); a **real quick tunnel** through the edge (`HESTIA_E2E_TUNNEL=1`).
+- `test/e2e/daemon.test.ts` — hestiad e2e, no docker, isolated via
+  `HESTIA_HOME`: auto-spawn, cap admit/deny/queue, crash-respawn,
+  stop-leaves-stacks, stub-connector revival, doctor budget.
 - `hestia-scope.html` / `hestia-tui.html` — scoping doc + TUI design spec.
   Reference-only; not shipped.
 
@@ -62,9 +78,13 @@ bun test            # unit + proc/tunnel-stub e2e always; docker/wrangler auto-g
 bunx tsc --noEmit   # typecheck
 HESTIA_E2E_TUNNEL=1 bun test test/e2e/tunnel.test.ts   # real edge round-trip
 bin/hestia up [--workers[=a,b]] [--allow-remote] [--force] [--no-varlock]
-bin/hestia run --name web [--env K=V] [--no-port] [--varlock] [--signal int] -- <cmd...>
+              [--wait[=secs]] [--no-daemon]
+bin/hestia run --name web [--env K=V] [--no-port] [--varlock] [--signal int]
+               [--wait[=secs]] [--no-daemon] -- <cmd...>
 bin/hestia expose <svc...> [--tunnel <name>] [--zone <z>] [--keep-host-header]
                   [--overwrite-dns] [--force]
+bin/hestia daemon status|start|stop|install [--print]|uninstall
+bin/hestia doctor [--json]     # report-only; exit 1 only on error rows
 bin/hestia stop <name> | down [--project <name>] | status | env | endpoint list
 ```
 
@@ -115,6 +135,19 @@ Public URLs surface as `endpoints[].publicUrl` + `HESTIA_<SVC>_URL`. The
 connector is a global proc under `~/.hestia/tunnel/<uuid>/` — `up`/`run`/
 `stop`/`down` regenerate the merged config and restart it whenever an exposed
 port rotates (a ~2–5 s public blip for all exposed worktrees, by design).
+
+**The daemon (hestiad)** auto-spawns on `up`/`run` — never managed by hand.
+Starting a NEW stack takes one of `maxStacks` machine-wide slots (default 5;
+`HESTIA_MAX_STACKS` env or `~/.hestia/config.json`, strict-parsed — invalid →
+default + warning, never deny-all). At the cap: fail fast with `stack-limit`
+listing the live stacks; `--wait[=secs]` joins a FIFO queue instead;
+`--no-daemon` skips admission entirely. Occupancy is DERIVED (mirrors +
+pidfile/docker-label liveness + persisted reservations under
+`~/.hestia/daemon/reservations/`), so a daemon crash never corrupts
+accounting; only in-memory queue order dies with it. A 15 s sweep frees slots
+of dead stacks and **revives dead connectors of adopted tunnels** (base rules
+must keep serving with zero live stacks). `hestia daemon install` writes a
+launchd agent so hestiad — and the adopted tunnel — survive reboots.
 
 ## Non-obvious invariants
 
@@ -200,32 +233,74 @@ port rotates (a ~2–5 s public blip for all exposed worktrees, by design).
 - **Automated tests never create DNS records and never touch the shared
   account's tunnels.** The stub covers lifecycle; the real binary is used only
   offline (`ingress validate`/`ingress rule`) or account-less (quick mode).
+- **hestiad's single-instance guard lives in `main.ts` under the daemon-dir
+  lock**, not in the spawner — launchd `RunAtLoad` bypasses the CLI's ensure
+  path entirely. The guard's loser exits 0, which pairs with the plist's
+  **`KeepAlive={SuccessfulExit:false}`** (plain `true` would respawn exit-0
+  forever and make `daemon stop` a lie). `daemon stop` boots the label out via
+  launchctl when installed; SIGTERM otherwise. Don't "simplify" either half.
+- **Slot occupancy is DERIVED, never owned**: recomputed from mirrors +
+  liveness each time. Liveness = live non-tunnel pidfiles → provisional
+  `starting` record with a live `starter` (pid+lstart) → label-based
+  `docker ps` probe. Docker *errors* are sticky (keep last known, default
+  LIVE) — a restarting Docker Desktop must never free slots. Quick-tunnel
+  procs (`backend: "tunnel"`) never count.
+- **The provisional `starting` record is the admission bridge**: written
+  right after a grant, before the worktree lock section that starts services.
+  It's why a multi-minute cold `compose up` can't lose its slot and why a
+  CLI crash frees one (dead starter → sweep). Reservation files only bridge
+  the seconds until that record exists.
+- **`ensureDaemon` must not poll while holding the daemon-dir lock** —
+  `main.ts` takes the same lock to start serving; the lock covers only
+  check+spawn (deadlock otherwise, found during implementation).
+- **`adopted.json` is enriched** (`{at, uuid, name, credFile}`) so the daemon
+  can revive a connector with zero live stacks; legacy `{at}`-only markers
+  reconstruct (uuid=dirname, credFile by convention, name from mirrors) and
+  self-heal on the first reconcile. gui LaunchAgents inherit a bare PATH —
+  `daemon install` bakes the user's full PATH into the plist or revival
+  ENOENTs on cloudflared/docker after a reboot.
+- **`HESTIA_HOME` overrides `~/.hestia`** (call-time, mirrors
+  `HESTIA_CLOUDFLARED_HOME`) — the daemon e2e depends on it because cap math
+  is machine-global. `HESTIA_LAUNCHD_DIR` likewise redirects the plist; tests
+  never `launchctl bootstrap`.
+- **The vendored `@hunk/session-broker*` packages are never forked** —
+  `packages/VENDORED.md` pins the commit; behavioral assumptions are pinned by
+  `daemon-vendor.test.ts` (idleTimeoutMs `0` = disabled — a "huge number"
+  would overflow setTimeout and shut down instantly; custom `handleRequest`
+  runs BEFORE broker routes; pruning is inert at 0 sessions).
 
 ## Testing
 
 - Unit: `naming`, `generateOverride`, plus `packages/engine/test/proc.test.ts`
   (detached-spawn survival, ownership oracle, templating, env precedence,
   lstart liveness, lock contention), `wrangler.test.ts` (jsonc/toml discovery,
-  remote detection, filters), and `tunnel.test.ts` (hostname budget/collision,
-  base-rule import, merged-config shape, ledger, mirror-derived rules) — no
-  docker, no network.
-- E2E gating: compose e2e needs docker (`dockerAvailable()` auto-skip); proc
-  e2e and the stub-tunnel e2e always run; wrangler e2e needs `bun install` in
+  remote detection, filters), `tunnel.test.ts` (hostname budget/collision,
+  base-rule import, merged-config shape, ledger, mirror-derived rules),
+  `daemon.test.ts` (occupancy/reservations/FIFO/cap parsing, plist content,
+  adopted.json reconstruction), and `daemon-vendor.test.ts` (the vendored
+  broker behavior pins) — no docker, no network.
+- E2E gating: compose e2e needs docker (`dockerAvailable()` auto-skip); proc,
+  stub-tunnel, and daemon e2e always run; wrangler e2e needs `bun install` in
   `test/fixtures/wrangler-repo`; the offline-ingress tier needs cloudflared on
-  PATH; the edge tier needs `HESTIA_E2E_TUNNEL=1` + network. **Ship gates: the
-  wrangler e2e must have run green locally before committing proc/wrangler
-  changes, and `HESTIA_E2E_TUNNEL=1` must have run green locally before
-  committing tunnel changes** — CI may skip both.
+  PATH; the edge tier needs `HESTIA_E2E_TUNNEL=1` + network. Only the daemon
+  e2e isolates `HESTIA_HOME`; the other suites run against the real
+  environment (user's call) and their teardowns `daemon stop` so no daemon
+  carrying test env (stub PATH!) outlives a run. **Ship gates: the wrangler
+  e2e must have run green locally before committing proc/wrangler changes,
+  and `HESTIA_E2E_TUNNEL=1` must have run green locally before committing
+  tunnel changes** — CI may skip both.
 
 ## What's NOT here yet (planned)
 
-- Concurrency daemon (cap of 5 stacks per plan) + queue
 - Log streaming (`EngineHooks.onLog` reserved; for now `--json` returns each
-  proc's `logPath` and agents tail the file)
-- `hestia logs` / `doctor` / `gc` commands (gc = the CF-API-token DNS cleanup
-  for stale per-branch CNAMEs)
+  proc's `logPath` and agents tail the file) — the vendored session-broker's
+  websocket sessions are the intended substrate
+- `hestia logs` / `gc` commands (gc = the CF-API-token DNS cleanup for stale
+  per-branch CNAMEs)
 - Remote-managed tunnel config (would remove the connector-restart blip on
   ingress changes — reserved as an upgrade, needs an API token)
 - TUI (spec at `hestia-tui.html`)
 - Portless localhost URL router (`Endpoint.reservedName` is populated but
   dormant)
+- Daemon queue persistence (FIFO order dies with a daemon restart; waiters
+  retry — accepted)

@@ -110,6 +110,17 @@ export interface TunnelRef {
   exposures: TunnelExposure[];
 }
 
+/**
+ * Identity of the CLI process holding a stack's admission slot while its
+ * first services start (provisional `state: "starting"` records). A dead
+ * holder (pid+lstart mismatch) is how the daemon sweep frees slots leaked by
+ * a CLI crash mid-`up` — the same identity scheme as pidfiles.
+ */
+export interface StackStarter {
+  pid: number;
+  startTime: string;
+}
+
 export interface StackRecord {
   /** Deterministic compose project name, e.g. "modem-salem". */
   project: string;
@@ -117,6 +128,8 @@ export interface StackRecord {
   branch: string;
   worktree: string;
   state: StackState;
+  /** Present only on provisional (state: "starting") records. */
+  starter?: StackStarter;
   services: ServiceRecord[];
   /** Resolved env block agents consume (DATABASE_URL, etc.). */
   env: Record<string, string>;
@@ -147,7 +160,15 @@ export interface ExposeOptions {
   readyTimeoutMs?: number;
 }
 
-export interface UpOptions {
+/** Daemon admission knobs shared by `up` and `run`. */
+export interface AdmitOptions {
+  /** ms to wait in the daemon's FIFO queue at the cap. Default 0 = fail fast. */
+  wait?: number;
+  /** Skip daemon ensure + admission entirely — capless escape hatch. */
+  noDaemon?: boolean;
+}
+
+export interface UpOptions extends AdmitOptions {
   /** Restrict to a subset of the configured services. */
   services?: string[];
   /** Auto-discover wrangler configs and supervise `wrangler dev` per config.
@@ -164,6 +185,31 @@ export interface UpOptions {
 export interface DownOptions {
   /** Also remove named volumes (data loss). Default keeps them. */
   destroy?: boolean;
+}
+
+/** hestiad `/health` view (broker health merged with hestia's capabilities). */
+export interface DaemonHealth {
+  ok: boolean;
+  pid: number;
+  protocolVersion: number;
+  maxStacks: number;
+  live: number;
+  queued: number;
+  startedAt: string;
+  /** e.g. an invalid HESTIA_MAX_STACKS that fell back to the default. */
+  warnings: string[];
+}
+
+/** hestiad `/hestia/state` view — feeds `daemon status`, doctor, the future TUI. */
+export interface DaemonStateView {
+  maxStacks: number;
+  /** Projects with ≥1 live non-tunnel service (derived from mirrors). */
+  live: string[];
+  /** Granted-but-not-yet-live projects (persisted reservations). */
+  reserved: string[];
+  /** FIFO of projects waiting for a slot. */
+  queued: string[];
+  warnings: string[];
 }
 
 export interface EngineHooks {
@@ -187,7 +233,7 @@ export interface IsolationEngine {
   down(worktree: string, opts?: DownOptions): Promise<void>;
   status(worktree: string): Promise<StackRecord | null>;
   /** Supervise a host process as part of this worktree's stack. */
-  run(worktree: string, spec: ProcSpec): Promise<StackRecord>;
+  run(worktree: string, spec: ProcSpec, admit?: AdmitOptions): Promise<StackRecord>;
   /** Stop one supervised proc. Idempotent: unknown/dead names succeed. */
   stopService(worktree: string, name: string): Promise<void>;
   /** Publish running stack services through a cloudflare tunnel. */
@@ -223,6 +269,7 @@ export class NotImplemented extends Error {
  * Tunnel: cloudflared-missing · tunnel-not-found · tunnel-auth-missing ·
  * tunnel-busy · tunnel-ready-timeout · dns-route-failed · dns-record-conflict ·
  * hostname-conflict · service-not-found.
+ * Daemon: stack-limit · daemon-start-failed · daemon-unreachable.
  */
 export class HestiaError extends Error {
   code: string;

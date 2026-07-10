@@ -1,0 +1,308 @@
+import { describe, expect, test } from "bun:test";
+import {
+  SESSION_BROKER_REGISTRATION_VERSION,
+  brokerWireParsers,
+  parseSessionRegistrationEnvelope,
+  parseSessionSnapshotEnvelope,
+  type SessionRegistration,
+  type SessionServerMessage,
+  type SessionSnapshot,
+} from "@hunk/session-broker-core";
+import { SessionBroker } from "./broker";
+import { createSessionBrokerDaemon } from "./daemon";
+
+interface TestSessionInfo {
+  title: string;
+}
+
+interface TestSessionState {
+  selectedIndex: number;
+}
+
+type TestRegistration = SessionRegistration<TestSessionInfo>;
+type TestSnapshot = SessionSnapshot<TestSessionState>;
+type TestServerMessage = SessionServerMessage<"annotate", { summary: string }>;
+
+function parseInfo(value: unknown): TestSessionInfo | null {
+  const record = brokerWireParsers.asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const title = brokerWireParsers.parseRequiredString(record.title);
+  return title === null ? null : { title };
+}
+
+function parseState(value: unknown): TestSessionState | null {
+  const record = brokerWireParsers.asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const selectedIndex = brokerWireParsers.parseNonNegativeInt(record.selectedIndex);
+  return selectedIndex === null ? null : { selectedIndex };
+}
+
+function createBroker() {
+  return new SessionBroker<TestSessionInfo, TestSessionState, TestServerMessage>({
+    parseRegistration: (value) => parseSessionRegistrationEnvelope(value, parseInfo),
+    parseSnapshot: (value) => parseSessionSnapshotEnvelope(value, parseState),
+  });
+}
+
+function createRegistration(overrides: Partial<TestRegistration> = {}): TestRegistration {
+  return {
+    registrationVersion: SESSION_BROKER_REGISTRATION_VERSION,
+    sessionId: "session-1",
+    pid: 123,
+    cwd: "/repo",
+    repoRoot: "/repo",
+    launchedAt: "2026-04-15T00:00:00.000Z",
+    info: { title: "repo working tree" },
+    ...overrides,
+  };
+}
+
+function createSnapshot(
+  overrides: Partial<TestSnapshot["state"]> & { updatedAt?: string } = {},
+): TestSnapshot {
+  const { updatedAt = "2026-04-15T00:00:00.000Z", ...stateOverrides } = overrides;
+
+  return {
+    updatedAt,
+    state: {
+      selectedIndex: 0,
+      ...stateOverrides,
+    },
+  };
+}
+
+function createConnection() {
+  const sent: string[] = [];
+  let closed: { code?: number; reason?: string } | null = null;
+
+  return {
+    sent,
+    get closed() {
+      return closed;
+    },
+    connection: {
+      send(data: string) {
+        sent.push(data);
+      },
+      close(code?: number, reason?: string) {
+        closed = { code, reason };
+      },
+    },
+  };
+}
+
+describe("session broker daemon", () => {
+  test("serves health and raw list/get requests when the HTTP API is enabled", async () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      capabilities: { version: 1, name: "test-broker" },
+      exposeHttpApi: true,
+    });
+    const { connection } = createConnection();
+    daemon.handleConnectionMessage(
+      connection,
+      JSON.stringify({
+        type: "register",
+        registration: createRegistration(),
+        snapshot: createSnapshot(),
+      }),
+    );
+
+    await expect(
+      daemon.handleRequest(new Request("http://broker.test/health")),
+    ).resolves.toBeInstanceOf(Response);
+    await expect(
+      daemon.handleRequest(new Request("http://broker.test/broker/capabilities")),
+    ).resolves.toBeInstanceOf(Response);
+
+    const listResponse = await daemon.handleRequest(
+      new Request("http://broker.test/broker", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "list" }),
+      }),
+    );
+    expect(listResponse).toBeInstanceOf(Response);
+    await expect(listResponse?.json()).resolves.toMatchObject({
+      sessions: [{ sessionId: "session-1", title: "repo working tree" }],
+    });
+
+    const getResponse = await daemon.handleRequest(
+      new Request("http://broker.test/broker", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "get", selector: { sessionId: "session-1" } }),
+      }),
+    );
+    await expect(getResponse?.json()).resolves.toMatchObject({
+      session: {
+        registration: { sessionId: "session-1" },
+        snapshot: { state: { selectedIndex: 0 } },
+      },
+    });
+
+    daemon.shutdown();
+  });
+
+  test("does not expose the raw broker HTTP API by default", async () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      capabilities: { version: 1 },
+    });
+
+    await expect(
+      daemon.handleRequest(new Request("http://broker.test/broker/capabilities")),
+    ).resolves.toBeNull();
+
+    await expect(
+      daemon.handleRequest(
+        new Request("http://broker.test/broker", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action: "list" }),
+        }),
+      ),
+    ).resolves.toBeNull();
+
+    await expect(
+      daemon.handleRequest(new Request("http://broker.test/health")),
+    ).resolves.toBeInstanceOf(Response);
+    expect(daemon.paths).toEqual({ health: "/health", socket: "/session" });
+    daemon.shutdown();
+  });
+
+  test("requires JSON content type for raw broker API posts", async () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      capabilities: { version: 1 },
+      exposeHttpApi: true,
+    });
+
+    const response = await daemon.handleRequest(
+      new Request("http://broker.test/broker", {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: JSON.stringify({ action: "list" }),
+      }),
+    );
+
+    expect(response?.status).toBe(415);
+    await expect(response?.json()).resolves.toEqual({
+      error: "Expected Content-Type application/json.",
+    });
+    daemon.shutdown();
+  });
+
+  test("rejects raw broker API bodies that exceed the size limit", async () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      capabilities: { version: 1 },
+      exposeHttpApi: true,
+    });
+
+    const oversized = JSON.stringify({ action: "list", filler: "x".repeat(5 * 1024 * 1024) });
+    const response = await daemon.handleRequest(
+      new Request("http://broker.test/broker", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: oversized,
+      }),
+    );
+
+    expect(response?.status).toBe(413);
+    await expect(response?.json()).resolves.toMatchObject({
+      error: expect.stringContaining("session broker limit"),
+    });
+    daemon.shutdown();
+  });
+
+  test("dispatches one raw command through the broker API", async () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      capabilities: { version: 1 },
+      exposeHttpApi: true,
+    });
+    const session = createConnection();
+    const { connection, sent } = session;
+    daemon.handleConnectionMessage(
+      connection,
+      JSON.stringify({
+        type: "register",
+        registration: createRegistration(),
+        snapshot: createSnapshot(),
+      }),
+    );
+
+    const pendingResponse = daemon.handleRequest(
+      new Request("http://broker.test/broker", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "dispatch",
+          selector: { sessionId: "session-1" },
+          command: "annotate",
+          input: { summary: "Review note" },
+        }),
+      }),
+    );
+
+    await Bun.sleep(0);
+    const outgoing = JSON.parse(sent[sent.length - 1]!) as { requestId: string; command: string };
+    expect(outgoing.command).toBe("annotate");
+
+    daemon.handleConnectionMessage(
+      connection,
+      JSON.stringify({
+        type: "command-result",
+        requestId: outgoing.requestId,
+        ok: true,
+        result: { applied: true },
+      }),
+    );
+
+    const response = await pendingResponse;
+    await expect(response?.json()).resolves.toEqual({ result: { applied: true } });
+    daemon.shutdown();
+  });
+
+  test("closes incompatible snapshot updates with a specific reason", () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      capabilities: { version: 1 },
+    });
+    const session = createConnection();
+    const { connection } = session;
+
+    daemon.handleConnectionMessage(
+      connection,
+      JSON.stringify({
+        type: "snapshot",
+        sessionId: "missing-session",
+        snapshot: createSnapshot(),
+      }),
+    );
+
+    expect(session.closed).toEqual({
+      code: 1008,
+      reason: "Session not registered with broker.",
+    });
+    daemon.shutdown();
+  });
+
+  test("requests shutdown after the idle timeout when no sessions remain", async () => {
+    const daemon = createSessionBrokerDaemon({
+      broker: createBroker(),
+      idleTimeoutMs: 20,
+      staleSessionSweepIntervalMs: 10,
+      capabilities: { version: 1 },
+    });
+
+    await expect(daemon.stopped).resolves.toBeUndefined();
+  });
+});

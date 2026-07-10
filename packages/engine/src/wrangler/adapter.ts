@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { connect } from "node:net";
 import { HestiaError, type ProcSpec } from "@hestia/core";
 import { allocatePort } from "../proc/ports.ts";
@@ -108,13 +108,21 @@ export async function planWorkers(
     );
   }
 
-  const bin = join(worktreeRoot, "node_modules", ".bin", "wrangler");
-  if (!existsSync(bin)) {
-    throw new HestiaError(
-      "wrangler-missing",
-      `no local wrangler at ${bin} — hestia never uses a global install`,
-    );
-  }
+  // Per-config resolution: pnpm workspaces (modem) link each app's deps into
+  // <app>/node_modules/.bin, NOT the workspace root — walk from the config's
+  // dir up to the worktree root and take the nearest local wrangler. Never a
+  // global install.
+  const wranglerBinFor = (configPath: string): string | null => {
+    let dir = dirname(configPath);
+    for (;;) {
+      const candidate = join(dir, "node_modules", ".bin", "wrangler");
+      if (existsSync(candidate)) return candidate;
+      if (dir === worktreeRoot) return null;
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      dir = parent;
+    }
+  };
 
   const warnings: string[] = [];
   const named: WorkerConfig[] = [];
@@ -145,6 +153,15 @@ export async function planWorkers(
   const registry = privateRegistryDir(worktreeRoot);
   const specs: ProcSpec[] = [];
   for (const w of named) {
+    const bin = wranglerBinFor(w.configPath);
+    if (bin === null) {
+      throw new HestiaError(
+        "wrangler-missing",
+        `no local wrangler for ${relative(worktreeRoot, w.configPath)} ` +
+          `(searched node_modules/.bin from the config dir up to the worktree ` +
+          `root) — hestia never uses a global install`,
+      );
+    }
     const inspectorPort = await allocatePort();
     specs.push({
       name: w.name!,
