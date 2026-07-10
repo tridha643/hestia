@@ -1,0 +1,8 @@
+{
+  // upstream worker: service-binds to worker-b — the binding must resolve to
+  // the SAME WORKTREE's worker-b via the private dev registry
+  "name": "fixture-worker-a",
+  "main": "index.ts",
+  "compatibility_date": "2025-01-01",
+  "services": [{ "binding": "B", "service": "fixture-worker-b" }]
+}

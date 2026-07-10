@@ -35,9 +35,44 @@ export interface ServiceRecord {
   state: ServiceState;
   /** Container-side port that was published (docker backend). */
   containerPort?: number;
-  /** Docker-assigned ephemeral host port. */
+  /** Host port where the service is reachable (docker-assigned or proc bind-probed). */
   publishedPort?: number;
   containerId?: string;
+  /** proc/wrangler backends: supervised process identity. */
+  pid?: number;
+  /** Process group id (== pid: detached spawn makes the child its own group leader). */
+  pgid?: number;
+  /** Verbatim `ps -o lstart=` output captured post-spawn — the PID-reuse guard. */
+  startTime?: string;
+  /** wrangler backend: probed inspector port injected via --inspector-port. */
+  inspectorPort?: number;
+  /** proc/wrangler backends: stdout+stderr log file. */
+  logPath?: string;
+  /** wrangler backend: the wrangler config this worker was started from. */
+  configPath?: string;
+}
+
+/** Spec for a supervised host process (`hestia run` / the wrangler adapter). */
+export interface ProcSpec {
+  /** Required, deterministic identity within the stack. */
+  name: string;
+  /** Command argv. `{port}` tokens are substituted; `{{port}}` escapes a literal. */
+  argv: string[];
+  /** Working directory relative to the worktree root (default: the root). */
+  cwd?: string;
+  /** Extra env — highest precedence, agent intent always wins. */
+  env?: Record<string, string>;
+  /** "auto" (default): bind-probe a port, inject PORT + tokens. "none": skip. */
+  port?: "auto" | "none";
+  /** Shutdown signal for the process group. Default "term"; wrangler uses "int". */
+  signal?: "term" | "int";
+  readyTimeoutMs?: number;
+  /** Prefix the spawn with the repo's varlock resolver (composition, not integration). */
+  varlock?: boolean;
+  backend?: "proc" | "wrangler";
+  /** wrangler backend metadata carried into the ServiceRecord. */
+  inspectorPort?: number;
+  configPath?: string;
 }
 
 export interface StackRecord {
@@ -52,14 +87,27 @@ export interface StackRecord {
   env: Record<string, string>;
   endpoints: Endpoint[];
   createdAt: string;
-  /** Paths hestia wrote, so `down` works even if the worktree is deleted. */
-  composeFile: string;
-  overrideFile: string;
+  /**
+   * Absent on procs-only stacks (a compose file is not required to `run`).
+   * When present, `down` uses them; the ~/.hestia mirror keeps copies so
+   * teardown works even if the worktree is deleted.
+   */
+  composeFile?: string;
+  overrideFile?: string;
 }
 
 export interface UpOptions {
   /** Restrict to a subset of the configured services. */
   services?: string[];
+  /** Auto-discover wrangler configs and supervise `wrangler dev` per config.
+   * `true` = all discovered; string[] filters by path substring or worker name. */
+  workers?: boolean | string[];
+  /** Allow workers whose config declares `remote: true` bindings. */
+  allowRemote?: boolean;
+  /** Skip the foreign-process (global dev registry) preflight. */
+  force?: boolean;
+  /** Disable the automatic varlock env-resolution wrapper for workers. */
+  noVarlock?: boolean;
 }
 
 export interface DownOptions {
@@ -87,6 +135,12 @@ export interface IsolationEngine {
   up(worktree: string, opts?: UpOptions): Promise<StackRecord>;
   down(worktree: string, opts?: DownOptions): Promise<void>;
   status(worktree: string): Promise<StackRecord | null>;
+  /** Supervise a host process as part of this worktree's stack. */
+  run(worktree: string, spec: ProcSpec): Promise<StackRecord>;
+  /** Stop one supervised proc. Idempotent: unknown/dead names succeed. */
+  stopService(worktree: string, name: string): Promise<void>;
+  /** Tear down by project name from the ~/.hestia mirror — works with the worktree gone. */
+  downProject?(project: string, opts?: DownOptions): Promise<void>;
 
   // Reserved — declared so later work slots in without changing callers.
   restartService?(worktree: string, service: string): Promise<void>;
@@ -102,6 +156,14 @@ export class NotImplemented extends Error {
   }
 }
 
+/**
+ * Codes are the stable CLI contract (`--json` emits `{error: {code, message}}`).
+ * Compose: config-missing · compose-failed · service-exited · ready-timeout.
+ * Proc: lock-timeout · port-allocation-failed · proc-spawn-failed ·
+ * proc-ready-timeout · proc-exited · name-conflict · ownership-tool-missing ·
+ * varlock-missing. Wrangler: no-workers-found · wrangler-missing ·
+ * worktree-busy · remote-binding-blocked · registry-leak.
+ */
 export class HestiaError extends Error {
   code: string;
   constructor(code: string, message: string) {

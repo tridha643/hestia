@@ -1,0 +1,8 @@
+{
+  "name": "hestia-wrangler-fixture",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "^4.96.0",
+    "varlock": "^1.1.0"
+  }
+}

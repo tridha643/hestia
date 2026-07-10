@@ -38,12 +38,19 @@ function serviceNames(composeFile: string): string[] {
  * the ephemeral ports back from `up` and wires whatever URLs it needs.
  */
 export function loadConfig(worktreeRoot: string): StackConfig {
-  const composeFile = firstExisting(worktreeRoot, COMPOSE_FILES);
-  if (composeFile === undefined) {
+  const cfg = tryLoadConfig(worktreeRoot);
+  if (cfg === null) {
     throw new HestiaError(
       "config-missing",
       `no compose file found in ${worktreeRoot}`,
     );
   }
+  return cfg;
+}
+
+/** Procs-only stacks are legal — a missing compose file is not an error here. */
+export function tryLoadConfig(worktreeRoot: string): StackConfig | null {
+  const composeFile = firstExisting(worktreeRoot, COMPOSE_FILES);
+  if (composeFile === undefined) return null;
   return { composeFile, services: serviceNames(composeFile) };
 }

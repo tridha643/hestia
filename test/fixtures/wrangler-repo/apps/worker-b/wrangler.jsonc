@@ -1,0 +1,6 @@
+{
+  // downstream worker: returns its per-worktree marker (from .dev.vars)
+  "name": "fixture-worker-b",
+  "main": "index.ts",
+  "compatibility_date": "2025-01-01"
+}
