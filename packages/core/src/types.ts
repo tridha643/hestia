@@ -212,15 +212,34 @@ export interface DaemonStateView {
   warnings: string[];
 }
 
+/** One arrival-ordered log line; application ANSI bytes are preserved verbatim. */
+export interface LogLine {
+  project: string;
+  service: string;
+  source: ServiceBackend;
+  /** One line without its trailing newline; application ANSI is not sanitized. */
+  text: string;
+  /** True when Hestia synthesized this notice instead of reading application output. */
+  meta?: boolean;
+  /** Reserved for a future source timestamp; unset while ordering is arrival-only. */
+  at?: string;
+}
+
+/** Selection and cancellation controls for the pull-based stack log stream. */
+export interface LogsOptions {
+  /** Service names to stream; defaults to every service in the stack record. */
+  services?: string[];
+  /** Keep streaming new output after the initial backfill. Default false. */
+  follow?: boolean;
+  /** Initial lines per source. Default 50; zero disables backfill. */
+  tail?: number;
+  /** Cooperative cancellation in addition to AsyncIterator.return(). */
+  signal?: AbortSignal;
+}
+
 export interface EngineHooks {
   onServiceState?(project: string, service: string, state: ServiceState): void;
   onEndpoint?(project: string, endpoint: Endpoint): void;
-  onLog?(line: {
-    project: string;
-    service: string;
-    stream: "stdout" | "stderr";
-    text: string;
-  }): void;
 }
 
 /**
@@ -244,6 +263,10 @@ export interface IsolationEngine {
   ): Promise<StackRecord>;
   /** Tear down by project name from the ~/.hestia mirror — works with the worktree gone. */
   downProject?(project: string, opts?: DownOptions): Promise<void>;
+  /** Pull an arrival-ordered stream of docker and supervised-process log lines. */
+  logs?(worktree: string, opts?: LogsOptions): AsyncIterable<LogLine>;
+  /** Pull logs by mirrored project name after its worktree has been deleted. */
+  logsProject?(project: string, opts?: LogsOptions): AsyncIterable<LogLine>;
 
   // Reserved — declared so later work slots in without changing callers.
   restartService?(worktree: string, service: string): Promise<void>;
@@ -269,6 +292,7 @@ export class NotImplemented extends Error {
  * Tunnel: cloudflared-missing · tunnel-not-found · tunnel-auth-missing ·
  * tunnel-busy · tunnel-ready-timeout · dns-route-failed · dns-record-conflict ·
  * hostname-conflict · service-not-found.
+ * Logs: no-stack · service-not-found.
  * Daemon: stack-limit · daemon-start-failed · daemon-unreachable.
  */
 export class HestiaError extends Error {

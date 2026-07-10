@@ -41,6 +41,8 @@ interface Flags {
   wait?: number;
   noDaemon: boolean;
   print: boolean;
+  follow: boolean;
+  tail?: number;
   /** everything after `--` (the `run` command argv) */
   rest: string[];
   _: string[];
@@ -59,6 +61,7 @@ function parseFlags(argv: string[]): Flags {
     overwriteDns: false,
     noDaemon: false,
     print: false,
+    follow: false,
     env: {},
     rest: [],
     _: [],
@@ -87,6 +90,8 @@ function parseFlags(argv: string[]): Flags {
     else if (a === "--overwrite-dns") f.overwriteDns = true;
     else if (a === "--no-daemon") f.noDaemon = true;
     else if (a === "--print") f.print = true;
+    else if (a === "-f" || a === "--follow") f.follow = true;
+    else if (a === "--tail") f.tail = Number(argv[++i]);
     else if (a.startsWith("--wait=")) f.wait = Number(a.slice("--wait=".length));
     else if (a === "--wait") {
       // bare flag = wait a long time; a following number is seconds
@@ -206,6 +211,10 @@ usage:
   hestia status [--json]                  show this worktree's stack
   hestia env  [--json]                    print the injected env (export lines)
   hestia endpoint list [--json]           list endpoints
+  hestia logs [service...] [-f|--follow] [--tail N] [--project <name>] [--json]
+        stream docker and supervised-process logs (default: all services,
+        last 50 lines). --json emits one LogLine JSON object per line;
+        --project reads the mirror and works after worktree deletion
 `;
 
 async function main(): Promise<void> {
@@ -337,6 +346,33 @@ async function main(): Promise<void> {
           for (const e of r.endpoints) {
             const pub = e.publicUrl !== undefined ? `  ${e.publicUrl}` : "";
             process.stdout.write(`${e.name.padEnd(12)} ${e.host}:${e.port}${pub}  (${e.reservedName})\n`);
+          }
+        }
+        break;
+      }
+      case "logs": {
+        if (flags.tail !== undefined && (!Number.isInteger(flags.tail) || flags.tail < 0)) {
+          fail("usage", "--tail requires a non-negative integer", flags.json);
+        }
+        const services = flags._.slice(1);
+        const stream = flags.project !== undefined
+          ? engine.logsProject(flags.project, {
+              services,
+              follow: flags.follow,
+              tail: flags.tail,
+            })
+          : engine.logs(cwd, {
+              services,
+              follow: flags.follow,
+              tail: flags.tail,
+            });
+        const nameWidth = Math.max(8, ...services.map((name) => name.length));
+        for await (const line of stream) {
+          if (flags.json) {
+            process.stdout.write(JSON.stringify(line) + "\n");
+          } else {
+            const text = line.meta ? `[hestia] ${line.text}` : line.text;
+            process.stdout.write(`${line.service.padEnd(nameWidth)} │ ${text}\n`);
           }
         }
         break;

@@ -21,6 +21,7 @@ hestia up --workers                # + one supervised `wrangler dev` per config
 hestia run --name web -- pnpm dev  # supervise any dev server ($PORT injected)
 hestia env                         # export lines: HESTIA_<SVC>_PORT / _URL
 hestia endpoint list --json        # [{name, host, port, publicUrl?}, ...]
+hestia logs -f web --json          # ndjson LogLine stream (docker or proc)
 hestia expose web                  # public URL (quick tunnel, rotates per run)
 hestia expose web --tunnel tri     # sticky named tunnel, stable hostname
 hestia open web /auth/login        # resolve public URL (+path), open browser
@@ -33,8 +34,9 @@ hestia doctor --json               # report-only audit; exit 1 on error rows
 - `up`/`run` inject ports: `$PORT` in the child env, `{port}` tokens in the
   command line (`{{port}}` escapes a literal), `HESTIA_<NAME>_PORT` in `env`.
 - Wire your own URLs from ports: `DATABASE_URL=postgres://…:$HESTIA_DB_PORT/…`.
-- Logs: no `hestia logs` yet — `--json` returns each proc's `logPath`; tail
-  that file (`tail -f .hestia/logs/<name>.log`).
+- Logs: `hestia logs [service...] [-f] [--tail N] [--project P]`; the default
+  is all services and 50 backfill lines. `--json` is ndjson: one `LogLine`
+  (`project`, `service`, `source`, `text`, optional `meta`) per output line.
 - Public URLs are guarded only by obscurity — fine for webhooks/dev demos.
 - **Before deleting a worktree, run `hestia down`.** Forgot? `hestia status
   --json` in any worktree won't show it, but `hestia down --project <name>`
@@ -64,6 +66,7 @@ hestiad daemon auto-starts on `up`/`run` — you never manage it, but you can:
 | `name-conflict` | name taken by another backend | pick another `--name` |
 | `worktree-busy` | foreign wrangler/dev proc holds the registry | stop it, or `--force` |
 | `service-not-found` | expose/open target not running | `hestia up`/`run` it first; for `open`, `expose` it first |
+| `no-stack` | no cwd stack or `--project` mirror exists | start the stack or check the project name |
 | `tunnel-busy` | another connector on the named tunnel | stop your manual `cloudflared tunnel run`; `--force` accepts replica risk |
 | `hostname-conflict` | another worktree owns that public hostname | different service name or branch |
 | `dns-record-conflict` | hostname's DNS points somewhere foreign | `--overwrite-dns` ONLY if you know it's stale |

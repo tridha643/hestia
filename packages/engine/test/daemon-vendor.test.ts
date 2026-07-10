@@ -110,4 +110,45 @@ describe("vendored session-broker behavior pins", () => {
       server.stop(true);
     }
   });
+
+  test("custom handleRequest streams a Response and propagates request cancellation", async () => {
+    const daemon = createSessionBrokerDaemon({ broker: createBroker(), idleTimeoutMs: 0 });
+    let cancelled = false;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    const server = serveSessionBrokerDaemon({
+      daemon,
+      hostname: "127.0.0.1",
+      port: 0,
+      handleRequest: () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("first\n"));
+              interval = setInterval(() => {
+                controller.enqueue(new TextEncoder().encode("tick\n"));
+              }, 10);
+            },
+            cancel() {
+              cancelled = true;
+              clearInterval(interval);
+            },
+          }),
+        ),
+    });
+    try {
+      const requestController = new AbortController();
+      const response = await fetch(`http://127.0.0.1:${server.port}/stream`, {
+        signal: requestController.signal,
+      });
+      const reader = response.body!.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe("first\n");
+      requestController.abort();
+      for (let attempt = 0; attempt < 50 && !cancelled; attempt++) await settle(10);
+      expect(cancelled).toBe(true);
+    } finally {
+      clearInterval(interval);
+      server.stop(true);
+      daemon.shutdown();
+    }
+  });
 });

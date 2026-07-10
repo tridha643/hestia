@@ -9,6 +9,8 @@ import {
   type Endpoint,
   type ExposeOptions,
   type IsolationEngine,
+  type LogLine,
+  type LogsOptions,
   type ProcSpec,
   type ServiceRecord,
   type StackRecord,
@@ -73,11 +75,14 @@ import {
 import { isReady, quickTunnelUrl } from "./tunnel/verify.ts";
 import { ensureDaemon } from "./daemon/ensure.ts";
 import { acquireSlot, readDaemonJson, releaseSlot } from "./daemon/client.ts";
+import { streamStackLogs } from "./logs/stream.ts";
 
 export { dockerAvailable } from "./compose/cli.ts";
 export * from "./compose/override.ts";
 export { withLock } from "./proc/lock.ts";
-export { substitutePort, envKey } from "./proc/supervisor.ts";
+export { substitutePort, envKey, openProcAttemptLog } from "./proc/supervisor.ts";
+export { readLastLines, tailFile } from "./logs/tail.ts";
+export { streamStackLogs } from "./logs/stream.ts";
 export * from "./proc/ports.ts";
 export * from "./proc/pidfile.ts";
 export * from "./proc/resolver.ts";
@@ -242,6 +247,25 @@ function syncExposures(record: StackRecord): boolean {
 const pexec = promisify(execFile);
 
 export class ComposeEngine implements IsolationEngine {
+  /** Stream this worktree's recorded services without taking its mutation lock. */
+  async *logs(cwd: string, opts?: LogsOptions): AsyncGenerator<LogLine> {
+    const { worktreeRoot } = await getRepoInfo(cwd);
+    const record = readState(worktreeRoot);
+    if (record === null) {
+      throw new HestiaError("no-stack", "no stack for this worktree");
+    }
+    yield* streamStackLogs(record, opts);
+  }
+
+  /** Stream a mirrored project without requiring its original worktree. */
+  async *logsProject(project: string, opts?: LogsOptions): AsyncGenerator<LogLine> {
+    const record = readMirrorState(project);
+    if (record === null) {
+      throw new HestiaError("no-stack", `no mirror for project "${project}"`);
+    }
+    yield* streamStackLogs(record, opts);
+  }
+
   /**
    * Best-effort convergence of the global connector after a stack mutation.
    * Failures degrade to warnings — `run`/`down` must not fail because the

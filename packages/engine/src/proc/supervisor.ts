@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { HestiaError, type ProcSpec, type ServiceRecord } from "@hestia/core";
@@ -17,6 +17,7 @@ const READY_TIMEOUT_MS = 60_000;
 const NO_PORT_GRACE_MS = 2_000;
 const POLL_MS = 300;
 const MAX_ATTEMPTS = 3;
+const PROC_RESTART_SENTINEL = "--- hestia: proc restarted (port stolen) ---\n";
 
 export function envKey(name: string): string {
   return name.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
@@ -57,8 +58,9 @@ function spawnOnce(
   cwd: string,
   env: Record<string, string | undefined>,
   logPath: string,
+  attempt: number,
 ): Promise<number> {
-  const fd = openSync(logPath, "w");
+  const fd = openProcAttemptLog(logPath, attempt);
   return new Promise((resolve, reject) => {
     // node:child_process, not Bun.spawn — Bun's native API has no `detached`.
     // detached makes the child its own process-group leader (pgid == pid), so
@@ -84,6 +86,12 @@ function spawnOnce(
       resolve(child.pid!);
     });
   });
+}
+
+/** Open a fresh first-attempt proc log or append a visible port-steal retry sentinel. */
+export function openProcAttemptLog(logPath: string, attempt: number): number {
+  if (attempt > 1) appendFileSync(logPath, PROC_RESTART_SENTINEL);
+  return openSync(logPath, attempt > 1 ? "a" : "w");
 }
 
 /**
@@ -122,7 +130,7 @@ export async function startProc(
       ...spec.env,
     };
 
-    const pid = await spawnOnce(argv, cwd, env, logPath);
+    const pid = await spawnOnce(argv, cwd, env, logPath, attempt);
     const startTime = startTimeOf(pid) ?? "";
     const pf: Pidfile = {
       name: spec.name,

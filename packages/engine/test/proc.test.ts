@@ -1,12 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { closeSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   allocatePort,
   inspectPort,
   isLive,
+  openProcAttemptLog,
   startTimeOf,
   substitutePort,
   withLock,
@@ -119,6 +120,18 @@ describe("port ownership oracle", () => {
 });
 
 describe("startProc", () => {
+  test("fresh attempts truncate while port-steal retries append a sentinel", () => {
+    const logPath = join(scratch(), "retry.log");
+    writeFileSync(logPath, "stale output\n");
+    closeSync(openProcAttemptLog(logPath, 1));
+    expect(readFileSync(logPath, "utf8")).toBe("");
+    writeFileSync(logPath, "first attempt\n");
+    closeSync(openProcAttemptLog(logPath, 2));
+    expect(readFileSync(logPath, "utf8")).toBe(
+      "first attempt\n--- hestia: proc restarted (port stolen) ---\n",
+    );
+  });
+
   test("no-port proc gets env layered correctly (spec.env wins) and stops cleanly", async () => {
     const wt = scratch();
     const outFile = join(wt, "env.json");

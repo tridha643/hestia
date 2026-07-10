@@ -11,8 +11,9 @@ hostnames.
 This branch (`scope-hestia-terminal-tool`) holds the **docker-compose MVP**,
 the **phase-2 proc + wrangler backend**, the **phase-3 unified-tunnel public
 ingress**, and the **phase-4 hestiad daemon** (machine-wide stack cap +
-connector supervision) with `hestia doctor` and the agent skill. Logs, TUI,
-and the portless localhost URL router are later efforts layered on the same
+connector supervision) with `hestia doctor` and the agent skill, plus the
+phase-5 pull-based log stream and `hestia logs`. The TUI and the portless
+localhost URL router are later efforts layered on the same
 `IsolationEngine` seam.
 
 ## Layout
@@ -41,11 +42,13 @@ and the portless localhost URL router are later efforts layered on the same
     connector revival), `ensure` (CLI-side spawn/restart), `client` (HTTP
     client + `daemon.json` discovery), `launchd` (plist gen/install).
   - `doctor.ts` — report-only, concurrently budgeted preflight/state audit.
+  - `logs/` — ordered file backfill/follow, label-only docker log streaming,
+    and the arrival-order multi-source `AsyncIterable<LogLine>` merge.
 - `packages/session-broker{-core,,-bun}` — **vendored** from modem-dev/hunk
   (not on npm; see `packages/VENDORED.md` for the pinned commit and the
   no-fork rule). hestiad composes them as an external consumer would.
 - `packages/cli` — the `hestia` CLI (`up`/`run`/`expose`/`open`/`stop`/`down`/
-  `status`/`env`/`endpoint`/`daemon`/`doctor`), `--json` on every command.
+  `status`/`env`/`endpoint`/`logs`/`daemon`/`doctor`), `--json` on every command.
 - `skills/hestia/SKILL.md` — the agent skill: workflow, `--json` contract,
   error-code table with remedies, invariants agents must respect.
 - `bin/hestia` — bash launcher that execs `bun run packages/cli/src/index.ts`.
@@ -65,6 +68,8 @@ and the portless localhost URL router are later efforts layered on the same
 - `test/e2e/daemon.test.ts` — hestiad e2e, no docker, isolated via
   `HESTIA_HOME`: auto-spawn, cap admit/deny/queue, crash-respawn,
   stop-leaves-stacks, stub-connector revival, doctor budget.
+- `test/e2e/logs.test.ts` — always-run proc logs plus docker-gated compose
+  backfill/follow, including reset handling and mirror reads after deletion.
 - `hestia-scope.html` / `hestia-tui.html` — scoping doc + TUI design spec.
   Reference-only; not shipped.
 
@@ -190,6 +195,13 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
   kill against pid reuse. Don't parse it, don't reformat it.
 - **`Bun.spawn` has no `detached`** — the supervisor uses `node:child_process`
   under Bun (compat verified by a unit test). Don't "simplify" it back.
+- **Proc logs truncate only on attempt 1 of a user start.** Port-steal readiness
+  retries append and first write `--- hestia: proc restarted (port stolen) ---`;
+  followers must see the retry instead of losing output to a truncate storm.
+- **Log streaming is pull-based.** `IsolationEngine.logs`/`logsProject` return
+  an `AsyncIterable<LogLine>`; consumer return/abort tears down file polls and
+  docker children. The old unimplementable `EngineHooks.onLog` was removed;
+  stdout and stderr share one proc fd and cannot be labeled truthfully.
 - **All state mutations serialize on `<worktree>/.hestia/lock`** (`withLock`):
   parallel agents in one worktree are the product premise; unserialized
   read-modify-write of `stack.json` loses records. Stale locks (dead holder)
@@ -292,11 +304,9 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
 
 ## What's NOT here yet (planned)
 
-- Log streaming (`EngineHooks.onLog` reserved; for now `--json` returns each
-  proc's `logPath` and agents tail the file) — the vendored session-broker's
-  websocket sessions are the intended substrate
-- `hestia logs` / `gc` commands (gc = the CF-API-token DNS cleanup for stale
-  per-branch CNAMEs)
+- Daemon HTTP log streaming (the CLI intentionally reads the engine seam
+  directly; the TUI phase will design the daemon transport it consumes)
+- `hestia gc` (CF-API-token DNS cleanup for stale per-branch CNAMEs)
 - Remote-managed tunnel config (would remove the connector-restart blip on
   ingress changes — reserved as an upgrade, needs an API token)
 - TUI (spec at `hestia-tui.html`)
