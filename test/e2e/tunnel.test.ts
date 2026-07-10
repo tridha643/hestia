@@ -140,6 +140,7 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       PATH: `${STUB_DIR}:${process.env.PATH}`,
       HESTIA_STUB_STATE: stubState,
       HESTIA_CLOUDFLARED_HOME: cfHome,
+      HESTIA_NO_OPEN: "1", // never spawn a real browser from the suite
     };
   });
 
@@ -288,6 +289,16 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       const quick = JSON.parse(runCli(wtQ, ["expose", "web", "--json"]).stdout) as StackJson;
       expect(quick.env.HESTIA_WEB_URL).toMatch(/^https:\/\/stub-.*\.trycloudflare\.com$/);
       expect(quick.services.some((s) => s.name === "tunnel-web")).toBe(true);
+
+      // `hestia open` resolves the public URL (+ optional path) for a click
+      const opened = JSON.parse(
+        runCli(wtQ, ["open", "web", "/auth/login", "--json"]).stdout,
+      ) as { url: string };
+      expect(opened.url).toBe(`${quick.env.HESTIA_WEB_URL}/auth/login`);
+      const bare = JSON.parse(runCli(wtQ, ["open", "web", "--json"]).stdout) as { url: string };
+      expect(bare.url).toBe(quick.env.HESTIA_WEB_URL);
+      // unexposed service → clear error, not a crash
+      expect(runCli(wtQ, ["open", "nope", "--json"]).stdout).toContain("service-not-found");
       // stopping the quick tunnel clears its origin's public URL
       expect(runCli(wtQ, ["stop", "tunnel-web"]).code).toBe(0);
       const after = JSON.parse(runCli(wtQ, ["status", "--json"]).stdout) as StackJson;

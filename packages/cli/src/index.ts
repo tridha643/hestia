@@ -83,6 +83,26 @@ function parseFlags(argv: string[]): Flags {
   return f;
 }
 
+/**
+ * Best-effort browser open. Always a no-op-safe side effect — the URL is
+ * printed regardless, so a headless/remote agent still hands the human a
+ * clickable link. HESTIA_NO_OPEN skips the shell-out (tests, pure-resolve use).
+ */
+function openUrl(url: string): void {
+  if (process.env.HESTIA_NO_OPEN) return;
+  const [cmd, ...pre] =
+    process.platform === "darwin"
+      ? ["open"]
+      : process.platform === "win32"
+        ? ["cmd", "/c", "start", ""]
+        : ["xdg-open"];
+  try {
+    Bun.spawn([cmd!, ...pre, url], { stdout: "ignore", stderr: "ignore" }).unref();
+  } catch {
+    // no browser here — the printed URL is the fallback
+  }
+}
+
 function fail(code: string, message: string, json: boolean): never {
   if (json) {
     process.stdout.write(JSON.stringify({ error: { code, message } }) + "\n");
@@ -132,6 +152,10 @@ usage:
         public URLs guarded only by obscurity. Tip: a one-time wildcard
         CNAME  *.<zone> → <tunnel-uuid>.cfargotunnel.com  makes hestia's
         per-branch DNS writes unnecessary.
+  hestia open <service> [path] [--json]
+        resolve a service's public URL (from \`expose\`) and open it in the
+        browser; the URL is always printed too, so a headless agent can hand
+        the human a direct-click link. HESTIA_NO_OPEN prints only.
   hestia stop <name> [--json]             stop one supervised proc (idempotent)
   hestia down [--destroy] [--project <name>] [--json]
         tear down procs + containers (--destroy also removes volumes);
@@ -195,6 +219,29 @@ async function main(): Promise<void> {
         });
         if (flags.json) process.stdout.write(JSON.stringify(r, null, 2) + "\n");
         else printStackHuman(r);
+        break;
+      }
+      case "open": {
+        const service = flags._[1];
+        if (!service) fail("usage", "usage: hestia open <service> [path]", flags.json);
+        const r = await engine.status(cwd);
+        if (r === null) fail("no-stack", "no stack for this worktree", flags.json);
+        const base = r.endpoints.find((e) => e.name === service)?.publicUrl;
+        if (base === undefined) {
+          fail(
+            "service-not-found",
+            `"${service}" has no public URL — run \`hestia expose ${service}\` first`,
+            flags.json,
+          );
+        }
+        const path = flags._[2];
+        const url =
+          path === undefined
+            ? base
+            : base.replace(/\/$/, "") + (path.startsWith("/") ? path : `/${path}`);
+        openUrl(url);
+        if (flags.json) process.stdout.write(JSON.stringify({ url }) + "\n");
+        else process.stdout.write(`${url}\n`);
         break;
       }
       case "stop": {
