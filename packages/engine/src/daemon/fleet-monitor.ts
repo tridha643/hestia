@@ -19,6 +19,13 @@ import { getRepoInfo } from "../git.ts";
 import { allListeners, processTree, type Listener } from "../proc/ports.ts";
 import { isLive, listPidfiles } from "../proc/pidfile.ts";
 import { hestiaHome, mirrorProcsDir } from "../state.ts";
+import {
+  effectiveLocalRouteServices,
+  readHestiaMachineConfig,
+  type HestiaMachineConfig,
+} from "../router/router-config.ts";
+import { resolvedLocalRouteHostname } from "../router/local-http-router.ts";
+import { readHestiaRouterStatus } from "../router/portless-adapter.ts";
 import { resolveMaxStacks, type SlotLedger, type StackReservation } from "./slots.ts";
 
 const pexec = promisify(execFile);
@@ -159,6 +166,8 @@ async function observeFleetService(
   service: ServiceRecord,
   docker: DockerServiceSnapshot,
   listeners: Listener[] | null,
+  config: HestiaMachineConfig,
+  localRouterUsable: boolean,
 ): Promise<FleetServiceView> {
   let state: FleetServiceView["state"];
   if (service.backend === "docker") {
@@ -181,6 +190,13 @@ async function observeFleetService(
     state = owner !== undefined && members.has(owner.pid) ? "healthy" : "unhealthy";
   }
   const endpoint = record.endpoints.find((candidate) => candidate.name === service.name);
+  const locallyRouted = effectiveLocalRouteServices(record, config).includes(service.name);
+  const directUrl = locallyRouted && service.publishedPort !== undefined
+    ? `http://127.0.0.1:${service.publishedPort}`
+    : undefined;
+  const localUrl = locallyRouted && localRouterUsable
+    ? `https://${resolvedLocalRouteHostname(record, service.name, config)}`
+    : undefined;
   return {
     name: service.name,
     backend: service.backend,
@@ -192,7 +208,8 @@ async function observeFleetService(
           name: endpoint.name,
           host: endpoint.host,
           port: endpoint.port,
-          url: endpoint.url,
+          url: directUrl,
+          localUrl,
           publicUrl: endpoint.publicUrl,
         },
   };
@@ -235,8 +252,11 @@ export async function collectFleetSnapshot(
   admission: FleetAdmissionSource,
 ): Promise<FleetSnapshot> {
   const mirrorResult = readManagedMirrors();
+  const machineConfig = readHestiaMachineConfig();
+  const routerStatus = await readHestiaRouterStatus();
+  const localRouterUsable = routerStatus.installed && routerStatus.running && routerStatus.trusted;
   const docker = await collectDockerServiceSnapshot();
-  const warnings = [...mirrorResult.warnings];
+  const warnings = [...mirrorResult.warnings, ...machineConfig.warnings];
   if (docker.warning !== undefined) warnings.push(docker.warning);
   const attributed: StackRecord[] = [];
   for (const record of mirrorResult.records) {
@@ -277,7 +297,14 @@ export async function collectFleetSnapshot(
   const allStackViews: FleetStackView[] = [];
   for (const record of attributed) {
     const services = await Promise.all(
-      record.services.map((service) => observeFleetService(record, service, docker, listeners)),
+      record.services.map((service) => observeFleetService(
+        record,
+        service,
+        docker,
+        listeners,
+        machineConfig.config,
+        localRouterUsable,
+      )),
     );
     const derivedPhase = deriveFleetPhase(record, services);
     allStackViews.push({

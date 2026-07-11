@@ -52,7 +52,25 @@ function selectedStack(snapshot: FleetSnapshot, project?: string): FleetStackVie
 function usableEndpoint(stack: FleetStackView | undefined, serviceName?: string): string | undefined {
   const endpoint = stack?.services.find((service) => service.name === serviceName)?.endpoint;
   if (endpoint === undefined) return undefined;
-  return endpoint.publicUrl ?? endpoint.url ?? `${endpoint.host}:${endpoint.port}`;
+  return endpoint.localUrl ?? endpoint.publicUrl ?? endpoint.url ?? `${endpoint.host}:${endpoint.port}`;
+}
+
+function copyableEndpoint(
+  stack: FleetStackView | undefined,
+  serviceName?: string,
+): FleetStackView["services"][number]["endpoint"] {
+  return stack?.services.find((service) => service.name === serviceName)?.endpoint;
+}
+
+/** Reset the visible log ring whenever a stack or service incarnation changes. */
+export function fleetLogSelectionKey(
+  stack: FleetStackView | undefined,
+  serviceName: string | undefined,
+): string | undefined {
+  if (stack === undefined || serviceName === undefined) return undefined;
+  const service = stack.services.find((candidate) => candidate.name === serviceName);
+  if (service === undefined) return undefined;
+  return `${stack.project}\0${service.name}\0${stack.createdAt ?? ""}\0${service.publishedPort ?? ""}`;
 }
 
 function openFleetUrl(value: string): void {
@@ -133,9 +151,8 @@ export function FleetApp({
     };
   }, [preferredProject, source]);
 
-  const selectionKey = state.selection.project !== undefined && state.selection.service !== undefined
-    ? `${state.selection.project}\0${state.selection.service}`
-    : undefined;
+  const selectedLogStack = selectedStack(snapshot, state.selection.project);
+  const selectionKey = fleetLogSelectionKey(selectedLogStack, state.selection.service);
   useEffect(() => {
     setLogs([]);
     if (selectionKey === undefined) return;
@@ -161,6 +178,7 @@ export function FleetApp({
     [snapshot, state.filter],
   );
   const stack = selectedStack(snapshot, state.selection.project);
+  const endpointView = copyableEndpoint(stack, state.selection.service);
   const endpoint = usableEndpoint(stack, state.selection.service);
   const effectiveLayout = state.layout === "auto"
     ? terminal.width >= 110 ? "split" : "stack"
@@ -289,6 +307,23 @@ export function FleetApp({
       setNotice(copied ? `copied ${endpoint}` : `copy unavailable: ${endpoint}`);
       return;
     }
+    const copySurfaceRequested = ["c", "l", "p"].some((name) => isFleetKey(key, name));
+    const surface = isFleetKey(key, "c")
+      ? endpointView?.url
+      : isFleetKey(key, "l")
+        ? endpointView?.localUrl
+        : isFleetKey(key, "p")
+          ? endpointView?.publicUrl
+          : undefined;
+    if (surface !== undefined) {
+      const copied = renderer.copyToClipboardOSC52(surface);
+      setNotice(copied ? `copied ${surface}` : `copy unavailable: ${surface}`);
+      return;
+    }
+    if (copySurfaceRequested) {
+      setNotice("selected URL surface is unavailable");
+      return;
+    }
     const delta = key.name === "down" || isFleetKey(key, "j")
       ? 1
       : key.name === "up" || isFleetKey(key, "k")
@@ -315,26 +350,44 @@ export function FleetApp({
 
       {effectiveLayout === "split" ? (
         <box style={{ flexGrow: 1, flexDirection: "row" }}>
-          <StackSidebar stacks={stacks} selectedProject={state.selection.project} width={Math.max(28, Math.floor(terminal.width * 0.28))} />
+          <StackSidebar
+            stacks={stacks}
+            selectedProject={state.selection.project}
+            width={Math.max(28, Math.floor(terminal.width * 0.28))}
+            onSelectProject={(project) => dispatch({ type: "select-stack", project, snapshot })}
+          />
           <box style={{ flexGrow: 1, flexDirection: "column" }}>
             <box style={{ height: Math.min(10, Math.max(5, (stack?.services.length ?? 0) + 2)) }}>
-              <ServicePane stack={stack} selectedService={state.selection.service} />
+              <ServicePane
+                stack={stack}
+                selectedService={state.selection.service}
+                onSelectService={(service) => dispatch({ type: "select-service", service, snapshot })}
+              />
             </box>
             <box style={{ flexGrow: 1 }}>
-              <LogPane lines={logs} height={Math.max(5, terminal.height - 13)} width={Math.max(20, Math.floor(terminal.width * 0.72))} offset={state.logOffset} follow={state.follow} unseen={state.unseenLines} label={logLabel} />
+              <LogPane lines={logs} height={Math.max(5, terminal.height - 13)} width={Math.max(20, Math.floor(terminal.width * 0.72))} offset={state.logOffset} follow={state.follow} unseen={state.unseenLines} label={logLabel} onScroll={(delta) => dispatch({ type: "scroll-logs", delta })} />
             </box>
           </box>
         </box>
       ) : (
         <box style={{ flexGrow: 1, flexDirection: "column" }}>
           <box style={{ height: Math.min(7, Math.max(4, stacks.length + 2)) }}>
-            <StackSidebar stacks={stacks} selectedProject={state.selection.project} width={terminal.width} />
+            <StackSidebar
+              stacks={stacks}
+              selectedProject={state.selection.project}
+              width={terminal.width}
+              onSelectProject={(project) => dispatch({ type: "select-stack", project, snapshot })}
+            />
           </box>
           <box style={{ height: Math.min(8, Math.max(4, (stack?.services.length ?? 0) + 2)) }}>
-            <ServicePane stack={stack} selectedService={state.selection.service} />
+            <ServicePane
+              stack={stack}
+              selectedService={state.selection.service}
+              onSelectService={(service) => dispatch({ type: "select-service", service, snapshot })}
+            />
           </box>
           <box style={{ flexGrow: 1 }}>
-            <LogPane lines={logs} height={Math.max(5, terminal.height - 17)} width={terminal.width} offset={state.logOffset} follow={state.follow} unseen={state.unseenLines} label={logLabel} />
+            <LogPane lines={logs} height={Math.max(5, terminal.height - 17)} width={terminal.width} offset={state.logOffset} follow={state.follow} unseen={state.unseenLines} label={logLabel} onScroll={(delta) => dispatch({ type: "scroll-logs", delta })} />
           </box>
         </box>
       )}
@@ -354,7 +407,7 @@ export function FleetApp({
           </>
         ) : (
           <text fg={notice ? fleetTheme.warning : fleetTheme.muted}>
-            {notice || "j/k navigate · [/] service · / filter · d down · D doctor · ? help · q quit"}
+            {notice || "click rows · wheel logs · j/k navigate · [/] service · / filter · d down · ? help · q quit"}
           </text>
         )}
       </box>
@@ -362,10 +415,12 @@ export function FleetApp({
       {state.helpOpen ? (
         <FleetModal title="Fleet help" terminalWidth={terminal.width} terminalHeight={terminal.height}>
           <text fg={fleetTheme.text}>j/k or arrows  navigate focused pane</text>
+          <text fg={fleetTheme.text}>mouse  click stacks/services · wheel scroll logs</text>
           <text fg={fleetTheme.text}>Tab / Shift-Tab  change pane</text>
           <text fg={fleetTheme.text}>[ / ]  previous / next service</text>
           <text fg={fleetTheme.text}>/ filter · G follow logs · 0/1/2 layout</text>
-          <text fg={fleetTheme.text}>o open · y copy · D doctor</text>
+          <text fg={fleetTheme.text}>o open · y primary · c direct · l local · p public</text>
+          <text fg={fleetTheme.text}>D doctor</text>
           <text fg={fleetTheme.danger}>d confirmed down (named volumes retained)</text>
           <text fg={fleetTheme.muted}>Esc closes this dialog</text>
         </FleetModal>

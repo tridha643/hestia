@@ -20,7 +20,11 @@
   "dependencies": {
     "@opentui/core": "0.4.3",
     "@opentui/react": "0.4.3",
+    "portless": "0.15.1",
     "react": "19.2.4",
     "yaml": "^2.6.0"
+  },
+  "patchedDependencies": {
+    "portless@0.15.1": "patches/portless@0.15.1.patch"
   }
 }

@@ -1,0 +1,176 @@
+diff --git a/dist/cli.js b/dist/cli.js
+--- a/dist/cli.js
++++ b/dist/cli.js
+@@ -2867,7 +2867,12 @@
+ var SYSTEMD_SERVICE = "portless.service";
+ var WINDOWS_TASK_NAME = "Portless Proxy";
+ var INTERNAL_ELEVATED_ENV = "PORTLESS_INTERNAL_SERVICE_ELEVATED";
+-var SERVICE_ENV_KEYS = /* @__PURE__ */ new Set(["PORTLESS_SYNC_HOSTS"]);
++var SERVICE_ENV_KEYS = /* @__PURE__ */ new Set([
++  "PORTLESS_SYNC_HOSTS",
++  "HESTIA_PORTLESS_ROUTES_PATH",
++  "HESTIA_PORTLESS_ROOT_STATE",
++  "HESTIA_PORTLESS_ROUTES_UID"
++]);
+ function normalizeTlds(tlds) {
+   return [...new Set(tlds.length > 0 ? tlds : [DEFAULT_TLD])];
+ }
+@@ -4067,9 +4072,85 @@
+   } catch {
+   }
+   fixOwnership(routesPath);
+-  let cachedRoutes = store.loadRoutes();
++  const externalRoutesPath = process.env.HESTIA_PORTLESS_ROUTES_PATH;
++  const loadExternalRoutes = () => {
++    if (!externalRoutesPath) return [];
++    let fd;
++    try {
++      fd = fs9.openSync(
++        externalRoutesPath,
++        fs9.constants.O_RDONLY | (fs9.constants.O_NOFOLLOW ?? 0)
++      );
++      const stat = fs9.fstatSync(fd);
++      const expectedUid = Number(process.env.HESTIA_PORTLESS_ROUTES_UID);
++      if (!stat.isFile() || stat.size > 1024 * 1024 || !Number.isInteger(expectedUid) || stat.uid !== expectedUid) {
++        return [];
++      }
++      const parsed = JSON.parse(fs9.readFileSync(fd, "utf8"));
++      if (!Array.isArray(parsed)) return [];
++      return parsed.filter((route) =>
++        typeof route === "object" && route !== null &&
++        typeof route.hostname === "string" &&
++        route.hostname.endsWith(".localhost") && route.hostname.length <= 253 &&
++        route.hostname.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) &&
++        Number.isInteger(route.port) && route.port > 0 && route.port <= 65535 &&
++        Number.isInteger(route.pid) && route.pid > 0 &&
++        typeof route.startTime === "string" && route.startTime.length > 0 && route.startTime.length <= 128
++      );
++    } catch {
++      return [];
++    } finally {
++      if (fd !== void 0) fs9.closeSync(fd);
++    }
++  };
++  const loadAllRoutes = () => {
++    const externalRoutes = loadExternalRoutes();
++    const externalHostnames = new Set(externalRoutes.map((route) => route.hostname));
++    return [
++      ...store.loadRoutes().filter((route) => !externalHostnames.has(route.hostname)),
++      ...externalRoutes
++    ];
++  };
++  let cachedRoutes = loadAllRoutes();
++  let liveRouteIdentities = /* @__PURE__ */ new Set();
++  const routeIdentityKey = (route) => `${route.pid}\0${route.startTime}`;
++  const refreshRouteIdentities = () => {
++    const guardedRoutes = cachedRoutes.filter((route) => typeof route.startTime === "string");
++    if (guardedRoutes.length === 0) {
++      liveRouteIdentities = /* @__PURE__ */ new Set();
++      return;
++    }
++    try {
++      const pids = [...new Set(guardedRoutes.map((route) => route.pid))];
++      const output = execFileSync("ps", ["-p", pids.join(","), "-o", "pid=,lstart="], {
++        encoding: "utf8",
++        timeout: 1e3
++      });
++      const identities = /* @__PURE__ */ new Set();
++      for (const line of output.split("\n")) {
++        const match = line.match(/^\s*(\d+)\s+(.+)$/);
++        if (match) identities.add(`${Number(match[1])}\0${match[2]}`);
++      }
++      liveRouteIdentities = identities;
++    } catch {
++      liveRouteIdentities = /* @__PURE__ */ new Set();
++    }
++  };
++  const routeProcessIsAlive = (route) => {
++    if (route.pid === 0) return true;
++    try {
++      process.kill(route.pid, 0);
++    } catch {
++      return false;
++    }
++    return typeof route.startTime !== "string" || liveRouteIdentities.has(routeIdentityKey(route));
++  };
++  refreshRouteIdentities();
++  const identityRefreshInterval = setInterval(refreshRouteIdentities, 500);
++  identityRefreshInterval.unref();
+   let debounceTimer = null;
+   let watcher = null;
++  let externalWatcher = null;
+   let pollingInterval = null;
+   const autoSyncHosts = shouldAutoSyncHosts(process.env.PORTLESS_SYNC_HOSTS);
+   const onMdnsError = (msg) => console.warn(chalk.yellow(msg));
+@@ -4098,7 +4179,8 @@
+   const reloadRoutes = () => {
+     try {
+       const previousRoutes = new Map(cachedRoutes.map((r) => [r.hostname, r.port]));
+-      cachedRoutes = store.loadRoutes();
++      cachedRoutes = loadAllRoutes();
++      refreshRouteIdentities();
+       if (autoSyncHosts) {
+         syncHostsFile(cachedRoutes.map((r) => r.hostname));
+       }
+@@ -4131,12 +4213,24 @@
+     console.warn(colors_default.yellow("fs.watch unavailable; falling back to polling for route changes"));
+     pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
+   }
++  if (externalRoutesPath) {
++    try {
++      const externalBasename = path9.basename(externalRoutesPath);
++      externalWatcher = fs9.watch(path9.dirname(externalRoutesPath), (_event, filename) => {
++        if (filename && filename.toString() !== externalBasename) return;
++        if (debounceTimer) clearTimeout(debounceTimer);
++        debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);
++      });
++    } catch {
++      if (!pollingInterval) pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
++    }
++  }
+   if (autoSyncHosts) {
+     syncHostsFile(cachedRoutes.map((r) => r.hostname));
+   }
+   publishCachedRoutes();
+   const server = createProxyServer({
+-    getRoutes: () => cachedRoutes,
++    getRoutes: () => cachedRoutes.filter(routeProcessIsAlive),
+     proxyPort,
+     tld,
+     tlds,
+@@ -4171,9 +4265,9 @@
+     redirectServer.on("error", () => {
+       redirectServer = null;
+     });
+-    redirectServer.listen(80);
++    redirectServer.listen(80, "127.0.0.1");
+   }
+-  server.listen(proxyPort, () => {
++  server.listen(proxyPort, "127.0.0.1", () => {
+     fs9.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
+     fs9.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
+     writeTlsMarker(store.dir, isTls);
+@@ -4215,10 +4309,12 @@
+     exiting = true;
+     if (debounceTimer) clearTimeout(debounceTimer);
+     if (pollingInterval) clearInterval(pollingInterval);
++    clearInterval(identityRefreshInterval);
+     if (lanMonitor) lanMonitor.stop();
+     if (watcher) {
+       watcher.close();
+     }
++    if (externalWatcher) externalWatcher.close();
+     if (activeLanIp) cleanupAll();
+     if (redirectServer) {
+       redirectServer.close();
+diff --git a/dist/chunk-SD2PIWJU.js b/dist/chunk-SD2PIWJU.js
+--- a/dist/chunk-SD2PIWJU.js
++++ b/dist/chunk-SD2PIWJU.js
+@@ -2,6 +2,7 @@
+ import * as fs from "fs";
+ function fixOwnership(...paths) {
+   if (process.platform === "win32") return;
++  if (process.env.HESTIA_PORTLESS_ROOT_STATE === "1") return;
+   const uid = process.env.SUDO_UID;
+   const gid = process.env.SUDO_GID;
+   if (!uid || process.getuid?.() !== 0) return;

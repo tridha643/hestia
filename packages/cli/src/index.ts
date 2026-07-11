@@ -4,14 +4,21 @@ import {
   doctor,
   engine,
   ensureDaemon,
+  effectiveLocalRouteServices,
   fetchHealth,
   fetchState,
   installLaunchd,
+  installHestiaRouter,
   launchdManagesThisHome,
+  resolvedLocalRouteHostname,
   plistPath,
   readDaemonJson,
+  readHestiaMachineConfig,
+  readHestiaRouterStatus,
+  hestiaConfigTomlPath,
   stopDaemonProcess,
   uninstallLaunchd,
+  uninstallHestiaRouter,
 } from "@hestia/engine";
 import { execFileSync } from "node:child_process";
 import { HestiaError, type ProcSpec, type StackRecord } from "@hestia/core";
@@ -41,6 +48,11 @@ interface Flags {
   wait?: number;
   noDaemon: boolean;
   print: boolean;
+  interactive: boolean;
+  direct: boolean;
+  local: boolean;
+  public: boolean;
+  file?: string;
   follow: boolean;
   tail?: number;
   /** everything after `--` (the `run` command argv) */
@@ -61,6 +73,10 @@ function parseFlags(argv: string[]): Flags {
     overwriteDns: false,
     noDaemon: false,
     print: false,
+    interactive: false,
+    direct: false,
+    local: false,
+    public: false,
     follow: false,
     env: {},
     rest: [],
@@ -90,6 +106,11 @@ function parseFlags(argv: string[]): Flags {
     else if (a === "--overwrite-dns") f.overwriteDns = true;
     else if (a === "--no-daemon") f.noDaemon = true;
     else if (a === "--print") f.print = true;
+    else if (a === "--interactive") f.interactive = true;
+    else if (a === "--direct") f.direct = true;
+    else if (a === "--local") f.local = true;
+    else if (a === "--public") f.public = true;
+    else if (a === "--file") f.file = argv[++i];
     else if (a === "-f" || a === "--follow") f.follow = true;
     else if (a === "--tail") f.tail = Number(argv[++i]);
     else if (a.startsWith("--wait=")) f.wait = Number(a.slice("--wait=".length));
@@ -137,9 +158,14 @@ function openUrl(url: string): void {
   }
 }
 
-function fail(code: string, message: string, json: boolean): never {
+function fail(
+  code: string,
+  message: string,
+  json: boolean,
+  details?: Record<string, unknown>,
+): never {
   if (json) {
-    process.stdout.write(JSON.stringify({ error: { code, message } }) + "\n");
+    process.stdout.write(JSON.stringify({ error: { code, message, ...(details ? { details } : {}) } }) + "\n");
   } else {
     process.stderr.write(`error [${code}]: ${message}\n`);
   }
@@ -168,7 +194,8 @@ usage:
         compose stack up; --workers also supervises one \`wrangler dev\` per
         discovered wrangler config (private dev registry per worktree).
         Starting a NEW stack takes a machine-wide slot (cap 5, configurable
-        via HESTIA_MAX_STACKS / ~/.hestia/config.json); at the cap it fails
+        via HESTIA_MAX_STACKS / ~/.hestia/config.toml / legacy config.json);
+        at the cap it fails
         with stack-limit — --wait[=secs] queues FIFO instead, --no-daemon
         skips the cap entirely
   hestia run --name <name> [--env K=V ...] [--no-port] [--varlock]
@@ -194,6 +221,14 @@ usage:
         resolve a service's public URL (from \`expose\`) and open it in the
         browser; the URL is always printed too, so a headless agent can hand
         the human a direct-click link. HESTIA_NO_OPEN prints only.
+  hestia route add|remove <service...> [--json] | route list [--json]
+        manage sticky per-worktree stable local HTTPS routes. Agents select
+        services; hestia resolves and verifies their current direct ports
+  hestia router status|install|uninstall [--interactive] [--json]
+        manage Hestia's isolated Portless HTTPS service. Commands are
+        non-interactive by default; --interactive is the only sudo prompt path
+  hestia config path|show|validate [--file <path>] [--json]
+        discover and validate machine-local ~/.hestia/config.toml
   hestia daemon status|start|stop|install [--print]|uninstall [--json]
         hestiad enforces the stack cap and revives adopted tunnel connectors;
         it auto-starts on up/run. \`install\` writes a launchd agent
@@ -282,16 +317,124 @@ async function main(): Promise<void> {
         else printStackHuman(r);
         break;
       }
+      case "route": {
+        const action = flags._[1];
+        const services = flags._.slice(2);
+        if (action === "add") {
+          const record = await engine.addLocalRoutes(cwd, services);
+          if (flags.json) process.stdout.write(JSON.stringify(record, null, 2) + "\n");
+          else printStackHuman(record);
+        } else if (action === "remove") {
+          const record = await engine.removeLocalRoutes(cwd, services);
+          const explicit = new Set((record.localRoutes ?? []).map((route) => route.service));
+          const configuredRoutesRemain = services.filter((service) =>
+            !explicit.has(service) && effectiveLocalRouteServices(record).includes(service)
+          );
+          if (flags.json) {
+            process.stdout.write(JSON.stringify({ record, configuredRoutesRemain }, null, 2) + "\n");
+          } else {
+            printStackHuman(record);
+            for (const service of configuredRoutesRemain) {
+              process.stderr.write(`route ${service} remains selected by ${hestiaConfigTomlPath()}\n`);
+            }
+          }
+        } else if (action === "list") {
+          const record = await engine.status(cwd);
+          if (record === null) fail("no-stack", "Route list: no stack for this worktree", flags.json);
+          const routes = effectiveLocalRouteServices(record).map((service) => {
+            const endpoint = record.endpoints.find((candidate) => candidate.name === service);
+            return {
+              service,
+              directUrl: endpoint?.url,
+              localUrl: endpoint?.localUrl ?? `https://${resolvedLocalRouteHostname(record, service)}`,
+              available: endpoint?.url !== undefined,
+              explicit: record.localRoutes?.some((route) => route.service === service) ?? false,
+            };
+          });
+          if (flags.json) process.stdout.write(JSON.stringify(routes, null, 2) + "\n");
+          else for (const route of routes) process.stdout.write(`${route.service.padEnd(16)} ${route.localUrl}\n`);
+        } else {
+          fail("usage", "usage: hestia route add|remove <service...> | route list", flags.json);
+        }
+        break;
+      }
+      case "router": {
+        const action = flags._[1];
+        const result = action === "status"
+          ? await readHestiaRouterStatus()
+          : action === "install"
+            ? await installHestiaRouter(flags.interactive)
+            : action === "uninstall"
+              ? await uninstallHestiaRouter(flags.interactive)
+              : null;
+        if (result === null) {
+          fail("usage", "usage: hestia router status|install|uninstall [--interactive]", flags.json);
+        }
+        if (flags.json) process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+        else {
+          process.stdout.write(
+            `router ${result.running ? "running" : result.installed ? "installed" : "not installed"} ` +
+              `(Portless ${result.version}, port ${result.port}, ${result.stateDir})\n`,
+          );
+        }
+        break;
+      }
+      case "config": {
+        const action = flags._[1];
+        const path = flags.file ?? hestiaConfigTomlPath();
+        if (action === "path") {
+          if (flags.json) process.stdout.write(JSON.stringify({ path }) + "\n");
+          else process.stdout.write(`${path}\n`);
+        } else if (action === "show" || action === "validate") {
+          const result = readHestiaMachineConfig(path);
+          if (flags.json) process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+          else if (action === "show") {
+            process.stdout.write(`${result.path}\n${JSON.stringify(result.config, null, 2)}\n`);
+            for (const warning of result.warnings) process.stderr.write(`warning: ${warning}\n`);
+          }
+          else {
+            process.stdout.write(`${result.valid ? "valid" : "invalid"} ${result.path}\n`);
+            for (const warning of result.warnings) process.stderr.write(`warning: ${warning}\n`);
+          }
+          if (!result.valid) process.exitCode = 1;
+        } else {
+          fail("usage", "usage: hestia config path|show|validate [--file <path>]", flags.json);
+        }
+        break;
+      }
       case "open": {
         const service = flags._[1];
         if (!service) fail("usage", "usage: hestia open <service> [path]", flags.json);
         const r = await engine.status(cwd);
         if (r === null) fail("no-stack", "no stack for this worktree", flags.json);
-        const base = r.endpoints.find((e) => e.name === service)?.publicUrl;
+        const endpoint = r.endpoints.find((e) => e.name === service);
+        const selectedModes = [flags.direct, flags.local, flags.public].filter(Boolean).length;
+        if (selectedModes > 1) fail("usage", "open accepts only one of --direct, --local, or --public", flags.json);
+        const localIsCandidate = endpoint?.localUrl !== undefined && (flags.local || selectedModes === 0);
+        const router = localIsCandidate ? await readHestiaRouterStatus() : undefined;
+        const daemon = localIsCandidate ? readDaemonJson() : null;
+        let daemonHealth: Awaited<ReturnType<typeof fetchHealth>> | null = null;
+        if (daemon !== null) {
+          try {
+            daemonHealth = await fetchHealth(daemon.port);
+          } catch {}
+        }
+        const localUsable = router?.installed === true && router.running && router.trusted &&
+          daemonHealth?.routerPort === daemon?.routerPort;
+        if (flags.local && endpoint?.localUrl !== undefined && !localUsable) {
+          fail("router-unreachable", "the requested local HTTPS router is not installed, running, and trusted", flags.json);
+        }
+        const base = flags.direct
+          ? endpoint?.url
+          : flags.local
+            ? endpoint?.localUrl
+            : flags.public
+              ? endpoint?.publicUrl
+              : localUsable ? endpoint?.localUrl : endpoint?.publicUrl ?? endpoint?.url;
         if (base === undefined) {
           fail(
             "service-not-found",
-            `"${service}" has no public URL — run \`hestia expose ${service}\` first`,
+            `"${service}" has no requested URL surface`,
             flags.json,
           );
         }
@@ -348,8 +491,10 @@ async function main(): Promise<void> {
         if (flags.json) process.stdout.write(JSON.stringify(r.endpoints) + "\n");
         else {
           for (const e of r.endpoints) {
-            const pub = e.publicUrl !== undefined ? `  ${e.publicUrl}` : "";
-            process.stdout.write(`${e.name.padEnd(12)} ${e.host}:${e.port}${pub}  (${e.reservedName})\n`);
+            process.stdout.write(`${e.name.padEnd(12)} ${e.host}:${e.port}\n`);
+            if (e.url) process.stdout.write(`  direct  ${e.url}\n`);
+            if (e.localUrl) process.stdout.write(`  local   ${e.localUrl}\n`);
+            if (e.publicUrl) process.stdout.write(`  public  ${e.publicUrl}\n`);
           }
         }
         break;
@@ -488,7 +633,7 @@ async function main(): Promise<void> {
         fail("unknown-command", `unknown command: ${cmd}`, flags.json);
     }
   } catch (err) {
-    if (err instanceof HestiaError) fail(err.code, err.message, flags.json);
+    if (err instanceof HestiaError) fail(err.code, err.message, flags.json, err.details);
     fail("internal", (err as Error).message ?? String(err), flags.json);
   }
 }

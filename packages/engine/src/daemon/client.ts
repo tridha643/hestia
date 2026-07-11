@@ -21,6 +21,8 @@ export interface DaemonJson {
   startedAt: string;
   /** Per-daemon bearer token; absent only on legacy protocol-v1 discovery files. */
   token?: string;
+  /** Unprivileged Hestia local-router port behind Portless. */
+  routerPort?: number;
 }
 
 const DAEMON_PIDFILE_NAME = "hestiad";
@@ -73,6 +75,23 @@ export async function fetchHealth(port: number, timeoutMs = 1_000): Promise<Daem
 
 export function fetchState(port: number, timeoutMs = 2_000): Promise<DaemonStateView | null> {
   return get<DaemonStateView>(port, "/hestia/state", timeoutMs);
+}
+
+/** Ask hestiad to reload route intent and reconcile its Portless aliases now. */
+export async function reconcileDaemonLocalRoutes(port: number): Promise<void> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/hestia/router/reconcile`, {
+      method: "POST",
+      headers: daemonAuthHeaders(port),
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (error) {
+    throw new HestiaError(
+      "router-unreachable",
+      `Router reconcile: could not reach hestiad on 127.0.0.1:${port}: ${(error as Error).message}`,
+    );
+  }
 }
 
 const MAX_NDJSON_FRAME_BYTES = 1024 * 1024;

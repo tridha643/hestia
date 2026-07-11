@@ -3,7 +3,7 @@ import { act } from "react";
 import { testRender } from "@opentui/react/test-utils";
 import type { FleetEnvelope, FleetSnapshot, FleetStackView, LogLine, RepoId } from "@hestia/core";
 import type { DaemonFleetSource } from "../src/fleet-source.ts";
-import { doctorOmissionSummary, FleetApp } from "../src/FleetApp.tsx";
+import { doctorOmissionSummary, FleetApp, fleetLogSelectionKey } from "../src/FleetApp.tsx";
 
 const repoId = "repo-1234567890abcdef" as RepoId;
 
@@ -73,6 +73,18 @@ class FakeFleetSource {
 }
 
 describe("FleetApp", () => {
+  test("log selection keys change across stack and service incarnations", () => {
+    const original = snapshot().stacks[0]!;
+    const replacedStack = { ...original, createdAt: "2026-01-03T00:00:00.000Z" };
+    const rotatedService = {
+      ...original,
+      services: original.services.map((service) => ({ ...service, publishedPort: 4200 })),
+    };
+    const key = fleetLogSelectionKey(original, "dashboard");
+    expect(fleetLogSelectionKey(replacedStack, "dashboard")).not.toBe(key);
+    expect(fleetLogSelectionKey(rotatedService, "dashboard")).not.toBe(key);
+  });
+
   test("renders wide and narrow layouts while retaining managed selection and logs", async () => {
     const source = new FakeFleetSource();
     const setup = await testRender(
@@ -129,6 +141,29 @@ describe("FleetApp", () => {
       await act(async () => setup.mockInput.pressEnter());
       await setup.waitForFrame((candidate) => candidate.includes("named volumes retained"));
       expect(source.downs).toEqual(["modem-alpha"]);
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test("mouse clicks select a stack row", async () => {
+    const source = new FakeFleetSource();
+    const setup = await testRender(
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" onQuit={() => {}} />,
+      { width: 120, height: 28 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("Services — alpha"));
+      await act(async () => {
+        await setup.mockMouse.click(2, 4);
+        await setup.flush();
+      });
+      const frame = await setup.waitForFrame((candidate) => candidate.includes("Services — beta"));
+      expect(frame).toContain("ingest");
     } finally {
       await act(async () => setup.renderer.destroy());
     }

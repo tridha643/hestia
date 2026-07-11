@@ -59,6 +59,7 @@ import {
 } from "./proc/pidfile.ts";
 import { stopProcTree } from "./proc/shutdown.ts";
 import { inspectPort } from "./proc/ports.ts";
+import { resolvedLocalRouteHostname, verifyStackServiceOrigin } from "./router/local-http-router.ts";
 import { detectVarlock } from "./proc/resolver.ts";
 import { planWorkers, privateRegistryDir } from "./wrangler/adapter.ts";
 import {
@@ -77,8 +78,18 @@ import {
 } from "./tunnel/registry.ts";
 import { isReady, quickTunnelUrl } from "./tunnel/verify.ts";
 import { ensureDaemon } from "./daemon/ensure.ts";
-import { acquireSlot, readDaemonJson, releaseSlot } from "./daemon/client.ts";
+import {
+  acquireSlot,
+  readDaemonJson,
+  reconcileDaemonLocalRoutes,
+  releaseSlot,
+} from "./daemon/client.ts";
 import { streamStackLogs } from "./logs/stream.ts";
+import {
+  effectiveLocalRouteServices,
+  readHestiaMachineConfig,
+} from "./router/router-config.ts";
+import { readHestiaRouterStatus } from "./router/portless-adapter.ts";
 
 export { dockerAvailable } from "./compose/cli.ts";
 export * from "./compose/override.ts";
@@ -110,6 +121,19 @@ export {
 export { adoptTunnel, listTunnels, routeDns } from "./tunnel/cloudflared.ts";
 export { hestiaHome } from "./state.ts";
 export { type DoctorRow, doctor } from "./doctor.ts";
+export {
+  configuredLocalRouteServices,
+  effectiveLocalRouteServices,
+  hestiaConfigTomlPath,
+  localRouteHostname,
+  readHestiaMachineConfig,
+} from "./router/router-config.ts";
+export {
+  installHestiaRouter,
+  readHestiaRouterStatus,
+  uninstallHestiaRouter,
+} from "./router/portless-adapter.ts";
+export { resolvedLocalRouteHostname } from "./router/local-http-router.ts";
 export { daemonDir, resolveMaxStacks } from "./daemon/slots.ts";
 export { HESTIAD_PROTOCOL_VERSION } from "./daemon/routes.ts";
 export { FleetMonitor, collectFleetSnapshot } from "./daemon/fleet-monitor.ts";
@@ -118,6 +142,7 @@ export {
   daemonAuthHeaders,
   fetchHealth,
   fetchState,
+  reconcileDaemonLocalRoutes,
   readDaemonJson,
   streamDaemonFleet,
   streamDaemonServiceLogs,
@@ -211,14 +236,26 @@ function upsertService(record: StackRecord, svc: ServiceRecord): void {
 
 function setEndpoint(record: StackRecord, ep: Endpoint): void {
   const i = record.endpoints.findIndex((e) => e.name === ep.name);
-  if (i >= 0) record.endpoints[i] = ep;
+  if (i >= 0) {
+    const previous = record.endpoints[i]!;
+    const portRotated = previous.port !== ep.port;
+    const namedExposure = record.tunnel?.exposures.some((exposure) => exposure.service === ep.name) ?? false;
+    if (portRotated && previous.publicUrl !== undefined && !namedExposure) {
+      delete previous.publicUrl;
+      delete record.env[urlKey(ep.name)];
+    }
+    record.endpoints[i] = { ...previous, ...ep };
+  }
   else record.endpoints.push(ep);
+  applyLocalRouteProjection(record);
 }
 
 function dropService(record: StackRecord, name: string): void {
   record.services = record.services.filter((s) => s.name !== name);
   record.endpoints = record.endpoints.filter((e) => e.name !== name);
   delete record.env[`HESTIA_${envKey(name)}_PORT`];
+  delete record.env[directUrlKey(name)];
+  delete record.env[localUrlKey(name)];
 }
 
 function recordProc(
@@ -239,6 +276,40 @@ function recordProc(
 
 function urlKey(name: string): string {
   return `HESTIA_${envKey(name)}_URL`;
+}
+
+function directUrlKey(name: string): string {
+  return `HESTIA_${envKey(name)}_DIRECT_URL`;
+}
+
+function localUrlKey(name: string): string {
+  return `HESTIA_${envKey(name)}_LOCAL_URL`;
+}
+
+/** Project direct and stable URL fields from explicit plus configured route intent. */
+function applyLocalRouteProjection(record: StackRecord): void {
+  const config = readHestiaMachineConfig().config;
+  const selected = new Set(effectiveLocalRouteServices(record, config));
+  for (const endpoint of record.endpoints) {
+    endpoint.reservedName = resolvedLocalRouteHostname(record, endpoint.name, config);
+    if (!selected.has(endpoint.name)) {
+      // A port is not automatically HTTP: route intent is the protocol declaration.
+      // Unselected TCP services retain the baseline host/port without invented URLs.
+      delete endpoint.url;
+      delete endpoint.localUrl;
+      delete record.env[directUrlKey(endpoint.name)];
+      delete record.env[localUrlKey(endpoint.name)];
+      continue;
+    }
+    const service = record.services.find((candidate) => candidate.name === endpoint.name);
+    if (service?.publishedPort === undefined || service.backend === "tunnel") continue;
+    endpoint.host = "127.0.0.1";
+    endpoint.port = service.publishedPort;
+    endpoint.url = `http://127.0.0.1:${service.publishedPort}`;
+    endpoint.localUrl = `https://${endpoint.reservedName}`;
+    record.env[directUrlKey(endpoint.name)] = endpoint.url;
+    record.env[localUrlKey(endpoint.name)] = endpoint.localUrl;
+  }
 }
 
 /**
@@ -287,6 +358,17 @@ interface StartAdmissionGuard {
 }
 
 export class ComposeEngine implements IsolationEngine {
+  /** Refresh daemon route state after a stack mutation; strict mode surfaces failures. */
+  async #refreshLocalRoutes(strict = false): Promise<void> {
+    try {
+      const daemon = readDaemonJson();
+      if (daemon !== null) await reconcileDaemonLocalRoutes(daemon.port);
+    } catch (error) {
+      if (strict) throw error;
+      process.stderr.write(`warning: local router reconcile failed: ${(error as Error).message}\n`);
+    }
+  }
+
   /** Stream this worktree's recorded services without taking its mutation lock. */
   async *logs(cwd: string, opts?: LogsOptions): AsyncGenerator<LogLine> {
     const { worktreeRoot } = await getRepoInfo(cwd);
@@ -368,6 +450,9 @@ export class ComposeEngine implements IsolationEngine {
     // Provisional record only when the project has no record at all — an
     // existing record already carries occupancy through its services.
     let provisional = false;
+    let retainedEmpty = false;
+    let previousState: StackRecord["state"] | undefined;
+    let previousStarter: StackRecord["starter"];
     let createdAt = "";
     await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
       let rec = readState(worktreeRoot);
@@ -382,6 +467,18 @@ export class ComposeEngine implements IsolationEngine {
         provisional = true;
         createdAt = rec.createdAt;
       } else {
+        if (rec.services.length === 0) {
+          retainedEmpty = true;
+          provisional = true;
+          previousState = rec.state;
+          previousStarter = rec.starter;
+          rec.state = "starting";
+          rec.starter = {
+            pid: process.pid,
+            startTime: startTimeOf(process.pid) ?? "",
+          };
+          writeState(worktreeRoot, rec);
+        }
         createdAt = rec.createdAt;
       }
     }));
@@ -392,7 +489,13 @@ export class ComposeEngine implements IsolationEngine {
       await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
         const rec = readState(worktreeRoot);
         if (rec !== null && rec.state === "starting" && rec.services.length === 0) {
-          clearState(worktreeRoot, project);
+          if (retainedEmpty) {
+            rec.state = previousState ?? "stopped";
+            rec.starter = previousStarter;
+            writeState(worktreeRoot, rec);
+          } else {
+            clearState(worktreeRoot, project);
+          }
         }
       }));
       if (handle !== null) await releaseSlot(handle.port, project);
@@ -415,6 +518,7 @@ export class ComposeEngine implements IsolationEngine {
       throw err;
     }
     if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
+    await this.#refreshLocalRoutes();
     return done;
   }
 
@@ -470,6 +574,7 @@ export class ComposeEngine implements IsolationEngine {
             state: "healthy",
             containerPort: cports[0],
             publishedPort: canonical,
+            containerId: row?.ID,
           });
           if (canonical !== undefined) {
             record.env[`HESTIA_${envKey(svc)}_PORT`] = String(canonical);
@@ -570,6 +675,7 @@ export class ComposeEngine implements IsolationEngine {
       throw err;
     }
     if (tunnelDirty) await this.#reconcileAdopted(done.tunnel);
+    await this.#refreshLocalRoutes();
     return done;
   }
 
@@ -612,6 +718,7 @@ export class ComposeEngine implements IsolationEngine {
         removePidfile(worktreeRoot, spec.name); // stale (crashed/reused pid)
       }
 
+      delete record.env[directUrlKey(spec.name)];
       const result = await startProc(worktreeRoot, spec, record.env, (pf) =>
         mirrorPidfile(record.project, pf),
       );
@@ -650,7 +757,8 @@ export class ComposeEngine implements IsolationEngine {
         dropService(record, name);
         tunnel = record.tunnel;
         tunnelDirty = syncExposures(record);
-        if (record.services.length === 0 && record.composeFile === undefined) {
+        const hasStickyLocalRoutes = effectiveLocalRouteServices(record).length > 0;
+        if (record.services.length === 0 && record.composeFile === undefined && !hasStickyLocalRoutes) {
           clearState(worktreeRoot, record.project);
         } else {
           writeState(worktreeRoot, record);
@@ -658,6 +766,73 @@ export class ComposeEngine implements IsolationEngine {
       }
     }));
     if (tunnelDirty) await this.#reconcileAdopted(tunnel);
+    await this.#refreshLocalRoutes();
+  }
+
+  async addLocalRoutes(cwd: string, services: string[]): Promise<StackRecord> {
+    if (services.length === 0) throw new HestiaError("usage", "Route add: at least one service is required");
+    const daemon = await ensureDaemon();
+    const { worktreeRoot } = await getRepoInfo(cwd);
+    const project = readState(worktreeRoot)?.project;
+    if (project === undefined) throw new HestiaError("no-stack", "Route add: no stack for this worktree");
+    const record = await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
+      const current = readState(worktreeRoot);
+      if (current === null) throw new HestiaError("no-stack", "Route add: no stack for this worktree");
+      for (const serviceName of services) {
+        const service = current.services.find((candidate) => candidate.name === serviceName);
+        if (service?.publishedPort === undefined || service.backend === "tunnel") {
+          throw new HestiaError(
+            "route-origin-unavailable",
+            `Route add: service "${serviceName}" is not running with a direct port`,
+          );
+        }
+        if (!await verifyStackServiceOrigin(current, service)) {
+          throw new HestiaError(
+            "route-origin-unavailable",
+            `Route add: service "${serviceName}" no longer owns its recorded direct port`,
+          );
+        }
+      }
+      current.localRoutes ??= [];
+      for (const service of services) {
+        if (!current.localRoutes.some((route) => route.service === service)) {
+          current.localRoutes.push({ service });
+        }
+      }
+      current.localRoutes.sort((left, right) => left.service.localeCompare(right.service));
+      applyLocalRouteProjection(current);
+      writeState(worktreeRoot, current);
+      return current;
+    }));
+    await reconcileDaemonLocalRoutes(daemon.port);
+    return record;
+  }
+
+  async removeLocalRoutes(cwd: string, services: string[]): Promise<StackRecord> {
+    if (services.length === 0) throw new HestiaError("usage", "Route remove: at least one service is required");
+    const { worktreeRoot } = await getRepoInfo(cwd);
+    const project = readState(worktreeRoot)?.project;
+    if (project === undefined) throw new HestiaError("no-stack", "Route remove: no stack for this worktree");
+    const record = await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
+      const current = readState(worktreeRoot);
+      if (current === null) throw new HestiaError("no-stack", "Route remove: no stack for this worktree");
+      const removing = new Set(services);
+      current.localRoutes = (current.localRoutes ?? []).filter((route) => !removing.has(route.service));
+      if (current.localRoutes.length === 0) delete current.localRoutes;
+      applyLocalRouteProjection(current);
+      if (
+        current.services.length === 0 &&
+        current.composeFile === undefined &&
+        effectiveLocalRouteServices(current).length === 0
+      ) {
+        clearState(worktreeRoot, current.project);
+      } else {
+        writeState(worktreeRoot, current);
+      }
+      return current;
+    }));
+    await this.#refreshLocalRoutes();
+    return record;
   }
 
   async down(cwd: string, opts?: DownOptions): Promise<void> {
@@ -708,6 +883,7 @@ export class ComposeEngine implements IsolationEngine {
     // mirror is gone → regen drops this stack's ingress rules; the connector
     // keeps serving the base rules and other worktrees
     await this.#reconcileAdopted(tunnel);
+    await this.#refreshLocalRoutes();
   }
 
   /** Best-effort slot release — waiters get their grant now instead of at the next sweep. */
@@ -775,6 +951,7 @@ export class ComposeEngine implements IsolationEngine {
         }
         await this.#releaseAdmission(project);
         await this.#reconcileAdopted(record.tunnel);
+        await this.#refreshLocalRoutes();
         return;
       }
     }
@@ -786,6 +963,7 @@ export class ComposeEngine implements IsolationEngine {
     await withLock(projectLockRoot, teardownFromMirror);
     await this.#releaseAdmission(project);
     await this.#reconcileAdopted(record?.tunnel);
+    await this.#refreshLocalRoutes();
   }
 
   async expose(
@@ -1076,7 +1254,12 @@ export class ComposeEngine implements IsolationEngine {
               ? "healthy"
               : "unhealthy";
           const pub = publishedPortFor(row, svc.containerPort);
-          if (pub !== undefined) svc.publishedPort = pub;
+          if (pub !== undefined) {
+            svc.publishedPort = pub;
+            svc.containerId = row.ID ?? svc.containerId;
+            const endpoint = record.endpoints.find((candidate) => candidate.name === svc.name);
+            if (endpoint !== undefined) endpoint.port = pub;
+          }
         }
       } catch {
         // docker unreachable — report last known state for docker services
@@ -1107,6 +1290,8 @@ export class ComposeEngine implements IsolationEngine {
       } else {
         svc.state = "healthy";
       }
+      const endpoint = record.endpoints.find((candidate) => candidate.name === svc.name);
+      if (endpoint !== undefined && svc.publishedPort !== undefined) endpoint.port = svc.publishedPort;
       // quick tunnel that connected after its expose timed out: surface the URL
       if (
         svc.backend === "tunnel" &&
@@ -1151,6 +1336,7 @@ export class ComposeEngine implements IsolationEngine {
     }
 
     record.state = anyUp ? "up" : "stopped";
+    applyLocalRouteProjection(record);
     return record;
   }
 

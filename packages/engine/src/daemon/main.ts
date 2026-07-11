@@ -19,6 +19,7 @@ import { Admission, HESTIAD_PROTOCOL_VERSION, createRoutes } from "./routes.ts";
 import { SlotLedger, daemonDir } from "./slots.ts";
 import { startDuties } from "./duties.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
+import { HestiaLocalHttpRouter } from "../router/local-http-router.ts";
 
 /**
  * hestiad — the machine-global admission + supervision daemon. One instance
@@ -57,6 +58,8 @@ async function main(): Promise<void> {
     const admission = new Admission(new SlotLedger());
     const fleet = new FleetMonitor(admission);
     const engine = new ComposeEngine();
+    const localRouter = new HestiaLocalHttpRouter();
+    const routerPort = await localRouter.start();
     const token = randomBytes(32).toString("hex");
     const server = serveSessionBrokerDaemon({
       daemon,
@@ -65,6 +68,8 @@ async function main(): Promise<void> {
       handleRequest: createRoutes(admission, startedAt, {
         token,
         fleet,
+        routerPort,
+        refreshLocalRoutes: () => localRouter.refreshRoutes(),
         logsProject: (project, options) => engine.logsProject(project, options),
       }),
     });
@@ -89,6 +94,7 @@ async function main(): Promise<void> {
         protocolVersion: HESTIAD_PROTOCOL_VERSION,
         startedAt,
         token,
+        routerPort,
       },
       { mode: 0o600 },
     );
@@ -97,6 +103,7 @@ async function main(): Promise<void> {
     const shutdown = () => {
       stopDuties();
       fleet.stop();
+      localRouter.stop();
       removePidfile(root, PIDFILE_NAME);
       rmSync(join(root, "daemon.json"), { force: true });
       server.stop(true);

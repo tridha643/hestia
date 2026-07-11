@@ -10,6 +10,7 @@
     "@hunk/session-broker": "workspace:*",
     "@hunk/session-broker-bun": "workspace:*",
     "@hunk/session-broker-core": "workspace:*",
+    "portless": "0.15.1",
     "yaml": "^2.6.0"
   }
 }

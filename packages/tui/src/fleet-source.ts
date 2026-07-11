@@ -13,6 +13,7 @@ import {
   streamDaemonServiceLogs,
   type DoctorRow,
 } from "@hestia/engine";
+import { ReconnectLogDeduper } from "./log-reconnect-deduper.ts";
 
 function isFleetEnvelope(value: unknown): value is FleetEnvelope {
   if (typeof value !== "object" || value === null) return false;
@@ -92,23 +93,18 @@ export class DaemonFleetSource {
   ): AsyncGenerator<LogLine> {
     let attempt = 0;
     let connectedBefore = false;
+    const deduper = new ReconnectLogDeduper(50);
     while (!signal.aborted && !this.#lifetime.signal.aborted) {
       const connectedAt = Date.now();
       try {
         const daemon = await ensureDaemon();
         if (connectedBefore) {
-          yield {
-            project,
-            service,
-            source: "proc",
-            text: "reconnected; recent lines may repeat",
-            meta: true,
-          };
+          deduper.beginReconnect();
         }
         connectedBefore = true;
         for await (const line of streamDaemonServiceLogs(daemon.port, project, service, 50, signal)) {
           if (!isLogLine(line)) throw new Error("log protocol frame is invalid");
-          yield line;
+          for (const freshLine of deduper.push(line)) yield freshLine;
         }
         if (!signal.aborted) throw new Error("log stream ended");
       } catch {

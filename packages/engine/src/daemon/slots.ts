@@ -12,6 +12,7 @@ import { LABELS, type StackIdentity, type StackRecord } from "@hestia/core";
 import { hestiaHome, mirrorProcsDir } from "../state.ts";
 import { isLive, listPidfiles } from "../proc/pidfile.ts";
 import { writeAtomicJsonFile } from "../atomic-json-file.ts";
+import { hestiaConfigTomlPath, readHestiaMachineConfig } from "../router/router-config.ts";
 
 /**
  * Admission slots for the machine-wide stack cap. Truth is DERIVED, never
@@ -60,6 +61,11 @@ export function resolveMaxStacks(): { maxStacks: number; warnings: string[] } {
     );
     return { maxStacks: DEFAULT_MAX_STACKS, warnings };
   }
+  const toml = readHestiaMachineConfig();
+  warnings.push(...toml.warnings);
+  if (toml.config.maxStacks !== undefined) {
+    return { maxStacks: toml.config.maxStacks, warnings };
+  }
   const configPath = join(hestiaHome(), "config.json");
   if (existsSync(configPath)) {
     try {
@@ -68,6 +74,7 @@ export function resolveMaxStacks(): { maxStacks: number; warnings: string[] } {
       };
       if (cfg.maxStacks !== undefined) {
         if (Number.isInteger(cfg.maxStacks) && (cfg.maxStacks as number) > 0) {
+          warnings.push(`legacy ${configPath} is in use — migrate maxStacks to max_stacks in ${hestiaConfigTomlPath()}`);
           return { maxStacks: cfg.maxStacks as number, warnings };
         }
         warnings.push(

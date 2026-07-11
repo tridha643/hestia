@@ -13,9 +13,8 @@ the **phase-2 proc + wrangler backend**, the **phase-3 unified-tunnel public
 ingress**, and the **phase-4 hestiad daemon** (machine-wide stack cap +
 connector supervision) with `hestia doctor` and the agent skill, plus the
 phase-5 pull-based log stream and `hestia logs`, and the phase-6 authenticated
-Fleet transport + Hunk-modeled `hestia tui`. The portless localhost URL router
-is a later effort layered on the same
-`IsolationEngine` seam.
+Fleet transport + Hunk-modeled `hestia tui`, plus the phase-7 Portless-backed
+stable localhost URL router layered on the same `IsolationEngine` seam.
 
 ## Layout
 
@@ -23,6 +22,8 @@ is a later effort layered on the same
   `StackRecord`/`ProcSpec`/`Endpoint` shapes are fixed here so the current CLI
   and any future daemon drive the same contract.
 - `packages/engine` — the engine (`ComposeEngine`, now compose + procs):
+  - `router/` — strict machine TOML, isolated Portless state/setup, and
+    hestiad's ownership-verified HTTP/WebSocket router.
   - `compose/` — override generation, `docker compose` CLI wrapper.
   - `proc/` — host-process supervision: `supervisor` (detached spawn, `{port}`
     templating, readiness), `ports` (bind-probe, process-tree port-ownership
@@ -99,6 +100,8 @@ bin/hestia expose <svc...> [--tunnel <name>] [--zone <z>] [--keep-host-header]
 bin/hestia daemon status|start|stop|install [--print]|uninstall
 bin/hestia doctor [--json]     # report-only; exit 1 only on error rows
 bin/hestia tui                 # interactive repo-scoped managed Fleet
+bin/hestia route add|remove|list ... | router status|install|uninstall
+bin/hestia config path|show|validate [--file <path>]
 bin/hestia stop <name> | down [--project <name>] | status | env | endpoint list
 ```
 
@@ -152,7 +155,8 @@ port rotates (a ~2–5 s public blip for all exposed worktrees, by design).
 
 **The daemon (hestiad)** auto-spawns on `up`/`run` — never managed by hand.
 Starting a NEW stack takes one of `maxStacks` machine-wide slots (default 5;
-`HESTIA_MAX_STACKS` env or `~/.hestia/config.json`, strict-parsed — invalid →
+`HESTIA_MAX_STACKS`, `~/.hestia/config.toml`, or legacy
+`~/.hestia/config.json`, strict-parsed — invalid →
 default + warning, never deny-all). At the cap: fail fast with `stack-limit`
 listing the live stacks; `--wait[=secs]` joins a FIFO queue instead;
 `--no-daemon` skips admission entirely. Occupancy is DERIVED (mirrors +
@@ -202,6 +206,12 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
 - **Pid identity = pid + verbatim `ps -o lstart=` output**, captured post-spawn
   and compared string-equal on the same host. Guards every liveness check and
   kill against pid reuse. Don't parse it, don't reformat it.
+- **Privileged Portless never writes below `HESTIA_HOME`.** Its executable,
+  TLS/runtime state, logs, and launchd payload are root-owned under
+  `/Library/Application Support/Hestia/router/`. Hestiad atomically publishes
+  only `~/.hestia/router/portless/aliases.json`; the patched exact Portless
+  release validates and reads that projection, checks PID+lstart, and never
+  writes through the user-controlled path.
 - **`Bun.spawn` has no `detached`** — the supervisor uses `node:child_process`
   under Bun (compat verified by a unit test). Don't "simplify" it back.
 - **Proc logs truncate only on attempt 1 of a user start.** Port-steal readiness
@@ -213,7 +223,11 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
   stdout and stderr share one proc fd and cannot be labeled truthfully.
 - **The TUI reuses that exact pull stream.** hestiad protocol v2 exposes one
   authenticated, bounded NDJSON service stream plus full repo-scoped Fleet
-  snapshots; it never tails a second copy of application logs.
+  snapshots; it never tails a second copy of application logs. Reconnect
+  backfill is suffix-overlap-deduplicated against the visible ring so daemon
+  restarts do not replay lines, while lines written during disconnection are
+  retained. Stack/service rows support left-click selection and logs support
+  wheel scrolling alongside the keyboard controls.
 - **Fleet means Hestia-managed mirrors only.** It never enumerates unrelated
   stopped Git worktrees. `d` delegates to locked engine teardown and always
   retains named volumes; volume deletion remains CLI-only via `--destroy`.
@@ -323,7 +337,5 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
 - Remote-managed tunnel config (would remove the connector-restart blip on
   ingress changes — reserved as an upgrade, needs an API token)
 - Event journal, metrics, queue steering, shell/restart/expose controls in TUI
-- Portless localhost URL router (`Endpoint.reservedName` is populated but
-  dormant)
 - Daemon queue persistence (FIFO order dies with a daemon restart; waiters
   retry — accepted)

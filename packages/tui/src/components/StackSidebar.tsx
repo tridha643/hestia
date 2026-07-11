@@ -15,10 +15,12 @@ export function StackSidebar({
   stacks,
   selectedProject,
   width,
+  onSelectProject,
 }: {
   stacks: FleetStackView[];
   selectedProject?: string;
   width: number;
+  onSelectProject?: (project: string) => void;
 }) {
   return (
     <box style={{ width, height: "100%", flexDirection: "column", border: true, borderColor: fleetTheme.border }}>
@@ -35,6 +37,12 @@ export function StackSidebar({
         return (
           <box
             key={stack.project}
+            onMouseDown={(event) => {
+              if (event.button !== 0) return;
+              event.preventDefault();
+              event.stopPropagation();
+              onSelectProject?.(stack.project);
+            }}
             style={{
               height: 1,
               paddingLeft: 1,

@@ -11,6 +11,7 @@ export function LogPane({
   follow,
   unseen,
   label,
+  onScroll,
 }: {
   lines: LogLine[];
   height: number;
@@ -19,13 +20,22 @@ export function LogPane({
   follow: boolean;
   unseen: number;
   label: string;
+  onScroll?: (delta: number) => void;
 }) {
   const viewportRows = Math.max(1, height - 3);
   const end = Math.max(0, lines.length - offset);
   const start = Math.max(0, end - viewportRows - 2);
   const visible = lines.slice(start, end).slice(-viewportRows);
   return (
-    <box style={{ height: "100%", width: "100%", flexDirection: "column", border: true, borderColor: fleetTheme.border }}>
+    <box
+      onMouseScroll={(event) => {
+        if (event.button !== 4 && event.button !== 5) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onScroll?.(event.button === 4 ? -3 : 3);
+      }}
+      style={{ height: "100%", width: "100%", flexDirection: "column", border: true, borderColor: fleetTheme.border }}
+    >
       <box style={{ height: 1, paddingLeft: 1, paddingRight: 1, flexDirection: "row", backgroundColor: fleetTheme.panelAlt }}>
         <text fg={fleetTheme.text}>{padFleetText(`Logs — ${label}`, Math.max(1, width - 24))}</text>
         <text fg={follow ? fleetTheme.healthy : fleetTheme.warning}>
@@ -34,7 +44,7 @@ export function LogPane({
       </box>
       {visible.length === 0 ? (
         <box style={{ paddingLeft: 1, paddingTop: 1 }}>
-          <text fg={fleetTheme.muted}>Waiting for log lines…</text>
+          <text fg={fleetTheme.muted}>No log output yet — service is still being followed.</text>
         </box>
       ) : visible.map((line, index) => (
         <box key={`${start + index}-${line.text}`} style={{ height: 1, paddingLeft: 1 }}>

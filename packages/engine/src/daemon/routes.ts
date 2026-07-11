@@ -12,7 +12,7 @@ import { readMirrorState } from "../state.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
 import { SlotLedger, resolveMaxStacks } from "./slots.ts";
 
-export const HESTIAD_PROTOCOL_VERSION = 2;
+export const HESTIAD_PROTOCOL_VERSION = 3;
 const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_LOG_STREAMS = 16;
 const MAX_LOG_TAIL = 200;
@@ -178,6 +178,8 @@ export class Admission {
 export interface DaemonRouteDependencies {
   token: string;
   fleet: FleetMonitor;
+  routerPort: number;
+  refreshLocalRoutes(): Promise<void>;
   logsProject(project: string, options: LogsOptions): AsyncIterable<LogLine>;
 }
 
@@ -295,6 +297,7 @@ export function createRoutes(
         live: state.live.length,
         queued: state.queued.length,
         startedAt,
+        routerPort: dependencies.routerPort,
         warnings: state.warnings,
       };
       return json(health);
@@ -302,6 +305,11 @@ export function createRoutes(
 
     if (url.pathname === "/hestia/state" && request.method === "GET") {
       return json(await admission.stateView());
+    }
+
+    if (url.pathname === "/hestia/router/reconcile" && request.method === "POST") {
+      await dependencies.refreshLocalRoutes();
+      return json({ ok: true, routerPort: dependencies.routerPort });
     }
 
     if (url.pathname === "/hestia/fleet" && request.method === "GET") {

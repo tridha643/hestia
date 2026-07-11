@@ -34,10 +34,9 @@ export interface Endpoint {
   host: string;
   port: number;
   url?: string;
-  /**
-   * Dormant in the MVP: the phase-3 named URL (svc.branch.repo.localhost).
-   * Present from day one so consumers can key on it before the proxy exists.
-   */
+  /** Stable Hestia-managed HTTPS URL for a selected HTTP service. */
+  localUrl?: string;
+  /** Deterministic local hostname reserved before its optional route activates. */
   reservedName?: string;
   /**
    * Public URL once the service is exposed through a cloudflare tunnel
@@ -45,6 +44,11 @@ export interface Endpoint {
    * Enriches the existing endpoint entry — never a second same-name entry.
    */
   publicUrl?: string;
+}
+
+/** Sticky per-worktree request to publish one service through the local HTTPS router. */
+export interface LocalRouteIntent {
+  service: string;
 }
 
 export interface ServiceRecord {
@@ -148,6 +152,8 @@ export interface StackRecord {
   /** Resolved env block agents consume (DATABASE_URL, etc.). */
   env: Record<string, string>;
   endpoints: Endpoint[];
+  /** Explicit CLI route selections; repository defaults remain in machine config. */
+  localRoutes?: LocalRouteIntent[];
   createdAt: string;
   /**
    * Absent on procs-only stacks (a compose file is not required to `run`).
@@ -212,6 +218,8 @@ export interface DaemonHealth {
   live: number;
   queued: number;
   startedAt: string;
+  /** Unprivileged loopback port receiving traffic from the Portless TLS proxy. */
+  routerPort: number;
   /** e.g. an invalid HESTIA_MAX_STACKS that fell back to the default. */
   warnings: string[];
 }
@@ -244,6 +252,7 @@ export interface FleetEndpointView {
   host: string;
   port: number;
   url?: string;
+  localUrl?: string;
   publicUrl?: string;
 }
 
@@ -343,6 +352,10 @@ export interface IsolationEngine {
   run(worktree: string, spec: ProcSpec, admit?: AdmitOptions): Promise<StackRecord>;
   /** Stop one supervised proc. Idempotent: unknown/dead names succeed. */
   stopService(worktree: string, name: string): Promise<void>;
+  /** Add sticky local HTTPS route intent for services in this worktree. */
+  addLocalRoutes(worktree: string, services: string[]): Promise<StackRecord>;
+  /** Remove sticky local HTTPS route intent for services in this worktree. */
+  removeLocalRoutes(worktree: string, services: string[]): Promise<StackRecord>;
   /** Publish running stack services through a cloudflare tunnel. */
   expose(
     worktree: string,
@@ -382,12 +395,17 @@ export class NotImplemented extends Error {
  * hostname-conflict · service-not-found.
  * Logs: no-stack · service-not-found.
  * Daemon: stack-limit · daemon-start-failed · daemon-unreachable.
+ * Router: router-setup-required · router-privilege-required ·
+ * router-port-busy · router-version-unsupported · router-unreachable ·
+ * route-origin-unavailable.
  */
 export class HestiaError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  details?: Record<string, unknown>;
+  constructor(code: string, message: string, details?: Record<string, unknown>) {
     super(message);
     this.name = "HestiaError";
     this.code = code;
+    this.details = details;
   }
 }

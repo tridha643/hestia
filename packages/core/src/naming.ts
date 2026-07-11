@@ -24,6 +24,30 @@ function shortHash(worktreePath: string, branch: string): string {
     .slice(0, 6);
 }
 
+function dnsServiceLabel(service: string): string {
+  const full = slug(service);
+  if (full.length <= 50) return full;
+  const hash = createHash("sha256").update(service).digest("hex").slice(0, 6);
+  return `${full.slice(0, 43)}-${hash}`;
+}
+
+/** Build collision-safe service, branch, and repository labels for local URLs. */
+export function localRouteLabels(
+  service: string,
+  repo: string,
+  branch: string,
+  worktreePath: string,
+): { service: string; branch: string; repo: string } {
+  const repoFull = slug(repo);
+  const branchFull = slug(branch);
+  const repoLabel = repoFull.slice(0, REPO_MAX);
+  let branchLabel = branchFull.slice(0, BRANCH_MAX);
+  if (repoLabel !== repoFull || branchLabel !== branchFull) {
+    branchLabel = `${branchLabel}-${shortHash(worktreePath, branch)}`;
+  }
+  return { service: dnsServiceLabel(service), branch: branchLabel, repo: repoLabel };
+}
+
 /**
  * Deterministic compose project name = slug(repo)-slug(branch), each length
  * capped. If either side had to be truncated the result is ambiguous, so we

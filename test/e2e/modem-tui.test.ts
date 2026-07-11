@@ -4,6 +4,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -30,8 +31,17 @@ if (!enabled) {
 
 interface StackJson {
   project: string;
+  repoId: string;
   env: Record<string, string>;
   services: Array<{ name: string; backend: string; publishedPort?: number }>;
+  endpoints: Array<{
+    name: string;
+    host: string;
+    port: number;
+    url?: string;
+    localUrl?: string;
+    publicUrl?: string;
+  }>;
 }
 
 let temporaryRoot = "";
@@ -44,6 +54,8 @@ let sourceStatus = "";
 let packageManagerVersion = "";
 let environment: Record<string, string> = {};
 const projects = new Set<string>();
+const PORTLESS_CLI = join(HESTIA_ROOT, "node_modules", "portless", "dist", "cli.js");
+let portlessPort = 0;
 
 function commandExists(command: string): boolean {
   return spawnSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" }).status === 0;
@@ -72,6 +84,71 @@ function runCli(cwd: string, args: string[], extraEnv: Record<string, string> = 
     maxBuffer: 16 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+function runPortless(args: string[]): string {
+  return execFileSync("bun", [PORTLESS_CLI, ...args], {
+    env: {
+      ...process.env,
+      ...environment,
+      PORTLESS_STATE_DIR: join(home, "router", "portless"),
+      PORTLESS_SYNC_HOSTS: "0",
+      HESTIA_PORTLESS_ROUTES_PATH: join(home, "router", "portless", "aliases.json"),
+      HESTIA_PORTLESS_ROUTES_UID: String(process.getuid?.() ?? 0),
+    },
+    encoding: "utf8",
+    timeout: 60_000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function routedFetch(
+  hostname: string,
+  path = "/health",
+  acceptApplicationResponse = false,
+): Promise<Response> {
+  const deadline = Date.now() + 90_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${portlessPort}${path}`, {
+        headers: { host: hostname },
+        signal: AbortSignal.timeout(3_000),
+      });
+      const responseText = await response.clone().text();
+      const isRouter404 = responseText.includes("Hestia route not found") ||
+        responseText.includes("<title>404 - Not Found</title>");
+      if (response.ok || (acceptApplicationResponse && response.status < 500 && !isRouter404)) {
+        return response;
+      }
+      lastError = new Error(`HTTP ${response.status}: ${responseText.slice(0, 500)}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`stable route ${hostname}${path} did not become ready: ${String(lastError)}`);
+}
+
+async function waitForRoutedStatus(hostname: string, expected: number): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${portlessPort}/`, {
+        headers: { host: hostname },
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (response.status === expected) return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`stable route ${hostname} did not converge to HTTP ${expected}`);
+}
+
+function endpointFor(stack: StackJson, service: string): NonNullable<StackJson["endpoints"][number]> {
+  const endpoint = stack.endpoints.find((candidate) => candidate.name === service);
+  if (endpoint === undefined) throw new Error(`modem endpoint ${service} is missing`);
+  return endpoint;
 }
 
 function redactedProcLogTail(worktree: string, service: string): string {
@@ -262,6 +339,16 @@ suite("real modem Fleet TUI", () => {
       HESTIA_MAX_STACKS: "2",
       HESTIA_NO_OPEN: "1",
     };
+    mkdirSync(join(home, "router", "portless"), { recursive: true });
+    writeFileSync(join(home, "router", "portless", "aliases.json"), "[]");
+    const probe = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: { data() {} },
+    });
+    portlessPort = probe.port;
+    probe.stop(true);
+    runPortless(["proxy", "start", "-p", String(portlessPort), "--no-tls"]);
   }, 30 * 60_000);
 
   afterAll(() => {
@@ -272,6 +359,7 @@ suite("real modem Fleet TUI", () => {
     }
     if (temporaryRoot) {
       try { runCli(temporaryRoot, ["daemon", "stop"]); } catch {}
+      try { runPortless(["proxy", "stop", "-p", String(portlessPort)]); } catch {}
     }
     for (const project of projects) removeProjectVolumes(project);
     if (MODEM_REPOSITORY) {
@@ -315,6 +403,35 @@ suite("real modem Fleet TUI", () => {
       waitForHealth(worktreeB, "modem-slack", slackB),
     ]);
 
+    writeFileSync(join(home, "config.toml"), `
+version = 1
+max_stacks = 2
+[router]
+hostname_template = "{service}.{branch}.{repo}.localhost"
+[router.repositories."${composeA.repoId}"]
+name = "modem"
+services = ["dashboard", "modem-ingest", "modem-slack"]
+`);
+    runCli(worktreeA, ["daemon", "start", "--json"]);
+
+    const routedWorkersA = JSON.parse(runCli(worktreeA, ["status", "--json"])) as StackJson;
+    const routedWorkersB = JSON.parse(runCli(worktreeB, ["status", "--json"])) as StackJson;
+    const ingestLocalA = endpointFor(routedWorkersA, "modem-ingest").localUrl;
+    const ingestLocalB = endpointFor(routedWorkersB, "modem-ingest").localUrl;
+    const slackLocalA = endpointFor(routedWorkersA, "modem-slack").localUrl;
+    const slackLocalB = endpointFor(routedWorkersB, "modem-slack").localUrl;
+    expect(endpointFor(routedWorkersA, "modem-ingest").url).toBe(`http://127.0.0.1:${ingestA}`);
+    expect(endpointFor(routedWorkersB, "modem-slack").url).toBe(`http://127.0.0.1:${slackB}`);
+    expect(ingestLocalA).toBeDefined();
+    expect(ingestLocalB).toBeDefined();
+    expect(ingestLocalA).not.toBe(ingestLocalB);
+    await Promise.all([
+      routedFetch(new URL(ingestLocalA!).hostname),
+      routedFetch(new URL(ingestLocalB!).hostname),
+      routedFetch(new URL(slackLocalA!).hostname),
+      routedFetch(new URL(slackLocalB!).hostname),
+    ]);
+
     const session = await launchTerminal({
       command: "bun",
       args: [CLI, "tui"],
@@ -330,30 +447,76 @@ suite("real modem Fleet TUI", () => {
       );
 
       const ingestUrlA = `http://127.0.0.1:${ingestA}`;
-      runCli(worktreeA, [
+      const dashboardStartArgs = (databaseUrl: string, ingestUrl: string) => [
         "run",
         "--name", "dashboard",
         "--varlock",
-        "--env", `DATABASE_URL=${databaseA}`,
-        "--env", `INGEST_URL=${ingestUrlA}`,
+        "--env", `DATABASE_URL=${databaseUrl}`,
+        "--env", `INGEST_URL=${ingestUrl}`,
         "--json",
         "--",
         "corepack", `pnpm@${packageManagerVersion}`,
         "-F", "@modem/dashboard", "exec", "next", "dev", "-p", "{port}",
-      ]);
+      ];
+      const dashboardFirst = JSON.parse(runCli(worktreeA, dashboardStartArgs(databaseA, ingestUrlA))) as StackJson;
+      const dashboardB = JSON.parse(runCli(
+        worktreeB,
+        dashboardStartArgs(databaseB, `http://127.0.0.1:${ingestB}`),
+      )) as StackJson;
+      const firstDashboardEndpoint = endpointFor(dashboardFirst, "dashboard");
+      const dashboardEndpointB = endpointFor(dashboardB, "dashboard");
+      expect(dashboardEndpointB.port).not.toBe(firstDashboardEndpoint.port);
+      expect(dashboardEndpointB.localUrl).not.toBe(firstDashboardEndpoint.localUrl);
+      expect(firstDashboardEndpoint.url).toBe(`http://127.0.0.1:${firstDashboardEndpoint.port}`);
+      expect(firstDashboardEndpoint.localUrl).toBeDefined();
+      await routedFetch(new URL(firstDashboardEndpoint.localUrl!).hostname, "/", true);
+      await routedFetch(new URL(dashboardEndpointB.localUrl!).hostname, "/", true);
       await waitForSnapshot(session, (frame) => frame.includes("dashboard"));
       for (let index = 0; index < 3; index += 1) await session.press("]");
       await waitForSnapshot(
         session,
-        (frame) => frame.includes("Logs — dashboard") && /ready|started server|local:/i.test(frame),
+        (frame) => frame.includes("Logs — dashboard") && /compiling|GET \//i.test(frame),
         120_000,
       );
+
+      runCli(worktreeA, ["stop", "dashboard", "--json"]);
+      const dashboardSecond = JSON.parse(
+        runCli(worktreeA, dashboardStartArgs(databaseA, ingestUrlA)),
+      ) as StackJson;
+      const secondDashboardEndpoint = endpointFor(dashboardSecond, "dashboard");
+      expect(secondDashboardEndpoint.port).not.toBe(firstDashboardEndpoint.port);
+      expect(secondDashboardEndpoint.localUrl).toBe(firstDashboardEndpoint.localUrl);
+      await routedFetch(new URL(secondDashboardEndpoint.localUrl!).hostname, "/", true);
+
+      const daemonBefore = JSON.parse(readFileSync(join(home, "daemon", "daemon.json"), "utf8")) as {
+        pid: number;
+        routerPort: number;
+      };
+      process.kill(daemonBefore.pid, "SIGKILL");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const oldPortBlocker = Bun.serve({
+        hostname: "127.0.0.1",
+        port: daemonBefore.routerPort,
+        fetch: () => new Response("foreign recycled-port process"),
+      });
+      try {
+        // Portless still has the cached alias, but its hestiad PID+lstart guard
+        // must fail closed before any request reaches this recycled origin.
+        await waitForRoutedStatus(new URL(secondDashboardEndpoint.localUrl!).hostname, 404);
+        runCli(worktreeA, ["daemon", "start", "--json"]);
+      } finally {
+        oldPortBlocker.stop(true);
+      }
+      const daemonAfter = JSON.parse(readFileSync(join(home, "daemon", "daemon.json"), "utf8")) as { routerPort: number };
+      expect(daemonAfter.routerPort).not.toBe(daemonBefore.routerPort);
+      await routedFetch(new URL(secondDashboardEndpoint.localUrl!).hostname, "/", true);
 
       await session.press("d");
       await session.waitForText("Named volumes are retained", { timeout: 5_000 });
       await session.press("esc");
       await waitForSnapshot(session, (frame) => !frame.includes("Confirm stack down"));
       await session.press("d");
+      await session.waitForText("Named volumes are retained", { timeout: 5_000 });
       await session.press("enter");
       await waitForSnapshot(
         session,
@@ -370,7 +533,10 @@ suite("real modem Fleet TUI", () => {
       await Promise.all([
         waitForHealth(worktreeB, "modem-ingest", ingestB),
         waitForHealth(worktreeB, "modem-slack", slackB),
+        routedFetch(new URL(ingestLocalB!).hostname),
+        routedFetch(new URL(dashboardEndpointB.localUrl!).hostname, "/", true),
       ]);
+      await waitForRoutedStatus(new URL(secondDashboardEndpoint.localUrl!).hostname, 404);
       await session.press("q");
       await session.waitIdle({ timeout: 3_000 });
     } finally {

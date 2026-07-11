@@ -26,6 +26,8 @@ export type FleetUiAction =
   | { type: "reconcile"; snapshot: FleetSnapshot; preferredProject?: string }
   | { type: "move-stack"; delta: number; snapshot: FleetSnapshot }
   | { type: "move-service"; delta: number; snapshot: FleetSnapshot }
+  | { type: "select-stack"; project: string; snapshot: FleetSnapshot }
+  | { type: "select-service"; service: string; snapshot: FleetSnapshot }
   | { type: "focus"; focus: FleetFocus }
   | { type: "layout"; layout: FleetLayoutMode }
   | { type: "filter"; filter: string; snapshot?: FleetSnapshot }
@@ -131,6 +133,33 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
             logOffset: 0,
             unseenLines: 0,
           };
+    }
+    case "select-stack": {
+      const stack = visibleFleetStacks(action.snapshot, state.filter).find(
+        (candidate) => candidate.project === action.project,
+      );
+      return stack === undefined ? state : {
+        ...state,
+        focus: "stacks",
+        selection: { project: stack.project, service: stack.services[0]?.name },
+        follow: true,
+        logOffset: 0,
+        unseenLines: 0,
+      };
+    }
+    case "select-service": {
+      const stack = action.snapshot.stacks.find(
+        (candidate) => candidate.project === state.selection.project,
+      );
+      if (!stack?.services.some((service) => service.name === action.service)) return state;
+      return {
+        ...state,
+        focus: "services",
+        selection: { ...state.selection, service: action.service },
+        follow: true,
+        logOffset: 0,
+        unseenLines: 0,
+      };
     }
     case "focus": return { ...state, focus: action.focus };
     case "layout": return { ...state, layout: action.layout };

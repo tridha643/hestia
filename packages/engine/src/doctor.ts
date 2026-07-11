@@ -14,6 +14,9 @@ import { isReady } from "./tunnel/verify.ts";
 import { fetchHealth, readDaemonJson } from "./daemon/client.ts";
 import { HESTIAD_PROTOCOL_VERSION } from "./daemon/routes.ts";
 import { plistPath } from "./daemon/launchd.ts";
+import { readHestiaMachineConfig } from "./router/router-config.ts";
+import { readHestiaRouterStatus } from "./router/portless-adapter.ts";
+import { readRouterStackRecords } from "./router/local-http-router.ts";
 
 /**
  * `hestia doctor` — report-only, never mutates. Doctor is the tool you reach
@@ -339,6 +342,41 @@ async function daemonChecks(): Promise<DoctorRow[]> {
   return rows;
 }
 
+async function localRouterChecks(): Promise<DoctorRow[]> {
+  const rows: DoctorRow[] = [];
+  const config = readHestiaMachineConfig();
+  rows.push(
+    config.valid
+      ? row("config-toml", "ok", config.path)
+      : row("config-toml", "warn", config.warnings.join("; ")),
+  );
+  const configuredRoutes = Object.values(config.config.router.repositories)
+    .reduce((count, repository) => count + (repository?.services.length ?? 0), 0) +
+    readRouterStackRecords().reduce((count, record) => count + (record.localRoutes?.length ?? 0), 0);
+  const router = await readHestiaRouterStatus();
+  if (!router.installed) {
+    rows.push(row(
+      "local-router",
+      configuredRoutes > 0 ? "warn" : "ok",
+      configuredRoutes > 0
+        ? "configured routes exist but the HTTPS router is not installed — run `hestia router install --interactive`"
+        : "not installed (optional; direct ports remain available)",
+    ));
+  } else {
+    const usable = router.running && router.trusted;
+    rows.push(row(
+      "local-router",
+      usable ? "ok" : "warn",
+      usable
+        ? `Portless ${router.version} serving on port ${router.port}`
+        : router.running
+          ? `Portless ${router.version} is running but its CA is not trusted — run \`hestia router install --interactive\``
+          : `Portless ${router.version} installed but not reachable on port ${router.port}`,
+    ));
+  }
+  return rows;
+}
+
 export async function doctor(cwd: string): Promise<DoctorRow[]> {
   let ctx: RepoCtx | null = null;
   let repoRow: DoctorRow;
@@ -361,6 +399,7 @@ export async function doctor(cwd: string): Promise<DoctorRow[]> {
     bounded("machine", () => machineChecks()),
     bounded("tunnel", () => tunnelChecks()),
     bounded("daemon", () => daemonChecks()),
+    bounded("local-router", () => localRouterChecks()),
   ]);
   return [repoRow, ...sections.flat()];
 }

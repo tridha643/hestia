@@ -195,6 +195,27 @@ describe("hestiad admission + supervision (daemon e2e)", () => {
     120_000,
   );
 
+  test("explicit route intent exposes the direct URL without Portless installation", () => {
+    const added = runCli(wtB, ["route", "add", "web", "--json"]);
+    expect(added.code).toBe(0);
+    const record = JSON.parse(added.stdout) as {
+      env: Record<string, string>;
+      endpoints: Array<{ name: string; url?: string; localUrl?: string }>;
+    };
+    const endpoint = record.endpoints.find((candidate) => candidate.name === "web");
+    if (endpoint?.url === undefined || endpoint.localUrl === undefined) {
+      throw new Error("route add did not project direct and local URL surfaces");
+    }
+    expect(endpoint.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(endpoint.localUrl).toMatch(/^https:\/\/.+\.localhost$/);
+    expect(record.env.HESTIA_WEB_DIRECT_URL).toBe(endpoint.url);
+    expect(record.env.HESTIA_WEB_LOCAL_URL).toBe(endpoint.localUrl);
+
+    const opened = runCli(wtB, ["open", "web", "--direct"]);
+    expect(opened.code).toBe(0);
+    expect(opened.stdout.trim()).toBe(endpoint.url);
+  });
+
   test(
     "killed daemon: status honest, next command respawns (fresh pid), start idempotent",
     async () => {

@@ -13,6 +13,7 @@ export interface ComposeCtx {
 
 /** compose service row from `ps --format json`. */
 export interface PsService {
+  ID?: string;
   Service: string;
   State: string;
   Health: string;

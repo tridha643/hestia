@@ -13,9 +13,11 @@ function serviceColor(service: FleetServiceView): string {
 export function ServicePane({
   stack,
   selectedService,
+  onSelectService,
 }: {
   stack?: FleetStackView;
   selectedService?: string;
+  onSelectService?: (service: string) => void;
 }) {
   return (
     <box style={{ height: "100%", width: "100%", flexDirection: "column", border: true, borderColor: fleetTheme.border }}>
@@ -27,12 +29,22 @@ export function ServicePane({
       {stack?.services.length ? stack.services.map((service) => {
         const selected = service.name === selectedService;
         const endpoint = service.endpoint;
-        const reach = endpoint?.publicUrl ?? endpoint?.url ?? (
+        const primaryReach = endpoint?.localUrl ?? endpoint?.publicUrl ?? endpoint?.url ?? (
           endpoint !== undefined ? `${endpoint.host}:${endpoint.port}` : "-"
         );
+        const directReach = endpoint !== undefined ? `${endpoint.host}:${endpoint.port}` : undefined;
+        const reach = endpoint?.localUrl !== undefined && directReach !== undefined
+          ? `${primaryReach} · ${directReach}`
+          : primaryReach;
         return (
           <box
             key={service.name}
+            onMouseDown={(event) => {
+              if (event.button !== 0) return;
+              event.preventDefault();
+              event.stopPropagation();
+              onSelectService?.(service.name);
+            }}
             style={{
               height: 1,
               paddingLeft: 1,

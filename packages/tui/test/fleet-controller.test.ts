@@ -70,6 +70,36 @@ describe("Fleet selection reducer", () => {
       .toEqual(["modem-beta"]);
   });
 
+  test("selects exact stack and service IDs for mouse interactions", () => {
+    const alphaWithTwoServices = {
+      ...snapshot.stacks[0]!,
+      services: [
+        ...snapshot.stacks[0]!.services,
+        { name: "postgres", backend: "docker" as const, state: "healthy" as const },
+      ],
+    };
+    const mouseSnapshot = { ...snapshot, stacks: [alphaWithTwoServices, snapshot.stacks[1]!] };
+    let state = reduceFleetUiState(createFleetUiState(), {
+      type: "select-stack",
+      project: "modem-beta",
+      snapshot: mouseSnapshot,
+    });
+    expect(state.selection).toEqual({ project: "modem-beta", service: "ingest" });
+    expect(state.focus).toBe("stacks");
+    state = reduceFleetUiState(state, {
+      type: "select-stack",
+      project: "modem-alpha",
+      snapshot: mouseSnapshot,
+    });
+    state = reduceFleetUiState(state, {
+      type: "select-service",
+      service: "postgres",
+      snapshot: mouseSnapshot,
+    });
+    expect(state.selection).toEqual({ project: "modem-alpha", service: "postgres" });
+    expect(state.focus).toBe("services");
+  });
+
   test("pins a down confirmation independently of snapshot reconciliation", () => {
     let state = reduceFleetUiState(createFleetUiState(), {
       type: "confirm-down",
