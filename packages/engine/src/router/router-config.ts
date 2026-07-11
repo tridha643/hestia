@@ -3,8 +3,10 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { slug, type RepoId, type StackRecord } from "@hestia/core";
 import { hestiaHome } from "../state.ts";
+import { writeAtomicTextFile } from "../atomic-json-file.ts";
+import { HestiaError } from "@hestia/core";
 
-export const DEFAULT_LOCAL_HOSTNAME_TEMPLATE = "{service}.{branch}.{repo}.localhost";
+export const DEFAULT_LOCAL_HOSTNAME_TEMPLATE = "{alias}.{branch}.{repo}.localhost";
 
 export interface RouterRepositoryConfig {
   name?: string;
@@ -34,6 +36,30 @@ export function hestiaConfigTomlPath(): string {
   return join(hestiaHome(), "config.toml");
 }
 
+/** Explicitly migrate the legacy maxStacks JSON into strict machine TOML. */
+export function migrateHestiaMachineConfig(): { migrated: boolean; from: string; to: string } {
+  const from = join(hestiaHome(), "config.json");
+  const to = hestiaConfigTomlPath();
+  if (existsSync(to)) return { migrated: false, from, to };
+  if (!existsSync(from)) throw new HestiaError("config-missing", `legacy config not found at ${from}`);
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(from, "utf8"));
+  } catch (error) {
+    throw new HestiaError("config-invalid", `invalid ${from}: ${(error as Error).message}`);
+  }
+  const maxStacks = (value as { maxStacks?: unknown })?.maxStacks;
+  if (!Number.isInteger(maxStacks) || (maxStacks as number) <= 0) {
+    throw new HestiaError("config-invalid", `${from}.maxStacks must be a positive integer`);
+  }
+  writeAtomicTextFile(
+    to,
+    `version = 1\nmax_stacks = ${maxStacks}\n\n[router]\nhostname_template = ${JSON.stringify(DEFAULT_LOCAL_HOSTNAME_TEMPLATE)}\n`,
+  );
+  readHestiaMachineConfig(to);
+  return { migrated: true, from, to };
+}
+
 function emptyMachineConfig(): HestiaMachineConfig {
   return {
     version: 1,
@@ -53,17 +79,20 @@ function assertKnownKeys(table: Record<string, unknown>, allowed: string[], path
 function validateHostnameTemplate(value: unknown): string {
   const template = value === undefined ? DEFAULT_LOCAL_HOSTNAME_TEMPLATE : value;
   if (typeof template !== "string") throw new Error("router.hostname_template must be a string");
-  for (const token of ["{service}", "{branch}", "{repo}"]) {
+  for (const token of ["{branch}", "{repo}"]) {
     if (!template.includes(token)) throw new Error(`router.hostname_template must contain ${token}`);
+  }
+  if (!["{alias}", "{workload}", "{service}"].some((token) => template.includes(token))) {
+    throw new Error("router.hostname_template must contain {alias}, {workload}, or legacy {service}");
   }
   if (!template.endsWith(".localhost")) {
     throw new Error("router.hostname_template must end in .localhost");
   }
   const unknown = template.match(/\{[^}]+\}/g)?.filter(
-    (token) => !["{service}", "{branch}", "{repo}"].includes(token),
+    (token) => !["{alias}", "{workload}", "{service}", "{branch}", "{repo}"].includes(token),
   );
   if (unknown?.length) throw new Error(`router.hostname_template has unknown token ${unknown[0]}`);
-  const worstCase = template.replaceAll(/\{(?:service|branch|repo)\}/g, "x".repeat(63));
+  const worstCase = template.replaceAll(/\{(?:alias|workload|service|branch|repo)\}/g, "x".repeat(63));
   if (worstCase.length > 253) {
     throw new Error("router.hostname_template can exceed the 253-character DNS hostname limit");
   }
@@ -185,23 +214,56 @@ export function effectiveLocalRouteServices(
   record: StackRecord,
   config = readHestiaMachineConfig().config,
 ): string[] {
-  return [...new Set([
-    ...(record.localRoutes ?? []).map((route) => route.service),
-    ...configuredLocalRouteServices(record.repoId, config),
-  ])].sort();
+  return effectiveLocalRoutes(record, config).map((route) => route.name);
+}
+
+export interface EffectiveLocalRoute {
+  name: string;
+  service: string;
+  selector?: string;
+}
+
+/** Resolve explicit aliases plus machine defaults into route targets. */
+export function effectiveLocalRoutes(
+  record: StackRecord,
+  config = readHestiaMachineConfig().config,
+): EffectiveLocalRoute[] {
+  const routes = new Map<string, EffectiveLocalRoute>();
+  for (const service of configuredLocalRouteServices(record.repoId, config)) {
+    routes.set(service, { name: service, service });
+  }
+  for (const endpoint of record.endpoints) {
+    if (endpoint.local !== true) continue;
+    routes.set(endpoint.alias ?? endpoint.name, {
+      name: endpoint.alias ?? endpoint.name,
+      service: endpoint.workload ?? endpoint.name,
+      selector: endpoint.binding,
+    });
+  }
+  for (const intent of record.localRoutes ?? []) {
+    const name = intent.alias ?? intent.service;
+    routes.set(name, { name, service: intent.service, selector: intent.selector });
+  }
+  for (const disabled of record.disabledLocalRoutes ?? []) {
+    routes.delete(disabled.alias ?? disabled.service);
+  }
+  return [...routes.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 /** Render one collision-safe local hostname from a validated template. */
 export function localRouteHostname(
   record: Pick<StackRecord, "repoId" | "repo" | "branch" | "worktree">,
-  service: string,
+  alias: string,
   config = readHestiaMachineConfig().config,
+  workload = alias,
 ): string {
   const repositoryName = record.repoId === undefined
     ? record.repo
     : config.router.repositories[record.repoId]?.name ?? record.repo;
   const expanded = config.router.hostnameTemplate
-    .replaceAll("{service}", service)
+    .replaceAll("{alias}", alias)
+    .replaceAll("{workload}", workload)
+    .replaceAll("{service}", alias)
     .replaceAll("{branch}", record.branch)
     .replaceAll("{repo}", repositoryName);
   const hostname = expanded.split(".").map((label) => localHostnameLabel(label)).join(".");
@@ -216,14 +278,16 @@ export function resolveLocalRouteHostnames(
 ): Map<string, string> {
   const candidates: Array<{ key: string; hostname: string; record: StackRecord }> = [];
   for (const record of records) {
-    const services = new Set([
-      ...effectiveLocalRouteServices(record, config),
-      ...record.endpoints.map((endpoint) => endpoint.name),
-    ]);
-    for (const service of services) {
+    const routes = new Map<string, string>(
+      effectiveLocalRoutes(record, config).map((route) => [route.name, route.service]),
+    );
+    for (const endpoint of record.endpoints) {
+      if (!routes.has(endpoint.name)) routes.set(endpoint.name, endpoint.workload ?? endpoint.name);
+    }
+    for (const [service, workload] of routes) {
       candidates.push({
         key: localRouteKey(record, service),
-        hostname: localRouteHostname(record, service, config),
+        hostname: localRouteHostname(record, service, config, workload),
         record,
       });
     }

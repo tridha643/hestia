@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, mkdirSync, openSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { HestiaError, type ProcSpec, type ServiceRecord } from "@hestia/core";
@@ -7,6 +7,7 @@ import {
   type Pidfile,
   isLive,
   removePidfile,
+  procSpecFingerprint,
   startTimeOf,
   writePidfile,
 } from "./pidfile.ts";
@@ -18,6 +19,10 @@ const NO_PORT_GRACE_MS = 2_000;
 const POLL_MS = 300;
 const MAX_ATTEMPTS = 3;
 const PROC_RESTART_SENTINEL = "--- hestia: proc restarted (port stolen) ---\n";
+const RELAY_SPEC_ENV = "HESTIA_PROC_RELAY_SPEC";
+const PROC_RELAY_ENTRYPOINT = existsSync(join(import.meta.dir, "proc-relay.js"))
+  ? join(import.meta.dir, "proc-relay.js")
+  : join(import.meta.dir, "proc-relay.ts");
 
 export function envKey(name: string): string {
   return name.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
@@ -60,19 +65,20 @@ function spawnOnce(
   logPath: string,
   attempt: number,
 ): Promise<number> {
-  const fd = openProcAttemptLog(logPath, attempt);
+  closeSync(openProcAttemptLog(logPath, attempt));
+  const relaySpec = Buffer.from(JSON.stringify({ argv, cwd, env, logPath })).toString("base64");
+  const relayFd = openSync(logPath, "a", 0o600);
   return new Promise((resolve, reject) => {
-    // node:child_process, not Bun.spawn — Bun's native API has no `detached`.
-    // detached makes the child its own process-group leader (pgid == pid), so
-    // one negative-pgid signal later reaches the whole tree.
-    const child = spawn(argv[0]!, argv.slice(1), {
+    // The relay is the supervised process-group root. It keeps target env in
+    // memory, captures both streams, and bounds the log family by rotation.
+    const child = spawn(process.execPath, [PROC_RELAY_ENTRYPOINT], {
       cwd,
-      env: env as NodeJS.ProcessEnv,
+      env: { ...process.env, [RELAY_SPEC_ENV]: relaySpec },
       detached: true,
-      stdio: ["ignore", fd, fd],
+      stdio: ["ignore", relayFd, relayFd],
     });
     child.once("error", (err) => {
-      closeSync(fd);
+      closeSync(relayFd);
       reject(
         new HestiaError(
           "proc-spawn-failed",
@@ -81,7 +87,7 @@ function spawnOnce(
       );
     });
     child.once("spawn", () => {
-      closeSync(fd);
+      closeSync(relayFd);
       child.unref();
       resolve(child.pid!);
     });
@@ -133,12 +139,12 @@ export async function startProc(
     const pid = await spawnOnce(argv, cwd, env, logPath, attempt);
     const startTime = startTimeOf(pid) ?? "";
     const pf: Pidfile = {
+      schemaVersion: 1,
       name: spec.name,
       pid,
       pgid: pid,
       startTime,
-      argv: spec.argv,
-      env: spec.env,
+      specFingerprint: procSpecFingerprint(spec),
       port,
       inspectorPort: spec.inspectorPort,
       logPath,
@@ -164,6 +170,7 @@ export async function startProc(
       logPath,
       configPath: spec.configPath,
       originService: spec.originService,
+      originEndpoint: spec.originEndpoint,
     };
 
     switch (outcome.kind) {

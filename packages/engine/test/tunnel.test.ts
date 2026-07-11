@@ -17,6 +17,10 @@ import {
   ledgerAdd,
   ledgerHas,
 } from "../src/tunnel/registry.ts";
+import {
+  internalEndpointAuthority,
+  publicGatewaySocketPath,
+} from "../src/router/local-http-router.ts";
 
 const cleanups: Array<() => void> = [];
 afterAll(() => {
@@ -140,8 +144,8 @@ describe("generateMergedConfig", () => {
     expect(cfg.ingress[0]!.hostname).toBe("tri-slack.modem.codes");
     expect(cfg.ingress[1]).toEqual({
       hostname: "tri-salem-slack.modem.codes",
-      service: "http://127.0.0.1:50123",
-      originRequest: { httpHostHeader: "127.0.0.1:50123" },
+      service: `unix:${publicGatewaySocketPath()}`,
+      originRequest: { httpHostHeader: internalEndpointAuthority("modem-salem", "slack") },
     });
     expect(cfg.ingress[2]).toEqual({ service: "http_status:404" });
   });
@@ -199,6 +203,7 @@ describe("hostname ledger + mirror-derived rules", () => {
     writeFileSync(
       join(mdir, "stack.json"),
       JSON.stringify({
+        schemaVersion: 1,
         project,
         repo: "r",
         branch: "b",
@@ -206,7 +211,7 @@ describe("hostname ledger + mirror-derived rules", () => {
         state: "up",
         env: {},
         endpoints: [],
-        createdAt: "",
+        createdAt: new Date(0).toISOString(),
         services: [
           { name: "web", backend: "proc", state: "healthy", publishedPort: 60001 },
         ],

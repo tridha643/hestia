@@ -38,3 +38,26 @@ export function writeAtomicJsonFile(
     throw error;
   }
 }
+
+/** Atomically publish private UTF-8 text (TOML, YAML, or other generated config). */
+export function writeAtomicTextFile(path: string, source: string, mode = 0o600): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const fd = openSync(temporaryPath, "wx", mode);
+  try {
+    writeFileSync(fd, source);
+    fsyncSync(fd);
+  } catch (error) {
+    closeSync(fd);
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+  closeSync(fd);
+  try {
+    chmodSync(temporaryPath, mode);
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}

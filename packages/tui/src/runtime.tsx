@@ -32,7 +32,7 @@ export async function runFleetTui(cwd = process.cwd()): Promise<void> {
     throw new HestiaError("usage", "hestia tui requires interactive stdin and stdout");
   }
   const repo = await getRepoInfo(cwd);
-  const preferredProject = projectName(repo.repo, repo.branch, repo.worktreeRoot);
+  const preferredProject = projectName(repo.repoId, repo.repo, repo.branch, repo.worktreeRoot);
   const source = new DaemonFleetSource(repo.repoId);
   const renderer = await createCliRenderer({
     stdin: process.stdin,
@@ -70,7 +70,16 @@ export async function runFleetTui(cwd = process.cwd()): Promise<void> {
     removeSuspend = installFleetSuspend(renderer);
     root.render(
       <FleetErrorBoundary onError={(error) => shutdown(error)}>
-        <FleetApp source={source} preferredProject={preferredProject} onQuit={shutdown} />
+        <FleetApp
+          source={source}
+          preferredProject={preferredProject}
+          invokingRepository={{
+            repo: repo.repo,
+            branch: repo.branch,
+            worktree: repo.worktreeRoot,
+          }}
+          onQuit={shutdown}
+        />
       </FleetErrorBoundary>,
     );
   });

@@ -23,7 +23,7 @@ interface UpResult {
   project: string;
   state: string;
   env: Record<string, string>;
-  endpoints: Array<{ name: string; host: string; port: number }>;
+  endpoints: Array<{ name: string; host: string; port: number; kind?: string; url?: string }>;
 }
 
 function runCli(cwd: string, args: string[]): { code: number; stdout: string } {
@@ -107,11 +107,13 @@ suite("per-worktree compose isolation (zero-config)", () => {
       // 1. up A — inferred service, ephemeral port surfaced + connectable.
       const a = upJson(wtA);
       expect(a.state).toBe("up");
-      expect(a.project).toBe("myrepo-branch-a");
+      expect(a.project).toMatch(/^myrepo-branch-a-[0-9a-f]{10}$/);
       const portA = Number(a.env.HESTIA_DB_PORT);
       expect(portA).toBeGreaterThan(0);
       expect(portA).not.toBe(54329); // the pinned host port was replaced
       expect(a.endpoints.find((e) => e.name === "db")?.port).toBe(portA);
+      expect(a.endpoints.find((e) => e.name === "db")?.kind).toBe("tcp");
+      expect(a.endpoints.find((e) => e.name === "db")?.url).toBeUndefined();
       // caller wires its own URL from the returned port (what an agent does).
       const urlA = `postgresql://postgres:postgres@127.0.0.1:${portA}/app`;
       expect(urlA).toContain(String(portA));
@@ -119,14 +121,14 @@ suite("per-worktree compose isolation (zero-config)", () => {
 
       // 2. up B — a second, distinct stack.
       const b = upJson(wtB);
-      expect(b.project).toBe("myrepo-branch-b");
+      expect(b.project).toMatch(/^myrepo-branch-b-[0-9a-f]{10}$/);
       const portB = Number(b.env.HESTIA_DB_PORT);
       expect(portB).not.toBe(portA);
       expect(await tcpOpens(portB)).toBe(true);
 
       // 3. status shows each worktree its own stack only.
       const statusA = JSON.parse(runCli(wtA, ["status", "--json"]).stdout);
-      expect(statusA.project).toBe("myrepo-branch-a");
+      expect(statusA.project).toBe(a.project);
 
       // 4. down A removes A but leaves B up and still connectable.
       expect(runCli(wtA, ["down"]).code).toBe(0);

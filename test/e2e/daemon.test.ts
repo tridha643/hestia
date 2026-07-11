@@ -132,6 +132,7 @@ describe("hestiad admission + supervision (daemon e2e)", () => {
       HESTIA_NO_OPEN: "1",
       HESTIA_STUB_STATE: stubState,
       HESTIA_CLOUDFLARED_HOME: cfHome,
+      HESTIA_E2E_DNS_RESOLVED: "1",
       PATH: `${STUB_DIR}:${process.env.PATH}`,
     };
   });

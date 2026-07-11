@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RepoId, StackRecord } from "@hestia/core";
+import { STATE_SCHEMA_VERSION, type RepoId, type StackRecord } from "@hestia/core";
 import { startTimeOf } from "../src/proc/pidfile.ts";
 import { writeState } from "../src/state.ts";
 import { collectFleetSnapshot, FleetMonitor } from "../src/daemon/fleet-monitor.ts";
@@ -15,6 +15,7 @@ const repoId = "repo-1234567890abcdef" as RepoId;
 
 function fixtureRecord(worktree: string): StackRecord {
   return {
+    schemaVersion: STATE_SCHEMA_VERSION,
     project: "fixture-fleet",
     repoId,
     repo: "fixture",

@@ -91,6 +91,29 @@ export async function ensureDaemon(): Promise<DaemonHandle> {
     );
   }
 
+  // Discovery can identify the exact live daemon even when its HTTP surface
+  // is wedged. Restart that identity before spawning; otherwise main.ts's
+  // single-instance guard correctly rejects the newcomer and ensure times out.
+  const discovery = readDaemonJson();
+  const discoveredPidfile = readPidfile(daemonDir(), PIDFILE_NAME);
+  if (
+    discovery !== null &&
+    discoveredPidfile?.pid === discovery.pid &&
+    isLive(discoveredPidfile)
+  ) {
+    if (launchdManagesThisHome()) kickstart();
+    else {
+      await stopDaemonProcess();
+      spawnDaemon();
+    }
+    const restarted = await pollHealthy();
+    if (restarted !== null) return restarted;
+    throw new HestiaError(
+      "daemon-start-failed",
+      `live but unhealthy hestiad ${discovery.pid} did not recover within ${START_TIMEOUT_MS / 1000}s`,
+    );
+  }
+
   // Not reachable — serialize the spawn decision so parallel agents fork at
   // most a couple of candidates (main.ts's own guard picks the single winner).
   // The lock covers ONLY check+spawn: main.ts takes the same lock to start

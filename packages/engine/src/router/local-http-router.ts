@@ -3,13 +3,17 @@ import { Agent, createServer, request as httpRequest, type IncomingMessage, type
 import { createConnection, createServer as createNetServer, type Socket } from "node:net";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ServiceRecord, StackRecord } from "@hestia/core";
+import { createHash } from "node:crypto";
+import { slug, type ServiceRecord, type StackRecord } from "@hestia/core";
 import { isLive } from "../proc/pidfile.ts";
 import { inspectPort } from "../proc/ports.ts";
-import { hestiaHome } from "../state.ts";
+import { hestiaHome, parseStackRecord } from "../state.ts";
 import {
   effectiveLocalRouteServices,
+  effectiveLocalRoutes,
   localRouteKey,
   localRouteHostname,
   readHestiaMachineConfig,
@@ -34,6 +38,8 @@ interface LocalRouterTarget {
   agent?: Agent;
 }
 
+class OriginOwnershipError extends Error {}
+
 export function readRouterStackRecords(): StackRecord[] {
   const stacksDir = join(hestiaHome(), "stacks");
   if (!existsSync(stacksDir)) return [];
@@ -43,7 +49,7 @@ export function readRouterStackRecords(): StackRecord[] {
     try {
       const source = readFileSync(path);
       if (source.byteLength > MAX_MIRROR_BYTES) continue;
-      const record = JSON.parse(source.toString("utf8")) as StackRecord;
+      const record = parseStackRecord(source.toString("utf8"), path);
       if (record.project === project) records.push(record);
     } catch {}
   }
@@ -140,11 +146,12 @@ async function verifyLocalRouterTarget(target: LocalRouterTarget): Promise<numbe
 export async function verifyStackServiceOrigin(
   record: StackRecord,
   service: ServiceRecord,
+  publishedPort = service.publishedPort,
 ): Promise<boolean> {
   return await verifyLocalRouterTarget({
     hostname: "",
     project: record.project,
-    service,
+    service: { ...service, publishedPort },
   }) !== null;
 }
 
@@ -161,28 +168,65 @@ function verifiedOriginAgent(target: LocalRouterTarget, port: number): Agent {
     _options: unknown,
     callback: (error: Error | null, socket?: Socket) => void,
   ) => {
-    const socket = createConnection({ host: "127.0.0.1", port });
-    let completed = false;
-    const finish = (error: Error | null, verifiedSocket?: Socket) => {
-      if (completed) return;
-      completed = true;
-      socket.off("error", onConnectionError);
-      callback(error, verifiedSocket);
+    let settled = false;
+    const finish = (error: Error | null, socket?: Socket) => {
+      if (settled) return;
+      settled = true;
+      callback(error, socket);
     };
-    const onConnectionError = (error: Error) => finish(error);
-    socket.once("connect", () => void verifyLocalRouterTarget(target).then((verifiedPort) => {
-      if (verifiedPort !== port) {
-        socket.destroy();
-        finish(new Error("route origin ownership changed"));
-      } else {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    socket.once("connect", () => {
+      // No request bytes are written until the Agent receives this callback.
+      // Verify after connect so a recycled listener cannot win the gap between
+      // ownership inspection and socket establishment.
+      void verifyLocalRouterTarget(target).then((verifiedPort) => {
+        if (verifiedPort !== port) {
+          socket.destroy();
+          finish(new OriginOwnershipError("route origin ownership changed"));
+          return;
+        }
         finish(null, socket);
-      }
-    }));
-    socket.once("error", onConnectionError);
+      }).catch((error) => {
+        socket.destroy();
+        finish(error as Error);
+      });
+    });
+    socket.once("error", (error) => finish(error));
     return undefined;
   }) as typeof agent.createConnection;
   target.agent = agent;
   return agent;
+}
+
+export function internalEndpointAuthority(project: string, service: string): string {
+  const serviceLabel = slug(service).slice(0, 32);
+  const hash = createHash("sha256").update(`${project}\0${service}`).digest("hex").slice(0, 10);
+  return `${serviceLabel}-${hash}.hestia.internal`;
+}
+
+export function publicGatewaySocketPath(): string {
+  const uid = process.getuid?.() ?? 501;
+  const homeHash = createHash("sha256").update(hestiaHome()).digest("hex").slice(0, 12);
+  return join(tmpdir(), `hestia-${uid}`, homeHash, "origin.sock");
+}
+
+function prepareGatewaySocket(path: string): void {
+  const uid = process.getuid?.();
+  const directories = [join(tmpdir(), `hestia-${uid ?? 501}`), join(tmpdir(), `hestia-${uid ?? 501}`, createHash("sha256").update(hestiaHome()).digest("hex").slice(0, 12))];
+  for (const directory of directories) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid)) {
+      throw new Error(`unsafe Hestia gateway runtime directory ${directory}`);
+    }
+    chmodSync(directory, 0o700);
+  }
+  if (!existsSync(path)) return;
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isSocket() || (uid !== undefined && stat.uid !== uid)) {
+    throw new Error(`refusing unsafe existing Hestia gateway socket ${path}`);
+  }
+  rmSync(path);
 }
 
 function sendRouterResponse(response: ServerResponse, status: number, message: string): void {
@@ -194,6 +238,7 @@ function sendRouterResponse(response: ServerResponse, status: number, message: s
 export class HestiaLocalHttpRouter {
   readonly #server = createServer((request, response) => void this.#proxyHttp(request, response));
   readonly #frontServer = createNetServer((socket) => this.#acceptFrontSocket(socket));
+  readonly #unixServer = createNetServer((socket) => this.#acceptFrontSocket(socket));
   #targets = new Map<string, LocalRouterTarget>();
   #timer?: ReturnType<typeof setInterval>;
 
@@ -202,6 +247,15 @@ export class HestiaLocalHttpRouter {
       this.#server.once("error", reject);
       this.#server.listen(0, "127.0.0.1", () => {
         this.#server.off("error", reject);
+        resolve();
+      });
+    });
+    prepareGatewaySocket(this.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      this.#unixServer.once("error", reject);
+      this.#unixServer.listen(this.socketPath, () => {
+        this.#unixServer.off("error", reject);
+        chmodSync(this.socketPath, 0o600);
         resolve();
       });
     });
@@ -225,6 +279,10 @@ export class HestiaLocalHttpRouter {
     return typeof address === "object" && address !== null ? address.port : 0;
   }
 
+  get socketPath(): string {
+    return publicGatewaySocketPath();
+  }
+
   /** Rebuild route targets from mirrors plus machine TOML and reconcile Portless aliases. */
   async refreshRoutes(): Promise<void> {
     const configResult = readHestiaMachineConfig();
@@ -232,18 +290,56 @@ export class HestiaLocalHttpRouter {
     const records = readRouterStackRecords();
     const hostnames = resolveLocalRouteHostnames(records, configResult.config);
     for (const record of records) {
-      for (const serviceName of effectiveLocalRouteServices(record, configResult.config)) {
-        const hostname = hostnames.get(localRouteKey(record, serviceName));
+      for (const route of effectiveLocalRoutes(record, configResult.config)) {
+        const hostname = hostnames.get(localRouteKey(record, route.name));
         if (hostname === undefined) continue;
+        const originalService = record.services.find((service) => service.name === route.service);
+        const selectedBinding = route.selector === undefined
+          ? undefined
+          : originalService?.bindings?.find(
+              (binding) => `${binding.target}/${binding.protocol}` === route.selector,
+            );
         const candidate: LocalRouterTarget = {
           hostname,
           project: record.project,
-          service: record.services.find((service) => service.name === serviceName),
+          service: originalService === undefined
+            ? undefined
+            : { ...originalService, publishedPort: selectedBinding?.publishedPort ?? originalService.publishedPort },
         };
         const previous = this.#targets.get(hostname);
         targets.set(hostname, previous !== undefined && targetIdentity(previous) === targetIdentity(candidate)
           ? previous
           : candidate);
+      }
+      for (const endpoint of record.endpoints) {
+        const service = record.services.find((candidate) =>
+          candidate.name === (endpoint.workload ?? endpoint.name));
+        const binding = service?.bindings?.find((candidate) =>
+          `${candidate.target}/${candidate.protocol}` === endpoint.binding);
+        const publishedPort = binding?.publishedPort ?? service?.publishedPort;
+        if (service === undefined || service.backend === "tunnel" || publishedPort === undefined) continue;
+        const authority = internalEndpointAuthority(record.project, endpoint.alias ?? endpoint.name);
+        targets.set(authority, {
+          hostname: authority,
+          project: record.project,
+          service: { ...service, publishedPort },
+        });
+      }
+      for (const exposure of record.tunnel?.exposures ?? []) {
+        const hostname = exposure.keepHostHeader
+          ? exposure.hostname
+          : internalEndpointAuthority(record.project, exposure.alias ?? exposure.service);
+        const originalService = record.services.find((service) => service.name === exposure.service);
+        const selectedBinding = originalService?.bindings?.find((binding) =>
+          `${binding.target}/${binding.protocol}` === exposure.binding);
+        targets.set(hostname, {
+          hostname,
+          project: record.project,
+          service: originalService === undefined ? undefined : {
+            ...originalService,
+            publishedPort: selectedBinding?.publishedPort ?? originalService.publishedPort,
+          },
+        });
       }
     }
     reconcilePortlessAliases([...targets.keys()], this.port);
@@ -262,6 +358,8 @@ export class HestiaLocalHttpRouter {
     }
     for (const target of this.#targets.values()) target.agent?.destroy();
     this.#frontServer.close();
+    this.#unixServer.close();
+    rmSync(this.socketPath, { force: true });
     this.#server.close();
   }
 
@@ -307,6 +405,9 @@ export class HestiaLocalHttpRouter {
     if (target === undefined) return sendRouterResponse(response, 404, "Hestia route not found");
     const port = target.service?.publishedPort;
     if (port === undefined) return sendRouterResponse(response, 503, "Hestia route origin unavailable");
+    if (await verifyLocalRouterTarget(target) !== port) {
+      return sendRouterResponse(response, 503, "Hestia route origin unavailable");
+    }
     const proxy = httpRequest({
       hostname: "127.0.0.1",
       port,
@@ -323,8 +424,15 @@ export class HestiaLocalHttpRouter {
       response.on("error", () => origin.destroy());
       origin.pipe(response);
     });
-    proxy.on("error", () => {
-      if (!response.headersSent) sendRouterResponse(response, 502, "Hestia route origin failed");
+    proxy.on("error", (error) => {
+      if (!response.headersSent) {
+        const ownershipFailure = error instanceof OriginOwnershipError;
+        sendRouterResponse(
+          response,
+          ownershipFailure ? 503 : 502,
+          ownershipFailure ? "Hestia route origin unavailable" : "Hestia route origin failed",
+        );
+      }
       else response.destroy();
     });
     request.pipe(proxy);
@@ -369,7 +477,8 @@ export class HestiaLocalHttpRouter {
       "",
     ].join("\r\n");
     const originSocket = createConnection({ host: "127.0.0.1", port });
-    originSocket.once("connect", () => void verifyLocalRouterTarget(target).then((verifiedPort) => {
+    originSocket.once("connect", async () => {
+      const verifiedPort = await verifyLocalRouterTarget(target);
       if (verifiedPort !== port) {
         originSocket.destroy();
         socket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
@@ -379,7 +488,7 @@ export class HestiaLocalHttpRouter {
       originSocket.write(rewrittenHeader, "latin1");
       if (head.length) originSocket.write(head);
       socket.resume();
-    }));
+    });
     originSocket.once("error", () => {
       if (!socket.destroyed) socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
     });

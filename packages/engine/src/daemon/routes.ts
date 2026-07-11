@@ -12,7 +12,7 @@ import { readMirrorState } from "../state.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
 import { SlotLedger, resolveMaxStacks } from "./slots.ts";
 
-export const HESTIAD_PROTOCOL_VERSION = 3;
+export const HESTIAD_PROTOCOL_VERSION = 4;
 const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_LOG_STREAMS = 16;
 const MAX_LOG_TAIL = 200;
@@ -49,6 +49,13 @@ function admissionIdentity(identity: StackIdentity | string): StackIdentity {
 /** Machine-wide FIFO admission whose expensive occupancy probes never serve Fleet readers. */
 export class Admission {
   #queue: Waiter[] = [];
+  #cachedState: DaemonStateView = {
+    maxStacks: resolveMaxStacks().maxStacks,
+    live: [],
+    reserved: [],
+    queued: [],
+    warnings: resolveMaxStacks().warnings,
+  };
   #mutex: Promise<unknown> = Promise.resolve();
 
   constructor(readonly ledger: SlotLedger) {}
@@ -116,9 +123,32 @@ export class Admission {
     return this.queuedIdentitySnapshot().map((identity) => identity.project);
   }
 
+  /** Constant-time cached view for liveness checks; never probes Docker or mutates reservations. */
+  healthSnapshot(): DaemonStateView {
+    return {
+      ...this.#cachedState,
+      live: [...this.#cachedState.live],
+      reserved: [...this.#cachedState.reserved],
+      queued: this.queuedProjects(),
+      warnings: [...this.#cachedState.warnings],
+    };
+  }
+
+  #cache(occupancy: Awaited<ReturnType<SlotLedger["occupancy"]>>): void {
+    const { maxStacks, warnings } = resolveMaxStacks();
+    this.#cachedState = {
+      maxStacks,
+      live: [...occupancy.live],
+      reserved: [...occupancy.reserved],
+      queued: this.queuedProjects(),
+      warnings: [...warnings, ...occupancy.warnings],
+    };
+  }
+
   async #try(identity: StackIdentity, holder: Holder): Promise<AcquireResult> {
     const { maxStacks } = resolveMaxStacks();
     const occupancy = await this.ledger.occupancy();
+    this.#cache(occupancy);
     if (
       occupancy.live.includes(identity.project) ||
       occupancy.reserved.includes(identity.project)
@@ -136,6 +166,7 @@ export class Admission {
     if (this.#queue.length === 0) return;
     const { maxStacks } = resolveMaxStacks();
     const occupancy = await this.ledger.occupancy();
+    this.#cache(occupancy);
     let used = occupancy.live.length + occupancy.reserved.length;
     const granted: Waiter[] = [];
     for (const waiter of this.#queue) {
@@ -165,6 +196,7 @@ export class Admission {
   async stateView(): Promise<DaemonStateView> {
     const { maxStacks, warnings } = resolveMaxStacks();
     const occupancy = await this.ledger.occupancy();
+    this.#cache(occupancy);
     return {
       maxStacks,
       live: occupancy.live,
@@ -179,6 +211,7 @@ export interface DaemonRouteDependencies {
   token: string;
   fleet: FleetMonitor;
   routerPort: number;
+  gatewaySocket: string;
   refreshLocalRoutes(): Promise<void>;
   logsProject(project: string, options: LogsOptions): AsyncIterable<LogLine>;
 }
@@ -288,7 +321,7 @@ export function createRoutes(
     if (!authorized(request, dependencies.token)) return json({ error: "unauthorized" }, 401);
 
     if (url.pathname === "/hestia/health" && request.method === "GET") {
-      const state = await admission.stateView();
+      const state = admission.healthSnapshot();
       const health: DaemonHealth = {
         ok: true,
         pid: process.pid,
@@ -298,6 +331,7 @@ export function createRoutes(
         queued: state.queued.length,
         startedAt,
         routerPort: dependencies.routerPort,
+        gatewaySocket: dependencies.gatewaySocket,
         warnings: state.warnings,
       };
       return json(health);

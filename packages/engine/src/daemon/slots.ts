@@ -8,8 +8,8 @@ import {
 } from "node:fs";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
-import { LABELS, type StackIdentity, type StackRecord } from "@hestia/core";
-import { hestiaHome, mirrorProcsDir } from "../state.ts";
+import { LABELS, STATE_SCHEMA_VERSION, type StackIdentity, type StackRecord } from "@hestia/core";
+import { hestiaHome, mirrorProcsDir, parseStackRecord } from "../state.ts";
 import { isLive, listPidfiles } from "../proc/pidfile.ts";
 import { writeAtomicJsonFile } from "../atomic-json-file.ts";
 import { hestiaConfigTomlPath, readHestiaMachineConfig } from "../router/router-config.ts";
@@ -37,6 +37,7 @@ function reservationsDir(): string {
 
 /** Persisted grant bridging daemon admission to the first stack mirror write. */
 export interface StackReservation {
+  schemaVersion?: typeof STATE_SCHEMA_VERSION;
   project: string;
   identity?: StackIdentity;
   /** Holder identity — a dead holder frees the reservation before the TTL. */
@@ -129,6 +130,7 @@ export class SlotLedger {
   ): void {
     const project = typeof identity === "string" ? identity : identity.project;
     const reservation: StackReservation = {
+      schemaVersion: STATE_SCHEMA_VERSION,
       project,
       identity: typeof identity === "string" ? undefined : identity,
       ...holder,
@@ -155,6 +157,9 @@ export class SlotLedger {
       }
       try {
         const reservation = JSON.parse(readFileSync(join(dir, f), "utf8")) as StackReservation;
+        if (reservation.schemaVersion !== STATE_SCHEMA_VERSION) {
+          throw new Error("legacy or unsupported reservation schema");
+        }
         if (reservation.project !== f) throw new Error("reservation filename mismatch");
         out.push(reservation);
       } catch {
@@ -223,7 +228,7 @@ export class SlotLedger {
         if (!existsSync(p)) continue;
         let record: StackRecord;
         try {
-          record = JSON.parse(readFileSync(p, "utf8")) as StackRecord;
+          record = parseStackRecord(readFileSync(p, "utf8"), p);
         } catch {
           warnings.push(`unreadable mirror for ${project}`);
           continue;

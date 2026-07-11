@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { createConnection, createServer as createNetServer, type Server as NetServer } from "node:net";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RepoId, StackRecord } from "@hestia/core";
+import { STATE_SCHEMA_VERSION, type RepoId, type StackRecord } from "@hestia/core";
 import { startTimeOf } from "../src/proc/pidfile.ts";
 import { ensureDir, mirrorDir, writeState } from "../src/state.ts";
 import {
@@ -13,7 +13,11 @@ import {
   readHestiaMachineConfig,
   resolveLocalRouteHostnames,
 } from "../src/router/router-config.ts";
-import { HestiaLocalHttpRouter, resolvedLocalRouteHostname } from "../src/router/local-http-router.ts";
+import {
+  HestiaLocalHttpRouter,
+  internalEndpointAuthority,
+  resolvedLocalRouteHostname,
+} from "../src/router/local-http-router.ts";
 
 const homes: string[] = [];
 
@@ -26,6 +30,7 @@ function useTemporaryHome(): string {
 
 function sampleRecord(worktree: string, port: number): StackRecord {
   return {
+    schemaVersion: STATE_SCHEMA_VERSION,
     project: "modem-salem",
     repoId: "repo-0123456789abcdef" as RepoId,
     repo: "modem",
@@ -263,4 +268,46 @@ describe("hestiad local HTTP router", () => {
       origin.close();
     }
   });
+
+  test("Unix gateway returns 503 before a recycled foreign port receives bytes", async () => {
+    const home = useTemporaryHome();
+    let foreignBytes = 0;
+    const foreign = createNetServer((socket) => {
+      socket.on("data", (chunk) => { foreignBytes += chunk.byteLength; });
+    });
+    await new Promise<void>((resolve) => foreign.listen(0, "127.0.0.1", resolve));
+    const address = foreign.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const worktree = join(home, "worktree");
+    const record = sampleRecord(worktree, port);
+    // This is the post-crash state: the recorded origin identity is dead but
+    // another process has already recycled its old port.
+    record.services[0]!.pid = 999_999;
+    record.services[0]!.startTime = "dead origin";
+    ensureDir(worktree);
+    writeState(worktree, record);
+
+    const router = new HestiaLocalHttpRouter();
+    await router.start();
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = httpRequest({
+          socketPath: router.socketPath,
+          path: "/",
+          headers: { host: internalEndpointAuthority(record.project, "dashboard") },
+        }, (response) => {
+          response.resume();
+          response.once("end", () => resolve(response.statusCode ?? 0));
+        });
+        request.setTimeout(2_000, () => request.destroy(new Error("gateway request timed out")));
+        request.once("error", reject);
+        request.end();
+      });
+      expect(status).toBe(503);
+      expect(foreignBytes).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => foreign.close(() => resolve()));
+      router.stop();
+    }
+  }, 15_000);
 });

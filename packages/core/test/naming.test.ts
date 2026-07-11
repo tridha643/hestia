@@ -21,36 +21,44 @@ describe("slug", () => {
 });
 
 describe("projectName", () => {
-  test("is repo-branch for short names, no hash", () => {
-    expect(projectName("modem", "salem", "/wt/salem")).toBe("modem-salem");
+  test("always includes a collision-safe identity hash", () => {
+    expect(projectName("repo-a", "modem", "salem", "/wt/salem"))
+      .toMatch(/^modem-salem-[0-9a-f]{10}$/);
   });
 
   test("is deterministic for the same worktree", () => {
-    const a = projectName("modem", "feat/auth", "/wt/a");
-    const b = projectName("modem", "feat/auth", "/wt/a");
+    const a = projectName("repo-a", "modem", "feat/auth", "/wt/a");
+    const b = projectName("repo-a", "modem", "feat/auth", "/wt/a");
     expect(a).toBe(b);
-    expect(a).toBe("modem-feat-auth");
+    expect(a).toMatch(/^modem-feat-auth-[0-9a-f]{10}$/);
   });
 
   test("distinct branches of one repo do not collide", () => {
-    const a = projectName("modem", "branch-a", "/wt/a");
-    const b = projectName("modem", "branch-b", "/wt/b");
+    const a = projectName("repo-a", "modem", "branch-a", "/wt/a");
+    const b = projectName("repo-a", "modem", "branch-b", "/wt/b");
     expect(a).not.toBe(b);
   });
 
-  test("appends a stable hash when a name is truncated", () => {
+  test("keeps the readable prefix bounded", () => {
     const long = "this-is-a-very-long-branch-name-that-exceeds-the-cap";
-    const name = projectName("modem", long, "/wt/x");
+    const name = projectName("repo-a", "modem", long, "/wt/x");
     expect(name.startsWith("modem-this-is-a-very-long-bran")).toBe(true);
-    expect(name).toMatch(/-[0-9a-f]{6}$/);
+    expect(name).toMatch(/-[0-9a-f]{10}$/);
     // stable across calls
-    expect(projectName("modem", long, "/wt/x")).toBe(name);
+    expect(projectName("repo-a", "modem", long, "/wt/x")).toBe(name);
     // different worktree with the same truncated name -> different hash
-    expect(projectName("modem", long, "/wt/y")).not.toBe(name);
+    expect(projectName("repo-a", "modem", long, "/wt/y")).not.toBe(name);
+  });
+
+  test("separates same-name clones and normalized branch collisions", () => {
+    expect(projectName("repo-a", "modem", "feat/a", "/wt/a"))
+      .not.toBe(projectName("repo-b", "modem", "feat/a", "/wt/a"));
+    expect(projectName("repo-a", "modem", "feat/a", "/wt/a"))
+      .not.toBe(projectName("repo-a", "modem", "feat-a", "/wt/a"));
   });
 
   test("result always matches the compose project regex", () => {
-    const name = projectName("Weird Repo!", "feature/#42", "/wt/z");
+    const name = projectName("repo-a", "Weird Repo!", "feature/#42", "/wt/z");
     expect(name).toMatch(/^[a-z0-9][a-z0-9_-]*$/);
   });
 });

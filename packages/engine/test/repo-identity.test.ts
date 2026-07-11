@@ -3,7 +3,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getRepoInfo, writeAtomicJsonFile } from "../src/index.ts";
+import { engine, getRepoInfo, writeAtomicJsonFile } from "../src/index.ts";
+import { assertMutableStackRecord, parseStackRecord } from "../src/state.ts";
 
 const scratchRoots: string[] = [];
 
@@ -70,5 +71,68 @@ describe("atomic JSON publication", () => {
       });
     }
     expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("versioned stack state", () => {
+  const baseRecord = {
+    project: "repo-branch-0123456789",
+    repo: "repo",
+    branch: "branch",
+    worktree: "/tmp/worktree",
+    state: "up",
+    services: [],
+    env: {},
+    endpoints: [],
+    createdAt: new Date(0).toISOString(),
+  };
+
+  test("rejects malformed and structurally invalid state with its path", () => {
+    for (const source of ["{", JSON.stringify({ ...baseRecord, services: null })]) {
+      try {
+        parseStackRecord(source, "/state/stack.json");
+        throw new Error("expected state-corrupt");
+      } catch (error) {
+        expect((error as { code?: string }).code).toBe("state-corrupt");
+        expect((error as Error).message).toContain("/state/stack.json");
+      }
+    }
+  });
+
+  test("legacy state stays readable but is mutation-blocked", () => {
+    const legacy = parseStackRecord(JSON.stringify(baseRecord), "/legacy/stack.json");
+    expect(legacy.schemaVersion).toBeUndefined();
+    try {
+      assertMutableStackRecord(legacy, "/legacy/stack.json");
+      throw new Error("expected migration-required");
+    } catch (error) {
+      expect((error as { code?: string }).code).toBe("migration-required");
+    }
+  });
+
+  test("schema v1 state is mutable", () => {
+    const current = parseStackRecord(
+      JSON.stringify({ ...baseRecord, schemaVersion: 1 }),
+      "/current/stack.json",
+    );
+    expect(() => assertMutableStackRecord(current, "/current/stack.json")).not.toThrow();
+  });
+
+  test("down --project removes a corrupt mirror through label-only recovery", async () => {
+    const root = mkdtempSync(join(tmpdir(), "hestia-corrupt-down-"));
+    scratchRoots.push(root);
+    const previous = process.env.HESTIA_HOME;
+    process.env.HESTIA_HOME = join(root, "home");
+    const project = "repo-branch-0123456789";
+    const mirror = join(process.env.HESTIA_HOME, "stacks", project);
+    mkdirSync(mirror, { recursive: true });
+    writeFileSync(join(mirror, "stack.json"), "{broken");
+    try {
+      await engine.downProject(project);
+      expect(() => readFileSync(join(mirror, "stack.json"))).toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.HESTIA_HOME;
+      else process.env.HESTIA_HOME = previous;
+    }
   });
 });

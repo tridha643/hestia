@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { HestiaError, slug, type TunnelExposure } from "@hestia/core";
 import { cloudflaredHome } from "./cloudflared.ts";
+import {
+  internalEndpointAuthority,
+  publicGatewaySocketPath,
+} from "../router/local-http-router.ts";
 
 /**
  * Pure ingress logic for the unified tunnel: hostname derivation, import of
@@ -99,10 +103,10 @@ export function generateMergedConfig(opts: {
   assertDisjoint(opts.baseRules, opts.dynamicRules);
   const dynamic: IngressRule[] = opts.dynamicRules.map((d) => ({
     hostname: d.hostname,
-    service: `http://127.0.0.1:${d.originPort}`,
+    service: `unix:${publicGatewaySocketPath()}`,
     ...(d.keepHostHeader
       ? {}
-      : { originRequest: { httpHostHeader: `127.0.0.1:${d.originPort}` } }),
+      : { originRequest: { httpHostHeader: internalEndpointAuthority(d.project, d.alias ?? d.service) } }),
   }));
   return stringifyYaml({
     tunnel: opts.uuid,

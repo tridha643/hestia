@@ -1,4 +1,4 @@
-import type { FleetServiceView, FleetStackView } from "@hestia/core";
+import type { FleetEndpointView, FleetServiceView, FleetStackView } from "@hestia/core";
 import { padFleetText } from "../fleet-text.ts";
 import { fleetTheme } from "../fleet-theme.ts";
 import { sanitizeFleetTerminalText } from "../terminal-text.ts";
@@ -9,36 +9,37 @@ function serviceColor(service: FleetServiceView): string {
   return fleetTheme.danger;
 }
 
-/** Render sanitized service and endpoint observations for the selected stack. */
+function endpointReach(endpoint: FleetEndpointView): string {
+  return endpoint.localUrl ?? endpoint.publicUrl ?? endpoint.url ?? `${endpoint.host}:${endpoint.port}`;
+}
+
+/** Render workload rows for lifecycle/log selection and child endpoints for reachability actions. */
 export function ServicePane({
   stack,
   selectedService,
+  selectedEndpoint,
   onSelectService,
+  onSelectEndpoint,
 }: {
   stack?: FleetStackView;
   selectedService?: string;
+  selectedEndpoint?: string;
   onSelectService?: (service: string) => void;
+  onSelectEndpoint?: (service: string, endpoint: string) => void;
 }) {
   return (
     <box style={{ height: "100%", width: "100%", flexDirection: "column", border: true, borderColor: fleetTheme.border }}>
       <box style={{ height: 1, paddingLeft: 1, backgroundColor: fleetTheme.panelAlt }}>
         <text fg={fleetTheme.text}>
-          {stack === undefined ? "Services" : `Services — ${sanitizeFleetTerminalText(stack.branch)}`}
+          {stack === undefined ? "Workloads" : `Workloads — ${sanitizeFleetTerminalText(stack.branch)}`}
         </text>
       </box>
-      {stack?.services.length ? stack.services.map((service) => {
-        const selected = service.name === selectedService;
-        const endpoint = service.endpoint;
-        const primaryReach = endpoint?.localUrl ?? endpoint?.publicUrl ?? endpoint?.url ?? (
-          endpoint !== undefined ? `${endpoint.host}:${endpoint.port}` : "-"
-        );
-        const directReach = endpoint !== undefined ? `${endpoint.host}:${endpoint.port}` : undefined;
-        const reach = endpoint?.localUrl !== undefined && directReach !== undefined
-          ? `${primaryReach} · ${directReach}`
-          : primaryReach;
-        return (
+      {stack?.services.length ? stack.services.flatMap((service) => {
+        const workloadSelected = service.name === selectedService && selectedEndpoint === undefined;
+        const endpoints = service.endpoints ?? (service.endpoint === undefined ? [] : [service.endpoint]);
+        const workloadRow = (
           <box
-            key={service.name}
+            key={`workload:${service.name}`}
             onMouseDown={(event) => {
               if (event.button !== 0) return;
               event.preventDefault();
@@ -50,21 +51,57 @@ export function ServicePane({
               paddingLeft: 1,
               paddingRight: 1,
               flexDirection: "row",
-              backgroundColor: selected ? fleetTheme.selected : fleetTheme.background,
+              backgroundColor: workloadSelected ? fleetTheme.selected : fleetTheme.background,
             }}
           >
-            <text fg={selected ? "#ffffff" : serviceColor(service)}>{selected ? "▸ " : "  "}</text>
-            <text fg={selected ? "#ffffff" : fleetTheme.text}>
+            <text fg={workloadSelected ? "#ffffff" : serviceColor(service)}>{workloadSelected ? "▸ " : "  "}</text>
+            <text fg={workloadSelected ? "#ffffff" : fleetTheme.text}>
               {padFleetText(sanitizeFleetTerminalText(service.name), 20)}
             </text>
-            <text fg={selected ? "#ffffff" : fleetTheme.muted}>{padFleetText(service.backend, 10)}</text>
-            <text fg={selected ? "#ffffff" : serviceColor(service)}>{padFleetText(service.state, 11)}</text>
-            <text fg={selected ? "#ffffff" : fleetTheme.muted}>{sanitizeFleetTerminalText(reach)}</text>
+            <text fg={workloadSelected ? "#ffffff" : fleetTheme.muted}>{padFleetText(service.backend, 10)}</text>
+            <text fg={workloadSelected ? "#ffffff" : serviceColor(service)}>{service.state}</text>
           </box>
         );
+        const endpointRows = endpoints.map((endpoint, index) => {
+          const endpointSelected = service.name === selectedService && endpoint.name === selectedEndpoint;
+          const connector = index === endpoints.length - 1 ? "└─" : "├─";
+          const kind = (endpoint.kind ?? "http").toUpperCase();
+          const selector = `${endpoint.workload ?? service.name}:${endpoint.binding ?? endpoint.port}`;
+          return (
+            <box
+              key={`endpoint:${service.name}:${endpoint.name}`}
+              onMouseDown={(event) => {
+                if (event.button !== 0) return;
+                event.preventDefault();
+                event.stopPropagation();
+                onSelectEndpoint?.(service.name, endpoint.name);
+              }}
+              style={{
+                height: 1,
+                paddingLeft: 2,
+                paddingRight: 1,
+                flexDirection: "row",
+                backgroundColor: endpointSelected ? fleetTheme.selected : fleetTheme.background,
+              }}
+            >
+              <text fg={endpointSelected ? "#ffffff" : fleetTheme.muted}>{endpointSelected ? "▸ " : `${connector} `}</text>
+              <text fg={endpointSelected ? "#ffffff" : fleetTheme.accent}>
+                {padFleetText(sanitizeFleetTerminalText(endpoint.name), 18)}
+              </text>
+              <text fg={endpointSelected ? "#ffffff" : fleetTheme.muted}>{padFleetText(kind, 8)}</text>
+              <text fg={endpointSelected ? "#ffffff" : fleetTheme.muted}>
+                {padFleetText(sanitizeFleetTerminalText(selector), 20)}
+              </text>
+              <text fg={endpointSelected ? "#ffffff" : fleetTheme.text}>
+                {sanitizeFleetTerminalText(endpointReach(endpoint))}
+              </text>
+            </box>
+          );
+        });
+        return [workloadRow, ...endpointRows];
       }) : (
         <box style={{ paddingLeft: 1, paddingTop: 1 }}>
-          <text fg={fleetTheme.muted}>No services recorded</text>
+          <text fg={fleetTheme.muted}>No workloads recorded</text>
         </box>
       )}
     </box>

@@ -8,6 +8,7 @@ import {
   type LogLine,
   type RepoId,
   type StackIdentity,
+  STATE_SCHEMA_VERSION,
 } from "@hestia/core";
 import { isLive, readPidfile, startTimeOf } from "../proc/pidfile.ts";
 import type { AcquireResult } from "./routes.ts";
@@ -15,6 +16,7 @@ import { daemonDir } from "./slots.ts";
 
 /** Discovery metadata the daemon writes next to its pidfile. */
 export interface DaemonJson {
+  schemaVersion?: typeof STATE_SCHEMA_VERSION;
   pid: number;
   port: number;
   protocolVersion: number;
@@ -23,6 +25,7 @@ export interface DaemonJson {
   token?: string;
   /** Unprivileged Hestia local-router port behind Portless. */
   routerPort?: number;
+  gatewaySocket?: string;
 }
 
 const DAEMON_PIDFILE_NAME = "hestiad";
@@ -35,7 +38,15 @@ export function readDaemonJson(): DaemonJson | null {
   const p = daemonJsonPath();
   if (!existsSync(p)) return null;
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as DaemonJson;
+    const value = JSON.parse(readFileSync(p, "utf8")) as Partial<DaemonJson>;
+    if (
+      value.schemaVersion !== STATE_SCHEMA_VERSION ||
+      !Number.isInteger(value.pid) ||
+      !Number.isInteger(value.port) ||
+      !Number.isInteger(value.protocolVersion) ||
+      typeof value.startedAt !== "string"
+    ) return null;
+    return value as DaemonJson;
   } catch {
     return null;
   }

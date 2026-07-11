@@ -44,7 +44,7 @@ describe("generateOverride", () => {
       services: Record<string, { ports: unknown[]; container_name: string; restart: string }>;
     };
     const pg = parsed.services.postgres!;
-    expect(pg.ports).toEqual(["127.0.0.1:0:5432"]);
+    expect(pg.ports).toEqual(["127.0.0.1:0:5432/tcp"]);
     expect(pg.container_name).toBe("hestia-modem-salem-postgres");
     expect(pg.restart).toBe("no");
   });

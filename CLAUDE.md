@@ -1,5 +1,12 @@
 # hestia
 
+> V1 contract: discover before starting; never infer permission to write
+> repository configuration. Use explicit `hestia init --scope repository|machine
+> --write`. Treat workload, binding, and endpoint alias as distinct concepts.
+> Runtime `.hestia/` must be ignored. Named ingress uses wildcard DNS and the
+> guarded hestiad Unix gateway. Distribution is macOS/Bun-only through
+> `@tridha643/hestia`.
+
 Per-worktree isolated dev stacks for parallel coding agents. `hestia up` in a
 git worktree brings up that worktree's docker compose services on **ephemeral
 host ports**; `hestia run` and `hestia up --workers` supervise **host

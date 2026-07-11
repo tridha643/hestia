@@ -69,6 +69,7 @@ function writeMirrorPidfile(project: string, name: string, live: boolean, backen
       pgid: id.pid,
       startTime: id.startTime,
       argv: ["x"],
+      specFingerprint: "test-fixture",
       logPath: "/dev/null",
       signal: "term",
       backend,
@@ -184,11 +185,13 @@ describe("daemon client authentication", () => {
       pgid: process.pid,
       startTime: startTimeOf(process.pid) ?? "",
       argv: [],
+      specFingerprint: "test-fixture",
       logPath: join(home, "daemon.log"),
       signal: "term",
       backend: "proc",
     });
     writeFileSync(join(daemonDir(), "daemon.json"), JSON.stringify({
+      schemaVersion: 1,
       pid: process.pid,
       port: 41234,
       protocolVersion: 2,
@@ -203,6 +206,7 @@ describe("daemon client authentication", () => {
       pgid: 999_999_999,
       startTime: "dead",
       argv: [],
+      specFingerprint: "test-fixture",
       logPath: join(home, "daemon.log"),
       signal: "term",
       backend: "proc",
@@ -301,7 +305,7 @@ describe("adopted.json", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, "adopted.json"),
-      JSON.stringify({ at: "2026-01-01", uuid, name: "tri", credFile: "/c/uuid.json" }),
+      JSON.stringify({ schemaVersion: 1, at: "2026-01-01", uuid, name: "tri", credFile: "/c/uuid.json" }),
     );
     const ref = readAdopted(uuid);
     expect(ref).toEqual({ uuid, name: "tri", credFile: "/c/uuid.json", reconstructed: false });

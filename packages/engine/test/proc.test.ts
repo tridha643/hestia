@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { closeSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +15,7 @@ import {
 import { startProc } from "../src/proc/supervisor.ts";
 import { stopProcTree } from "../src/proc/shutdown.ts";
 import { readPidfile } from "../src/proc/pidfile.ts";
+import { RotatingLogWriter } from "../src/proc/proc-relay.ts";
 
 const tmpDirs: string[] = [];
 const cleanupPgids: number[] = [];
@@ -120,6 +121,18 @@ describe("port ownership oracle", () => {
 });
 
 describe("startProc", () => {
+  test("rotating relay bounds the current log plus three archives", () => {
+    const root = scratch();
+    const path = join(root, "bounded.log");
+    const writer = new RotatingLogWriter(path, 32, 3);
+    writer.write(Buffer.alloc(32 * 6, "x"));
+    writer.close();
+    expect(existsSync(`${path}.4`)).toBe(false);
+    for (const candidate of [path, `${path}.1`, `${path}.2`, `${path}.3`]) {
+      expect(statSync(candidate).size).toBeLessThanOrEqual(32);
+    }
+  });
+
   test("fresh attempts truncate while port-steal retries append a sentinel", () => {
     const logPath = join(scratch(), "retry.log");
     writeFileSync(logPath, "stale output\n");
@@ -155,6 +168,10 @@ describe("startProc", () => {
     const dumped = JSON.parse(readFileSync(outFile, "utf8"));
     expect(dumped.A).toBe("from-stack");
     expect(dumped.B).toBe("from-spec"); // --env beats stack env
+    const persisted = readFileSync(join(wt, ".hestia", "procs", "envdump.json"), "utf8");
+    expect(persisted).not.toContain("from-spec");
+    expect(persisted).not.toContain("writeFileSync(process.env.OUT");
+    expect(JSON.parse(persisted).specFingerprint).toMatch(/^[0-9a-f]{64}$/);
 
     await stopProcTree(result.pidfile);
     expect(isLive(result.pidfile)).toBe(false);

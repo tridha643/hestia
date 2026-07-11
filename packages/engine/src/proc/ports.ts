@@ -165,6 +165,12 @@ export async function inspectPort(
   const members = new Set(processTree(rootPid).map((r) => r.pid));
   const listeners = await allListeners();
   const owner = listeners.find((l) => l.port === port);
+  // A freshly spawned relay can fork the target between the ps snapshot and
+  // lsof. Re-snapshot before declaring a listener foreign; a false steal
+  // would kill a correctly bound dev server and churn through all retries.
+  if (owner !== undefined && !members.has(owner.pid)) {
+    for (const member of processTree(rootPid)) members.add(member.pid);
+  }
   return {
     owner,
     ownerIsMember: owner !== undefined && members.has(owner.pid),

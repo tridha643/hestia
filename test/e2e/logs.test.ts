@@ -162,6 +162,7 @@ dockerSuite("hestia logs docker end-to-end", () => {
 
   beforeAll(() => {
     dockerRoot = mkdtempSync(join(tmpdir(), "hestia-docker-logs-e2e-"));
+    writeFileSync(join(dockerRoot, ".gitignore"), ".hestia/\n");
     writeFileSync(
       join(dockerRoot, "docker-compose.yml"),
       `services:\n  db:\n    image: postgres:16-alpine\n    command: ["postgres", "-c", "log_statement=all"]\n    environment:\n      POSTGRES_PASSWORD: postgres\n    ports:\n      - "5432"\n    healthcheck:\n      test: ["CMD-SHELL", "pg_isready -U postgres"]\n      interval: 1s\n      timeout: 3s\n      retries: 30\n`,

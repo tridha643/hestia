@@ -126,7 +126,7 @@ describe("hestia tui PTY", () => {
       await session.press("down");
       await waitForSnapshot(session, (snapshot) => snapshot.includes("web2"), 15_000);
       await session.press("up");
-      await waitForSnapshot(session, (snapshot) => snapshot.includes("Services — pty-a"));
+      await waitForSnapshot(session, (snapshot) => snapshot.includes("Workloads — pty-a"));
 
       await session.press("d");
       await session.waitForText("Named volumes are retained", { timeout: 3_000 });
@@ -138,7 +138,7 @@ describe("hestia tui PTY", () => {
       await session.press("enter");
       frame = await waitForSnapshot(
         session,
-        (snapshot) => !snapshot.includes("Services — pty-a") && snapshot.includes("Services — pty-b"),
+        (snapshot) => !snapshot.includes("Workloads — pty-a") && snapshot.includes("Workloads — pty-b"),
         15_000,
       );
       expect(frame).toContain("named volumes retained");
@@ -162,10 +162,10 @@ describe("hestia tui PTY", () => {
         env: { ...process.env, ...environment },
       });
       try {
-        await session.waitForText("hestia — Fleet", { timeout: 10_000 });
+        await session.waitForText("Hestia Fleet —", { timeout: 10_000 });
         await session.press(exitKey as "q" | ["ctrl", "c"]);
         const restored = await session.waitForText("__HESTIA_PRIMARY_SCREEN__", { timeout: 5_000 });
-        expect(restored).not.toContain("hestia — Fleet");
+        expect(restored).not.toContain("Hestia Fleet —");
       } finally {
         session.close();
       }

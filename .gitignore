@@ -1,4 +1,5 @@
 node_modules/
+dist/
 .hestia/
 *.log
 .DS_Store

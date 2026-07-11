@@ -9,6 +9,7 @@ import {
   isLive,
   readPidfile,
   removePidfile,
+  procSpecFingerprint,
   startTimeOf,
   writePidfile,
 } from "../proc/pidfile.ts";
@@ -20,6 +21,7 @@ import { SlotLedger, daemonDir } from "./slots.ts";
 import { startDuties } from "./duties.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
 import { HestiaLocalHttpRouter } from "../router/local-http-router.ts";
+import { STATE_SCHEMA_VERSION } from "@hestia/core";
 
 /**
  * hestiad — the machine-global admission + supervision daemon. One instance
@@ -69,6 +71,7 @@ async function main(): Promise<void> {
         token,
         fleet,
         routerPort,
+        gatewaySocket: localRouter.socketPath,
         refreshLocalRoutes: () => localRouter.refreshRoutes(),
         logsProject: (project, options) => engine.logsProject(project, options),
       }),
@@ -77,11 +80,17 @@ async function main(): Promise<void> {
     // Written while still holding the lock: identity first, then discovery.
     const startTime = startTimeOf(process.pid) ?? "";
     writePidfile(root, {
+      schemaVersion: 1,
       name: PIDFILE_NAME,
       pid: process.pid,
       pgid: process.pid,
       startTime,
-      argv: process.argv,
+      specFingerprint: procSpecFingerprint({
+        name: PIDFILE_NAME,
+        argv: process.argv,
+        port: "none",
+        backend: "proc",
+      }),
       logPath: join(root, "daemon.log"),
       signal: "term",
       backend: "proc",
@@ -89,12 +98,14 @@ async function main(): Promise<void> {
     writeAtomicJsonFile(
       join(root, "daemon.json"),
       {
+        schemaVersion: STATE_SCHEMA_VERSION,
         pid: process.pid,
         port: server.port,
         protocolVersion: HESTIAD_PROTOCOL_VERSION,
         startedAt,
         token,
         routerPort,
+        gatewaySocket: localRouter.socketPath,
       },
       { mode: 0o600 },
     );

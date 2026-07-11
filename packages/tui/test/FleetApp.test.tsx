@@ -3,7 +3,12 @@ import { act } from "react";
 import { testRender } from "@opentui/react/test-utils";
 import type { FleetEnvelope, FleetSnapshot, FleetStackView, LogLine, RepoId } from "@hestia/core";
 import type { DaemonFleetSource } from "../src/fleet-source.ts";
-import { doctorOmissionSummary, FleetApp, fleetLogSelectionKey } from "../src/FleetApp.tsx";
+import {
+  doctorOmissionSummary,
+  FleetApp,
+  fleetLogSelectionKey,
+  middleTruncateWorktreePath,
+} from "../src/FleetApp.tsx";
 
 const repoId = "repo-1234567890abcdef" as RepoId;
 
@@ -72,6 +77,8 @@ class FakeFleetSource {
   stop() {}
 }
 
+const invokingRepository = { repo: "modem", branch: "alpha", worktree: "/tmp/alpha" };
+
 describe("FleetApp", () => {
   test("log selection keys change across stack and service incarnations", () => {
     const original = snapshot().stacks[0]!;
@@ -88,7 +95,7 @@ describe("FleetApp", () => {
   test("renders wide and narrow layouts while retaining managed selection and logs", async () => {
     const source = new FakeFleetSource();
     const setup = await testRender(
-      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" onQuit={() => {}} />,
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
       { width: 140, height: 28 },
     );
     try {
@@ -117,7 +124,7 @@ describe("FleetApp", () => {
   test("down confirmation consumes keys, cancels, then confirms without destroy", async () => {
     const source = new FakeFleetSource();
     const setup = await testRender(
-      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" onQuit={() => {}} />,
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
       { width: 120, height: 28 },
     );
     try {
@@ -149,7 +156,7 @@ describe("FleetApp", () => {
   test("mouse clicks select a stack row", async () => {
     const source = new FakeFleetSource();
     const setup = await testRender(
-      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" onQuit={() => {}} />,
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
       { width: 120, height: 28 },
     );
     try {
@@ -157,12 +164,12 @@ describe("FleetApp", () => {
         source.start();
         await setup.flush();
       });
-      await setup.waitForFrame((candidate) => candidate.includes("Services — alpha"));
+      await setup.waitForFrame((candidate) => candidate.includes("Workloads — alpha"));
       await act(async () => {
-        await setup.mockMouse.click(2, 4);
+        await setup.mockMouse.click(2, 8);
         await setup.flush();
       });
-      const frame = await setup.waitForFrame((candidate) => candidate.includes("Services — beta"));
+      const frame = await setup.waitForFrame((candidate) => candidate.includes("Workloads — beta"));
       expect(frame).toContain("ingest");
     } finally {
       await act(async () => setup.renderer.destroy());
@@ -184,7 +191,7 @@ describe("FleetApp", () => {
       }],
     });
     const setup = await testRender(
-      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-queued" onQuit={() => {}} />,
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-queued" invokingRepository={invokingRepository} onQuit={() => {}} />,
       { width: 120, height: 28 },
     );
     try {
@@ -209,5 +216,46 @@ describe("FleetApp", () => {
       detail: "detail",
     }));
     expect(doctorOmissionSummary(rows)).toBe("… 3 more (1 errors, 1 warnings)");
+  });
+
+  test("keeps invoking repository context visible with zero stacks", async () => {
+    const source = new FakeFleetSource({
+      ...snapshot(),
+      capacity: { maxStacks: 5, live: 0, reserved: 0, queued: 0 },
+      stacks: [],
+    });
+    const setup = await testRender(
+      <FleetApp
+        source={source as unknown as DaemonFleetSource}
+        preferredProject="missing"
+        invokingRepository={{
+          repo: "modem\x1b]52;c;secret\x07",
+          branch: "salem",
+          worktree: "/Users/tri/conductor/workspaces/modem/salem",
+        }}
+        onQuit={() => {}}
+      />,
+      { width: 100, height: 24 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      const frame = await setup.waitForFrame((candidate) => candidate.includes("Hestia Fleet — modem"));
+      expect(frame).toContain("Hestia Fleet — modem");
+      expect(frame).toContain("/Users/tri/conductor/workspaces/modem/salem");
+      expect(frame).not.toContain("secret");
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test("middle-truncates paths while preserving orientation and basename", () => {
+    const path = "/Users/tri/conductor/workspaces/modem/a-very-long-branch";
+    const truncated = middleTruncateWorktreePath(path, 30);
+    expect(truncated.length).toBeLessThanOrEqual(30);
+    expect(truncated.startsWith("/Users/")).toBe(true);
+    expect(truncated.endsWith("a-very-long-branch")).toBe(true);
   });
 });

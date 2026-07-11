@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HestiaError } from "@hestia/core";
 import { isLive, startTimeOf } from "./pidfile.ts";
@@ -21,7 +21,9 @@ export async function withLock<T>(
   timeoutMs = 30_000,
 ): Promise<T> {
   const path = lockPath(worktreeRoot);
-  mkdirSync(join(worktreeRoot, ".hestia"), { recursive: true });
+  const privateDirectory = join(worktreeRoot, ".hestia");
+  mkdirSync(privateDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(privateDirectory, 0o700);
   const me = JSON.stringify({
     pid: process.pid,
     startTime: startTimeOf(process.pid),
@@ -30,7 +32,7 @@ export async function withLock<T>(
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      writeFileSync(path, me, { flag: "wx" });
+      writeFileSync(path, me, { flag: "wx", mode: 0o600 });
       break;
     } catch {
       // Held — break it if the holder is dead (crashed CLI), else wait.

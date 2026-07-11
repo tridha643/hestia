@@ -59,6 +59,7 @@ interface StackJson {
   env: Record<string, string>;
   endpoints: Array<{ name: string; publicUrl?: string }>;
   services: Array<{ name: string; pid?: number; publishedPort?: number; state: string }>;
+  auxiliary?: Array<{ name: string; originService?: string; state: string }>;
   tunnel?: { uuid: string; exposures: Array<{ hostname: string; originPort: number }> };
 }
 
@@ -72,7 +73,7 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
   let cfHome: string;
   let env: Record<string, string>;
 
-  const tunnelHome = () => join(homedir(), ".hestia", "tunnel", uuid);
+  const tunnelHome = () => join(env?.HESTIA_HOME ?? join(homedir(), ".hestia"), "tunnel", uuid);
   const mergedConfig = () =>
     parseYaml(readFileSync(join(tunnelHome(), "config.yml"), "utf8")) as {
       ingress: Array<{ hostname?: string; service: string; originRequest?: Record<string, unknown> }>;
@@ -82,9 +83,10 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
     return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as { pid: number }).pid : null;
   };
   const routeLog = (): string[][] =>
-    readFileSync(join(stubState, "route.log"), "utf8")
+    (existsSync(join(stubState, "route.log")) ? readFileSync(join(stubState, "route.log"), "utf8") : "")
       .trim()
       .split("\n")
+      .filter(Boolean)
       .map((l) => JSON.parse(l) as string[]);
 
   function runCli(cwd: string, args: string[]): CliResult {
@@ -140,6 +142,8 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       PATH: `${STUB_DIR}:${process.env.PATH}`,
       HESTIA_STUB_STATE: stubState,
       HESTIA_CLOUDFLARED_HOME: cfHome,
+      HESTIA_HOME: join(tmpRoot, "hestia-home"),
+      HESTIA_E2E_DNS_RESOLVED: "1",
       HESTIA_NO_OPEN: "1", // never spawn a real browser from the suite
     };
   });
@@ -183,26 +187,25 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
         "https://stubtun-tun-a-web.stub.test",
       );
 
-      // route dns targeted the UUID, never the tunnel name
+      // Named v1 never mutates DNS; wildcard routing was preflighted.
       const routes = routeLog();
-      expect(routes.length).toBe(1);
-      expect(routes[0]).toEqual([
-        "tunnel", "route", "dns", uuid, "stubtun-tun-a-web.stub.test",
-      ]);
+      expect(routes).toEqual([]);
 
       // merged config: base rule first, A's dynamic rule with Host rewrite, catch-all last
       let cfg = mergedConfig();
       expect(cfg.ingress[0]!.hostname).toBe("stubtun-static.stub.test");
       const aPort = a.services.find((s) => s.name === "web")!.publishedPort!;
       const aRule = cfg.ingress.find((r) => r.hostname === "stubtun-tun-a-web.stub.test")!;
-      expect(aRule.service).toBe(`http://127.0.0.1:${aPort}`);
-      expect(aRule.originRequest).toEqual({ httpHostHeader: `127.0.0.1:${aPort}` });
+      expect(aRule.service.startsWith("unix:")).toBe(true);
+      expect(String(aRule.originRequest?.httpHostHeader)).toMatch(/\.hestia\.internal$/);
       expect(cfg.ingress[cfg.ingress.length - 1]).toEqual({ service: "http_status:404" });
       const pid1 = connectorPid();
       expect(pid1).not.toBeNull();
 
       // 2. B joins the same tunnel — one connector, both rules, restart happened
-      expect(runCli(wtB, ["expose", "web", "--tunnel", "stubtun", "--json"]).code).toBe(0);
+      const bOut = runCli(wtB, ["expose", "web", "--tunnel", "stubtun", "--json"]);
+      expect(bOut.code).toBe(0);
+      const b = JSON.parse(bOut.stdout) as StackJson;
       cfg = mergedConfig();
       expect(cfg.ingress.some((r) => r.hostname === "stubtun-tun-a-web.stub.test")).toBe(true);
       expect(cfg.ingress.some((r) => r.hostname === "stubtun-tun-b-web.stub.test")).toBe(true);
@@ -212,7 +215,7 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       // 3. sticky adoption + idempotence: bare re-expose changes nothing
       expect(runCli(wtA, ["expose", "web", "--json"]).code).toBe(0);
       expect(connectorPid()).toBe(pid2);
-      expect(routeLog().length).toBe(2); // ledger made the re-expose DNS-free
+      expect(routeLog()).toEqual([]);
 
       // 4. port rotation: replacing A's proc re-points the rule automatically
       expect(runCli(wtA, ["run", "--name", "web", "--env", "WORKTREE_MARKER=A2", "--json", "--", "bun", "server.ts"]).code).toBe(0);
@@ -222,8 +225,8 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       cfg = mergedConfig();
       expect(
         cfg.ingress.find((r) => r.hostname === "stubtun-tun-a-web.stub.test")!.service,
-      ).toBe(`http://127.0.0.1:${newPort}`);
-      expect(connectorPid()).not.toBe(pid2); // regen restarted the connector
+      ).toMatch(/^unix:/);
+      expect(connectorPid()).toBe(pid2); // stable gateway removes origin-rotation restarts
 
       // 5. status: tunnel row healthy, exposure ports current
       const status = JSON.parse(runCli(wtA, ["status", "--json"]).stdout) as StackJson;
@@ -239,7 +242,7 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
 
       // 7. delete B's worktree; mirror teardown drops its rule too
       git(repoDir, ["worktree", "remove", "--force", wtB]);
-      expect(runCli(tmpRoot, ["down", "--project", "tunrepo-tun-b"]).code).toBe(0);
+      expect(runCli(tmpRoot, ["down", "--project", b.project]).code).toBe(0);
       cfg = mergedConfig();
       expect(cfg.ingress.some((r) => r.hostname === "stubtun-tun-b-web.stub.test")).toBe(false);
     },
@@ -260,20 +263,18 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       expect(busy.code).toBe(1);
       expect(busy.stdout).toContain("tunnel-busy");
 
-      // DNS conflict: existing record, no ledger memory → hard error…
+      // Existing DNS state is read-only to Hestia; resolved wildcard DNS wins.
       writeFileSync(
         join(stubState, "dns-existing.json"),
         JSON.stringify(["stubtun-tun-c-web.stub.test"]),
       );
       const conflict = runCli(wt, ["expose", "web", "--tunnel", "stubtun", "--json"]);
-      expect(conflict.code).toBe(1);
-      expect(conflict.stdout).toContain("dns-record-conflict");
-      // …and --overwrite-dns re-points it explicitly
+      expect(conflict.code).toBe(0);
+      expect(routeLog()).toEqual([]);
+      // --overwrite-dns was removed from the v1 mutation path.
       const forced = runCli(wt, ["expose", "web", "--tunnel", "stubtun", "--overwrite-dns", "--json"]);
-      expect(forced.code).toBe(0);
-      const last = routeLog().at(-1)!;
-      expect(last).toContain("--overwrite-dns");
-      expect(last).toContain(uuid);
+      expect(forced.code).toBe(1);
+      expect(forced.stdout).toContain("usage");
 
       // dead connector: killed out-of-band, the next expose revives it
       const pid = connectorPid()!;
@@ -292,7 +293,7 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       ).toBe(0);
       const quick = JSON.parse(runCli(wtQ, ["expose", "web", "--json"]).stdout) as StackJson;
       expect(quick.env.HESTIA_WEB_URL).toMatch(/^https:\/\/stub-.*\.trycloudflare\.com$/);
-      expect(quick.services.some((s) => s.name === "tunnel-web")).toBe(true);
+      expect(quick.auxiliary?.some((service) => service.originService === "web")).toBe(true);
 
       // `hestia open` resolves the public URL (+ optional path) for a click
       const opened = JSON.parse(
@@ -303,10 +304,10 @@ describe("unified tunnel lifecycle (stub cloudflared, no network)", () => {
       expect(bare.url).toBe(quick.env.HESTIA_WEB_URL);
       // unexposed service → clear error, not a crash
       expect(runCli(wtQ, ["open", "nope", "--json"]).stdout).toContain("service-not-found");
-      // stopping the quick tunnel clears its origin's public URL
-      expect(runCli(wtQ, ["stop", "tunnel-web"]).code).toBe(0);
-      const after = JSON.parse(runCli(wtQ, ["status", "--json"]).stdout) as StackJson;
-      expect(after.env.HESTIA_WEB_URL).toBeUndefined();
+      // stopping the origin also stops its hidden quick-tunnel auxiliary.
+      expect(runCli(wtQ, ["stop", "web"]).code).toBe(0);
+      const after = JSON.parse(runCli(wtQ, ["status", "--json"]).stdout) as StackJson | null;
+      expect(after).toBeNull();
       expect(runCli(wtQ, ["down"]).code).toBe(0);
     },
     120_000,
@@ -333,9 +334,9 @@ describe.if(realCloudflared())("generated ingress vs the real cloudflared parser
         `  - hostname: tri-static.modem.codes`,
         `    service: http://localhost:9`,
         `  - hostname: tri-salem-slack.modem.codes`,
-        `    service: http://127.0.0.1:50123`,
+        `    service: unix:/tmp/hestia-test-origin.sock`,
         `    originRequest:`,
-        `      httpHostHeader: 127.0.0.1:50123`,
+        `      httpHostHeader: slack-0123456789.hestia.internal`,
         `  - service: http_status:404`,
       ].join("\n") + "\n",
     );
@@ -348,7 +349,7 @@ describe.if(realCloudflared())("generated ingress vs the real cloudflared parser
       ["tunnel", "--config", cfgPath, "ingress", "rule", "https://tri-salem-slack.modem.codes"],
       { encoding: "utf8", timeout: 30_000 },
     );
-    expect(match).toContain("http://127.0.0.1:50123");
+    expect(match).toContain("unix:/tmp/hestia-test-origin.sock");
     // an unknown hostname falls through to the catch-all, not someone's origin
     const fallthrough = execFileSync(
       "cloudflared",

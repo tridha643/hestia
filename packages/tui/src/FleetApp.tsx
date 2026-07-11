@@ -20,6 +20,26 @@ import { FleetModal } from "./components/FleetModal.tsx";
 const LOG_RING_CAPACITY = 2_000;
 const EMPTY_CAPACITY = { maxStacks: 0, live: 0, reserved: 0, queued: 0 };
 
+export interface InvokingRepositoryContext {
+  repo: string;
+  branch: string;
+  worktree: string;
+}
+
+/** Preserve path orientation and basename while fitting narrow terminals. */
+export function middleTruncateWorktreePath(path: string, width: number): string {
+  if (path.length <= width) return path;
+  if (width <= 3) return path.slice(0, width);
+  const parts = path.split("/");
+  const basename = parts.at(-1) || path;
+  if (basename.length + 3 >= width) {
+    const tail = basename.slice(-Math.max(1, width - 2));
+    return `…/${tail}`.slice(0, width);
+  }
+  const prefixWidth = width - basename.length - 2;
+  return `${path.slice(0, prefixWidth)}…/${basename}`;
+}
+
 function emptySnapshot(repoId: RepoId): FleetSnapshot {
   return { repoId, observedAt: new Date(0).toISOString(), capacity: EMPTY_CAPACITY, stacks: [], warnings: [] };
 }
@@ -49,8 +69,27 @@ function selectedStack(snapshot: FleetSnapshot, project?: string): FleetStackVie
   return snapshot.stacks.find((stack) => stack.project === project);
 }
 
-function usableEndpoint(stack: FleetStackView | undefined, serviceName?: string): string | undefined {
-  const endpoint = stack?.services.find((service) => service.name === serviceName)?.endpoint;
+function fleetServiceRowCount(stack: FleetStackView | undefined): number {
+  return stack?.services.reduce((count, service) =>
+    count + 1 + (service.endpoints?.length ?? (service.endpoint === undefined ? 0 : 1)), 0) ?? 0;
+}
+
+function selectedFleetEndpoint(
+  stack: FleetStackView | undefined,
+  serviceName?: string,
+  endpointName?: string,
+): FleetStackView["services"][number]["endpoint"] {
+  const service = stack?.services.find((candidate) => candidate.name === serviceName);
+  const endpoints = service?.endpoints ?? (service?.endpoint === undefined ? [] : [service.endpoint]);
+  return endpoints.find((endpoint) => endpoint.name === endpointName) ?? endpoints[0];
+}
+
+function usableEndpoint(
+  stack: FleetStackView | undefined,
+  serviceName?: string,
+  endpointName?: string,
+): string | undefined {
+  const endpoint = selectedFleetEndpoint(stack, serviceName, endpointName);
   if (endpoint === undefined) return undefined;
   return endpoint.localUrl ?? endpoint.publicUrl ?? endpoint.url ?? `${endpoint.host}:${endpoint.port}`;
 }
@@ -58,8 +97,9 @@ function usableEndpoint(stack: FleetStackView | undefined, serviceName?: string)
 function copyableEndpoint(
   stack: FleetStackView | undefined,
   serviceName?: string,
+  endpointName?: string,
 ): FleetStackView["services"][number]["endpoint"] {
-  return stack?.services.find((service) => service.name === serviceName)?.endpoint;
+  return selectedFleetEndpoint(stack, serviceName, endpointName);
 }
 
 /** Reset the visible log ring whenever a stack or service incarnation changes. */
@@ -96,10 +136,12 @@ export function doctorOmissionSummary(rows: DoctorRow[], visibleRows = 10): stri
 export function FleetApp({
   source,
   preferredProject,
+  invokingRepository,
   onQuit,
 }: {
   source: DaemonFleetSource;
   preferredProject: string;
+  invokingRepository: InvokingRepositoryContext;
   onQuit: () => void;
 }) {
   const terminal = useTerminalDimensions();
@@ -178,8 +220,14 @@ export function FleetApp({
     [snapshot, state.filter],
   );
   const stack = selectedStack(snapshot, state.selection.project);
-  const endpointView = copyableEndpoint(stack, state.selection.service);
-  const endpoint = usableEndpoint(stack, state.selection.service);
+  const context = {
+    repo: sanitizeFleetTerminalText(stack?.repo ?? invokingRepository.repo),
+    branch: sanitizeFleetTerminalText(stack?.branch ?? invokingRepository.branch),
+    worktree: sanitizeFleetTerminalText(stack?.worktree ?? invokingRepository.worktree),
+    project: sanitizeFleetTerminalText(stack?.project ?? "—"),
+  };
+  const endpointView = copyableEndpoint(stack, state.selection.service, state.selection.endpoint);
+  const endpoint = usableEndpoint(stack, state.selection.service, state.selection.endpoint);
   const effectiveLayout = state.layout === "auto"
     ? terminal.width >= 110 ? "split" : "stack"
     : state.layout;
@@ -344,9 +392,23 @@ export function FleetApp({
   return (
     <box style={{ width: "100%", height: "100%", flexDirection: "column", backgroundColor: fleetTheme.background }}>
       <box style={{ height: 1, paddingLeft: 1, paddingRight: 1, flexDirection: "row", backgroundColor: fleetTheme.panelAlt }}>
-        <text fg={fleetTheme.accent}>hestia — Fleet</text>
+        <text fg={fleetTheme.accent}>Hestia Fleet — {context.repo}</text>
         <text fg={fleetTheme.muted}>  {status}</text>
       </box>
+
+      {terminal.width >= 90 ? (
+        <box style={{ height: 4, paddingLeft: 1, flexDirection: "column", backgroundColor: fleetTheme.background }}>
+          <text fg={fleetTheme.text}>Repository  {context.repo}</text>
+          <text fg={fleetTheme.text}>Branch      {context.branch}</text>
+          <text fg={fleetTheme.text}>Worktree    {middleTruncateWorktreePath(context.worktree, Math.max(16, terminal.width - 13))}</text>
+          <text fg={fleetTheme.muted}>Project     {context.project}</text>
+        </box>
+      ) : (
+        <box style={{ height: 2, paddingLeft: 1, flexDirection: "column", backgroundColor: fleetTheme.background }}>
+          <text fg={fleetTheme.text}>{context.repo} · {context.branch} · {context.project}</text>
+          <text fg={fleetTheme.muted}>worktree {middleTruncateWorktreePath(context.worktree, Math.max(12, terminal.width - 10))}</text>
+        </box>
+      )}
 
       {effectiveLayout === "split" ? (
         <box style={{ flexGrow: 1, flexDirection: "row" }}>
@@ -357,11 +419,13 @@ export function FleetApp({
             onSelectProject={(project) => dispatch({ type: "select-stack", project, snapshot })}
           />
           <box style={{ flexGrow: 1, flexDirection: "column" }}>
-            <box style={{ height: Math.min(10, Math.max(5, (stack?.services.length ?? 0) + 2)) }}>
+            <box style={{ height: Math.min(12, Math.max(5, fleetServiceRowCount(stack) + 2)) }}>
               <ServicePane
                 stack={stack}
                 selectedService={state.selection.service}
+                selectedEndpoint={state.selection.endpoint}
                 onSelectService={(service) => dispatch({ type: "select-service", service, snapshot })}
+                onSelectEndpoint={(service, endpoint) => dispatch({ type: "select-endpoint", service, endpoint, snapshot })}
               />
             </box>
             <box style={{ flexGrow: 1 }}>
@@ -379,11 +443,13 @@ export function FleetApp({
               onSelectProject={(project) => dispatch({ type: "select-stack", project, snapshot })}
             />
           </box>
-          <box style={{ height: Math.min(8, Math.max(4, (stack?.services.length ?? 0) + 2)) }}>
+          <box style={{ height: Math.min(10, Math.max(4, fleetServiceRowCount(stack) + 2)) }}>
             <ServicePane
               stack={stack}
               selectedService={state.selection.service}
+              selectedEndpoint={state.selection.endpoint}
               onSelectService={(service) => dispatch({ type: "select-service", service, snapshot })}
+              onSelectEndpoint={(service, endpoint) => dispatch({ type: "select-endpoint", service, endpoint, snapshot })}
             />
           </box>
           <box style={{ flexGrow: 1 }}>
@@ -443,6 +509,8 @@ export function FleetApp({
       {state.confirmDown !== undefined ? (
         <FleetModal title="Confirm stack down" terminalWidth={terminal.width} terminalHeight={terminal.height}>
           <text fg={fleetTheme.text}>Branch: {sanitizeFleetTerminalText(state.confirmDown.branch)}</text>
+          <text fg={fleetTheme.text}>Repository: {sanitizeFleetTerminalText(state.confirmDown.repo)}</text>
+          <text fg={fleetTheme.text}>Worktree: {sanitizeFleetTerminalText(state.confirmDown.worktree)}</text>
           <text fg={fleetTheme.text}>Project: {sanitizeFleetTerminalText(state.confirmDown.project)}</text>
           <box style={{ height: 1 }} />
           <text fg={fleetTheme.warning}>Named volumes are retained.</text>

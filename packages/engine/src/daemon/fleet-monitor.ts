@@ -18,7 +18,7 @@ import {
 import { getRepoInfo } from "../git.ts";
 import { allListeners, processTree, type Listener } from "../proc/ports.ts";
 import { isLive, listPidfiles } from "../proc/pidfile.ts";
-import { hestiaHome, mirrorProcsDir } from "../state.ts";
+import { hestiaHome, mirrorProcsDir, parseStackRecord } from "../state.ts";
 import {
   effectiveLocalRouteServices,
   readHestiaMachineConfig,
@@ -100,7 +100,7 @@ function readManagedMirrors(): ManagedMirrorResult {
         warnings.push(`Fleet mirror too large for ${project}`);
         continue;
       }
-      const record = JSON.parse(source.toString("utf8")) as StackRecord;
+      const record = parseStackRecord(source.toString("utf8"), path);
       if (record.project !== project) {
         warnings.push(`Fleet mirror project mismatch for ${project}`);
         continue;
@@ -117,7 +117,7 @@ async function attributeLegacyRepoId(record: StackRecord): Promise<RepoId | null
   if (record.repoId !== undefined) return record.repoId;
   if (!existsSync(record.worktree)) return null;
   const info = await getRepoInfo(record.worktree);
-  if (projectName(info.repo, info.branch, info.worktreeRoot) !== record.project) return null;
+  if (projectName(info.repoId, info.repo, info.branch, info.worktreeRoot) !== record.project) return null;
   return info.repoId;
 }
 
@@ -189,29 +189,30 @@ async function observeFleetService(
     const owner = listeners.find((listener) => listener.port === service.publishedPort);
     state = owner !== undefined && members.has(owner.pid) ? "healthy" : "unhealthy";
   }
-  const endpoint = record.endpoints.find((candidate) => candidate.name === service.name);
-  const locallyRouted = effectiveLocalRouteServices(record, config).includes(service.name);
-  const directUrl = locallyRouted && service.publishedPort !== undefined
-    ? `http://127.0.0.1:${service.publishedPort}`
-    : undefined;
-  const localUrl = locallyRouted && localRouterUsable
-    ? `https://${resolvedLocalRouteHostname(record, service.name, config)}`
-    : undefined;
+  const endpointRecords = record.endpoints.filter(
+    (candidate) => (candidate.workload ?? candidate.name) === service.name,
+  );
+  const locallyRouted = new Set(effectiveLocalRouteServices(record, config));
+  const endpoints = endpointRecords.map((endpoint) => ({
+    name: endpoint.name,
+    workload: endpoint.workload,
+    binding: endpoint.binding,
+    kind: endpoint.kind,
+    host: endpoint.host,
+    port: endpoint.port,
+    url: endpoint.url,
+    localUrl: locallyRouted.has(endpoint.name) && localRouterUsable
+      ? `https://${resolvedLocalRouteHostname(record, endpoint.name, config)}`
+      : undefined,
+    publicUrl: endpoint.publicUrl,
+  }));
   return {
     name: service.name,
     backend: service.backend,
     state,
     publishedPort: service.publishedPort,
-    endpoint: endpoint === undefined
-      ? undefined
-      : {
-          name: endpoint.name,
-          host: endpoint.host,
-          port: endpoint.port,
-          url: directUrl,
-          localUrl,
-          publicUrl: endpoint.publicUrl,
-        },
+    endpoint: endpoints[0],
+    endpoints,
   };
 }
 

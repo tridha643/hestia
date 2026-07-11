@@ -6,6 +6,7 @@ export type FleetLayoutMode = "auto" | "split" | "stack";
 export interface FleetSelection {
   project?: string;
   service?: string;
+  endpoint?: string;
 }
 
 export interface FleetUiState {
@@ -28,6 +29,7 @@ export type FleetUiAction =
   | { type: "move-service"; delta: number; snapshot: FleetSnapshot }
   | { type: "select-stack"; project: string; snapshot: FleetSnapshot }
   | { type: "select-service"; service: string; snapshot: FleetSnapshot }
+  | { type: "select-endpoint"; service: string; endpoint: string; snapshot: FleetSnapshot }
   | { type: "focus"; focus: FleetFocus }
   | { type: "layout"; layout: FleetLayoutMode }
   | { type: "filter"; filter: string; snapshot?: FleetSnapshot }
@@ -60,7 +62,9 @@ export function visibleFleetStacks(snapshot: FleetSnapshot, filter: string): Fle
   const needle = filter.trim().toLowerCase();
   if (needle === "") return snapshot.stacks;
   return snapshot.stacks.filter((stack) =>
-    `${stack.project}\n${stack.branch}\n${stack.services.map((service) => service.name).join("\n")}`
+    `${stack.project}\n${stack.branch}\n${stack.services.map((service) =>
+      `${service.name}\n${(service.endpoints ?? []).map((endpoint) => endpoint.name).join("\n")}`
+    ).join("\n")}`
       .toLowerCase()
       .includes(needle),
   );
@@ -84,7 +88,9 @@ export function reconcileFleetSelection(
     ?? snapshot.stacks[0]!;
   const service = stack.services.find((candidate) => candidate.name === previous.service)
     ?? stack.services[0];
-  return { project: stack.project, service: service?.name };
+  const endpoints = service?.endpoints ?? (service?.endpoint === undefined ? [] : [service.endpoint]);
+  const endpoint = endpoints.find((candidate) => candidate.name === previous.endpoint);
+  return { project: stack.project, service: service?.name, endpoint: endpoint?.name };
 }
 
 function moveSelection<T>(items: T[], currentIndex: number, delta: number): T | undefined {
@@ -113,7 +119,11 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
         ? state
         : {
             ...state,
-            selection: { project: stack.project, service: stack.services[0]?.name },
+            selection: {
+              project: stack.project,
+              service: stack.services[0]?.name,
+              endpoint: undefined,
+            },
             follow: true,
             logOffset: 0,
             unseenLines: 0,
@@ -128,7 +138,11 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
         ? state
         : {
             ...state,
-            selection: { ...state.selection, service: service.name },
+            selection: {
+              ...state.selection,
+              service: service.name,
+              endpoint: undefined,
+            },
             follow: true,
             logOffset: 0,
             unseenLines: 0,
@@ -141,7 +155,11 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
       return stack === undefined ? state : {
         ...state,
         focus: "stacks",
-        selection: { project: stack.project, service: stack.services[0]?.name },
+        selection: {
+          project: stack.project,
+          service: stack.services[0]?.name,
+          endpoint: undefined,
+        },
         follow: true,
         logOffset: 0,
         unseenLines: 0,
@@ -155,10 +173,26 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
       return {
         ...state,
         focus: "services",
-        selection: { ...state.selection, service: action.service },
+        selection: {
+          ...state.selection,
+          service: action.service,
+          endpoint: undefined,
+        },
         follow: true,
         logOffset: 0,
         unseenLines: 0,
+      };
+    }
+    case "select-endpoint": {
+      const stack = action.snapshot.stacks.find(
+        (candidate) => candidate.project === state.selection.project,
+      );
+      const service = stack?.services.find((candidate) => candidate.name === action.service);
+      if (!service?.endpoints?.some((endpoint) => endpoint.name === action.endpoint)) return state;
+      return {
+        ...state,
+        focus: "services",
+        selection: { ...state.selection, service: action.service, endpoint: action.endpoint },
       };
     }
     case "focus": return { ...state, focus: action.focus };

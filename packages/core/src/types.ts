@@ -7,6 +7,7 @@ export type ServiceState =
   | "starting"
   | "healthy"
   | "unhealthy"
+  | "stopped"
   | "exited";
 export type StackState =
   | "queued"
@@ -18,6 +19,9 @@ export type StackState =
 
 /** Stable identity for one physical git repository, shared by all its worktrees. */
 export type RepoId = string & { readonly __repoId: unique symbol };
+
+/** Current on-disk state schema. Bump only with an explicit compatibility policy. */
+export const STATE_SCHEMA_VERSION = 1 as const;
 
 /** Complete repository-scoped stack identity carried through daemon admission. */
 export interface StackIdentity {
@@ -44,11 +48,30 @@ export interface Endpoint {
    * Enriches the existing endpoint entry — never a second same-name entry.
    */
   publicUrl?: string;
+  /** User-facing endpoint alias; defaults to name on legacy records. */
+  alias?: string;
+  /** Owning workload name. */
+  workload?: string;
+  /** Canonical target/protocol selector, e.g. 3000/tcp or main/tcp. */
+  binding?: string;
+  kind?: "http" | "tcp" | "udp";
+  /** Portable or machine-local default route intent from configuration. */
+  local?: boolean;
+}
+
+/** One concrete published socket owned by a workload. */
+export interface PortBinding {
+  id: string;
+  target: string;
+  protocol: "tcp" | "udp";
+  publishedPort: number;
 }
 
 /** Sticky per-worktree request to publish one service through the local HTTPS router. */
 export interface LocalRouteIntent {
   service: string;
+  selector?: string;
+  alias?: string;
 }
 
 export interface ServiceRecord {
@@ -74,6 +97,10 @@ export interface ServiceRecord {
   configPath?: string;
   /** tunnel backend (quick mode): the stack service this tunnel fronts. */
   originService?: string;
+  /** tunnel backend: endpoint alias independently selected from the workload. */
+  originEndpoint?: string;
+  /** Every published socket; legacy scalar port fields mirror a unique binding. */
+  bindings?: PortBinding[];
 }
 
 /** Spec for a supervised host process (`hestia run` / the wrangler adapter). */
@@ -99,12 +126,17 @@ export interface ProcSpec {
   configPath?: string;
   /** tunnel backend (quick mode): the stack service this tunnel fronts. */
   originService?: string;
+  originEndpoint?: string;
 }
 
 /** One public hostname → local origin rule owned by a stack (named mode). */
 export interface TunnelExposure {
   /** Stack service this rule fronts. */
   service: string;
+  /** User-facing endpoint name used for URL/env projection and gateway authority. */
+  alias?: string;
+  /** Exact target/protocol binding; absent only on legacy single-port records. */
+  binding?: string;
   /** Single-label public hostname under the zone, e.g. tri-salem-slack.modem.codes. */
   hostname: string;
   /** Origin port the rule pointed at when last generated — rotation detector. */
@@ -138,6 +170,8 @@ export interface StackStarter {
 }
 
 export interface StackRecord {
+  /** Missing only on legacy records, which are inspection/down-only. */
+  schemaVersion?: typeof STATE_SCHEMA_VERSION;
   /** Deterministic compose project name, e.g. "modem-salem". */
   project: string;
   /** Added in daemon protocol v2; absent only on legacy mirrors. */
@@ -149,11 +183,14 @@ export interface StackRecord {
   /** Present only on provisional (state: "starting") records. */
   starter?: StackStarter;
   services: ServiceRecord[];
+  /** Hestia helpers never occupy the user workload namespace. */
+  auxiliary?: ServiceRecord[];
   /** Resolved env block agents consume (DATABASE_URL, etc.). */
   env: Record<string, string>;
   endpoints: Endpoint[];
   /** Explicit CLI route selections; repository defaults remain in machine config. */
   localRoutes?: LocalRouteIntent[];
+  disabledLocalRoutes?: LocalRouteIntent[];
   createdAt: string;
   /**
    * Absent on procs-only stacks (a compose file is not required to `run`).
@@ -220,6 +257,8 @@ export interface DaemonHealth {
   startedAt: string;
   /** Unprivileged loopback port receiving traffic from the Portless TLS proxy. */
   routerPort: number;
+  /** Stable ownership-verifying public ingress socket. */
+  gatewaySocket: string;
   /** e.g. an invalid HESTIA_MAX_STACKS that fell back to the default. */
   warnings: string[];
 }
@@ -249,6 +288,9 @@ export type FleetStackPhase =
 /** Sanitized endpoint data safe to expose to an authenticated local TUI. */
 export interface FleetEndpointView {
   name: string;
+  workload?: string;
+  binding?: string;
+  kind?: "http" | "tcp" | "udp";
   host: string;
   port: number;
   url?: string;
@@ -263,6 +305,7 @@ export interface FleetServiceView {
   state: ServiceState | "unknown";
   publishedPort?: number;
   endpoint?: FleetEndpointView;
+  endpoints?: FleetEndpointView[];
 }
 
 /** One Hestia-managed stack in a repository-scoped Fleet snapshot. */
@@ -356,6 +399,10 @@ export interface IsolationEngine {
   addLocalRoutes(worktree: string, services: string[]): Promise<StackRecord>;
   /** Remove sticky local HTTPS route intent for services in this worktree. */
   removeLocalRoutes(worktree: string, services: string[]): Promise<StackRecord>;
+  /** Mask repository or machine route defaults for this worktree. */
+  disableLocalRoutes?(worktree: string, services: string[]): Promise<StackRecord>;
+  /** Remove the per-worktree override and reveal configured defaults. */
+  resetLocalRoutes?(worktree: string, services: string[]): Promise<StackRecord>;
   /** Publish running stack services through a cloudflare tunnel. */
   expose(
     worktree: string,

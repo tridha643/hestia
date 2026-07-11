@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { LABELS, type StackRecord } from "@hestia/core";
 import { getRepoInfo } from "./git.ts";
 import { tryLoadConfig } from "./config.ts";
-import { hestiaDir, hestiaHome, readState } from "./state.ts";
+import { hestiaDir, hestiaHome, parseStackRecord, readState } from "./state.ts";
 import { isLive, listPidfiles, procsDir } from "./proc/pidfile.ts";
 import { detectVarlock } from "./proc/resolver.ts";
 import { discoverWorkers } from "./wrangler/discover.ts";
@@ -93,6 +93,16 @@ async function envChecks(ctx: RepoCtx | null): Promise<DoctorRow[]> {
     }
   }
   if (ctx !== null) {
+    const ignored = await exec("git", ["-C", ctx.worktreeRoot, "check-ignore", "-q", ".hestia/"]);
+    rows.push(
+      ignored.ok
+        ? row("state-ignore", "ok", ".hestia/ is ignored")
+        : row(
+            "state-ignore",
+            "error",
+            `add the exact line ".hestia/" to ${join(ctx.worktreeRoot, ".gitignore")}`,
+          ),
+    );
     const schema = existsSync(join(ctx.worktreeRoot, ".env.schema"));
     if (schema) {
       rows.push(
@@ -178,13 +188,16 @@ async function stateChecks(ctx: RepoCtx): Promise<DoctorRow[]> {
   // exposure port drift = live cross-worktree leak (the OS recycles ports)
   for (const exp of record.tunnel?.exposures ?? []) {
     const svc = record.services.find((s) => s.name === exp.service);
-    if (svc?.publishedPort !== undefined && svc.publishedPort !== exp.originPort) {
+    const binding = svc?.bindings?.find((candidate) =>
+      `${candidate.target}/${candidate.protocol}` === exp.binding);
+    const publishedPort = binding?.publishedPort ?? svc?.publishedPort;
+    if (publishedPort !== undefined && publishedPort !== exp.originPort) {
       rows.push(
         row(
           `exposure:${exp.service}`,
           "error",
           `ingress rule points at port ${exp.originPort} but the service owns ` +
-            `${svc.publishedPort} — a recycled port serves ANOTHER worktree; ` +
+            `${publishedPort} — a recycled port serves ANOTHER worktree; ` +
             `run any hestia command to resync, this should not persist`,
         ),
       );
@@ -222,7 +235,7 @@ async function machineChecks(): Promise<DoctorRow[]> {
       if (!existsSync(p)) continue;
       mirrored.add(project);
       try {
-        const rec = JSON.parse(readFileSync(p, "utf8")) as StackRecord;
+        const rec = parseStackRecord(readFileSync(p, "utf8"), p);
         if (!existsSync(rec.worktree)) {
           rows.push(
             row(

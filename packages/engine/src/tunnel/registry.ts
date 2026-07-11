@@ -3,11 +3,10 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { HestiaError, type StackRecord, type TunnelRef } from "@hestia/core";
-import { hestiaHome } from "../state.ts";
+import { HestiaError, STATE_SCHEMA_VERSION, type StackRecord, type TunnelRef } from "@hestia/core";
+import { hestiaHome, parseStackRecord } from "../state.ts";
 import { withLock } from "../proc/lock.ts";
 import { credFilePath } from "./cloudflared.ts";
 import { startProc } from "../proc/supervisor.ts";
@@ -19,6 +18,7 @@ import {
   importBaseRules,
 } from "./ingress.ts";
 import { pollReady } from "./verify.ts";
+import { writeAtomicJsonFile, writeAtomicTextFile } from "../atomic-json-file.ts";
 
 /**
  * The machine-global unified-tunnel singleton: ONE connector process per
@@ -77,13 +77,17 @@ export interface AdoptedRef {
 export function readAdopted(uuid: string): AdoptedRef | null {
   const p = adoptedMarker(uuid);
   if (!existsSync(p)) return null;
-  let marker: { name?: string; credFile?: string };
+  let marker: { schemaVersion?: number; name?: string; credFile?: string };
   try {
     marker = JSON.parse(readFileSync(p, "utf8")) as typeof marker;
   } catch {
     marker = {};
   }
-  if (typeof marker.name === "string" && typeof marker.credFile === "string") {
+  if (
+    marker.schemaVersion === STATE_SCHEMA_VERSION &&
+    typeof marker.name === "string" &&
+    typeof marker.credFile === "string"
+  ) {
     return { uuid, name: marker.name, credFile: marker.credFile, reconstructed: false };
   }
   let name: string | undefined;
@@ -93,7 +97,7 @@ export function readAdopted(uuid: string): AdoptedRef | null {
       const sp = join(stacksDir, project, "stack.json");
       if (!existsSync(sp)) continue;
       try {
-        const record = JSON.parse(readFileSync(sp, "utf8")) as StackRecord;
+        const record = parseStackRecord(readFileSync(sp, "utf8"), sp);
         if (record.tunnel?.uuid === uuid) {
           name = record.tunnel.name;
           break;
@@ -140,7 +144,7 @@ export function ledgerAdd(uuid: string, hostname: string): void {
     ? (JSON.parse(readFileSync(p, "utf8")) as string[])
     : [];
   if (!cur.includes(hostname)) {
-    writeFileSync(p, JSON.stringify([...cur, hostname], null, 2));
+    writeAtomicJsonFile(p, [...cur, hostname]);
   }
 }
 
@@ -164,20 +168,23 @@ export function collectDynamicRules(uuid: string): {
     if (!existsSync(p)) continue;
     let record: StackRecord;
     try {
-      record = JSON.parse(readFileSync(p, "utf8")) as StackRecord;
+      record = parseStackRecord(readFileSync(p, "utf8"), p);
     } catch {
       continue;
     }
     if (record.tunnel?.uuid !== uuid) continue;
     for (const exp of record.tunnel.exposures) {
       const svc = record.services.find((s) => s.name === exp.service);
-      if (svc === undefined || svc.publishedPort === undefined) {
+      const binding = svc?.bindings?.find((candidate) =>
+        `${candidate.target}/${candidate.protocol}` === exp.binding);
+      const publishedPort = binding?.publishedPort ?? svc?.publishedPort;
+      if (svc === undefined || publishedPort === undefined) {
         dropped.push({ project, service: exp.service, hostname: exp.hostname });
         continue;
       }
       // The stack's own regen hooks keep originPort current; the live record
       // is still authoritative in case this regen races a restart.
-      rules.push({ ...exp, originPort: svc.publishedPort, project });
+      rules.push({ ...exp, originPort: publishedPort, project });
     }
   }
   return { rules, dropped };
@@ -249,7 +256,7 @@ export async function reconcileTunnel(
       await stopProcTree(pf);
       removePidfile(dir, CONNECTOR);
     }
-    writeFileSync(cfgPath, nextConfig);
+    writeAtomicTextFile(cfgPath, nextConfig);
 
     const result = await startProc(
       dir,
@@ -291,14 +298,15 @@ export async function reconcileTunnel(
 
     // Enriched so revival (daemon duties) can rebuild the ref with zero live
     // stacks; also heals legacy `{at}`-only markers on their first reconcile.
-    writeFileSync(
+    writeAtomicJsonFile(
       adoptedMarker(ref.uuid),
-      JSON.stringify({
+      {
+        schemaVersion: STATE_SCHEMA_VERSION,
         at: new Date().toISOString(),
         uuid: ref.uuid,
         name: ref.name,
         credFile: ref.credFile,
-      }),
+      },
     );
 
     const metricsPort = result.record.publishedPort!;

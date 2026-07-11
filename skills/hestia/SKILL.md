@@ -1,111 +1,148 @@
 ---
 name: hestia
-description: Per-worktree isolated dev stacks for parallel coding agents. Use when working in a git worktree that needs its own docker compose services, dev servers (next/vite/wrangler), or public URLs — hestia assigns ephemeral ports, isolates wrangler dev registries, and publishes services through cloudflare tunnels so parallel worktrees never collide.
+description: Discover, configure, run, inspect, expose, and tear down isolated macOS/Bun development workloads in parallel Git worktrees.
 ---
 
-# hestia
+# Hestia agent workflow
 
-Every git worktree gets an isolated stack. You never pick ports, never write
-config, never fight another agent over postgres, container names, wrangler
-service bindings, or public hostnames. All commands accept `--json`.
+Hestia owns development workload lifecycle and reachability for this worktree.
+Do not choose ports, start configured dev servers directly, or run a second
+Cloudflare connector beside Hestia.
 
-**The golden rule: one stack per worktree, and it's YOURS. Never start dev
-servers or `cloudflared tunnel run` by hand next to a hestia stack — hand the
-command to `hestia run` instead so it gets a safe port and supervision.**
-
-## Workflow
+## Start with discovery
 
 ```bash
-hestia up                          # compose services on ephemeral ports
-hestia up --workers                # + one supervised `wrangler dev` per config
-hestia run --name web -- pnpm dev  # supervise any dev server ($PORT injected)
-hestia env                         # PORT, DIRECT_URL, LOCAL_URL, public URL
-hestia endpoint list --json        # host/port plus direct/local/public surfaces
-hestia route add web api --json    # stable local HTTPS, service names only
-hestia route remove web --json     # removes CLI intent; TOML may keep it
-hestia route list --json           # effective explicit + repository defaults
-hestia router status --json        # non-interactive Portless state
-hestia config path --json          # canonical machine-local config.toml
-hestia logs -f web --json          # ndjson LogLine stream (docker or proc)
-hestia tui                          # human Fleet cockpit for managed repo stacks
-hestia expose web                  # public URL (quick tunnel, rotates per run)
-hestia expose web --tunnel tri     # sticky named tunnel, stable hostname
-hestia open web /auth/login        # local → public → direct preference
-hestia open web --direct           # request one surface explicitly
-hestia status --json               # current stack; null if none
-hestia down                        # tear down THIS worktree's stack
-hestia down --project <name>       # tear down after the worktree was deleted
-hestia doctor --json               # report-only audit; exit 1 on error rows
+hestia version --json
+hestia discover --json
+hestia doctor --json
 ```
 
-- `up`/`run` inject ports: `$PORT` in the child env, `{port}` tokens in the
-  command line (`{{port}}` escapes a literal), `HESTIA_<NAME>_PORT` in `env`.
-- Wire your own URLs from ports: `DATABASE_URL=postgres://…:$HESTIA_DB_PORT/…`.
-- Routed services retain `Endpoint.url` / `HESTIA_<SVC>_DIRECT_URL`, add
-  `Endpoint.localUrl` / `HESTIA_<SVC>_LOCAL_URL`, and preserve
-  `Endpoint.publicUrl` / `HESTIA_<SVC>_URL` for Cloudflare ingress.
-- Repository route defaults live only in `~/.hestia/config.toml`; discover and
-  validate it with `hestia config path|show|validate --json`.
-- The trusted Portless LaunchDaemon writes only below its root-owned
-  `/Library/Application Support/Hestia/router/` runtime. Hestiad publishes
-  agent route intent separately in `~/.hestia/router/portless/aliases.json`,
-  which Portless validates and reads without writing through the user path.
-- Logs: `hestia logs [service...] [-f] [--tail N] [--project P]`; the default
-  is all services and 50 backfill lines. `--json` is ndjson: one `LogLine`
-  (`project`, `service`, `source`, `text`, optional `meta`) per output line.
-- Fleet: `hestia tui` requires an interactive terminal and shows only stacks
-  Hestia currently manages for this Git repository. The only mutation is a
-  confirmed `down`; named volumes are always retained. Agents should continue
-  using the JSON CLI while humans use Fleet for live observation. Humans can
-  click stack/service rows and wheel-scroll logs; reconnect backfill is
-  deduplicated before display.
-- Public URLs are guarded only by obscurity — fine for webhooks/dev demos.
-- **Before deleting a worktree, run `hestia down`.** Forgot? `hestia status
-  --json` in any worktree won't show it, but `hestia down --project <name>`
-  (project = `<repo>-<branch>` slug) cleans up from the mirror.
+Discovery is read-only. Inspect:
 
-## The stack cap (daemon)
+- `repository`: exact repo, `repoId`, branch, and absolute worktree.
+- `runnableWorkloads` and `candidateWorkloads`.
+- `bindings` and configured endpoint aliases.
+- `decisionSource`: `discovery`, `repository`, `machine`, or `worktree`.
+- `missingDecisions`, `conflicts`, and `suggestions`.
 
-Starting a **new** stack takes one of 5 machine-wide slots (config:
-`HESTIA_MAX_STACKS`, then `~/.hestia/config.toml` `max_stacks`, then legacy
-`~/.hestia/config.json` `{"maxStacks": n}`). The
-hestiad daemon auto-starts on `up`/`run` — you never manage it, but you can:
-`hestia daemon status|start|stop|install|uninstall`.
+Do not guess when discovery reports a missing decision. If repository changes
+are authorized, use a suggested `hestia init ... --scope repository --write`.
+For personal/non-portable setup use `--scope machine --write`. Without
+`--write`, init prints the complete proposed TOML and changes nothing. Hestia
+never commits.
 
-- At the cap, `up`/`run` fail fast with `stack-limit` listing the live stacks.
-  Prefer finishing + `hestia down`-ing one; or queue with `--wait[=secs]`
-  (FIFO; the command blocks until a slot frees or the wait times out).
-- Re-`up`/`run` on an already-running stack never takes a second slot.
-- `--no-daemon` skips the cap (escape hatch; supervision paused — avoid).
+Examples:
 
-## Error codes (`--json` → `{error: {code, message}}`)
+```bash
+hestia init dockerfile web Dockerfile --scope repository
+hestia init proc consumer --scope machine --no-port -- bun run consume
+hestia init endpoint dashboard web 3000/tcp http --scope repository --write
+hestia init wrangler slack-worker apps/slack/wrangler.toml --scope repository --write
+hestia discover --json
+```
 
-| code | meaning | what to do |
-|---|---|---|
-| `stack-limit` | machine stack cap reached | `hestia down` a stack you own, or retry with `--wait=120` |
-| `config-missing` | no compose file for plain `up` | use `hestia run`/`up --workers`, or add a compose file |
-| `proc-ready-timeout` | proc never listened on its port | read `logPath`; if it's not a server, use `--no-port` |
-| `proc-exited` | proc died before ready | read `logPath` |
-| `name-conflict` | name taken by another backend | pick another `--name` |
-| `worktree-busy` | foreign wrangler/dev proc holds the registry | stop it, or `--force` |
-| `service-not-found` | expose/open target not running | `hestia up`/`run` it first; for `open`, `expose` it first |
-| `no-stack` | no cwd stack or `--project` mirror exists | start the stack or check the project name |
-| `tunnel-busy` | another connector on the named tunnel | stop your manual `cloudflared tunnel run`; `--force` accepts replica risk |
-| `hostname-conflict` | another worktree owns that public hostname | different service name or branch |
-| `dns-record-conflict` | hostname's DNS points somewhere foreign | `--overwrite-dns` ONLY if you know it's stale |
-| `lock-timeout` | another hestia command holds the worktree lock | retry shortly |
-| `daemon-start-failed` / `daemon-unreachable` | hestiad broken | `hestia daemon status`, read `~/.hestia/daemon/daemon.log`; last resort `--no-daemon` |
-| `router-setup-required` | trusted router absent | `hestia router install --interactive` in a terminal |
-| `router-privilege-required` | non-interactive setup lacks sudo | run the structured remediation command in a terminal |
-| `router-port-busy` | foreign process owns `:443` | inspect and stop it yourself; Hestia never kills it |
-| `route-origin-unavailable` | no verified direct origin | start the service through Hestia, then add the route |
+Configuration layers are worktree runtime intent, machine repository overlay
+at `~/.hestia/repositories/<repoId>.toml`, optional committed `hestia.toml`,
+then automatic discovery. Conflicts fail rather than silently overriding a
+workload source. `.hestia/` must remain ignored.
 
-## Invariants you must respect
+## Run and consume structured endpoints
 
-1. Never run `cloudflared tunnel run <name>` yourself while hestia has adopted
-   that tunnel — two connectors = requests randomly cross worktrees.
-2. Never hardcode ports; always consume `hestia env` / `endpoint list`.
-3. `.hestia/` is state, not code — it must stay gitignored; never commit it.
-4. Exposed port drift is repaired automatically by any hestia command; if
-   `doctor` reports it as an error, run any `hestia` command — never "fix" it
-   by re-running `expose`.
+```bash
+hestia up --json
+hestia endpoint list --json
+hestia endpoint get dashboard --json
+hestia logs web -f --json
+```
+
+A workload is a lifecycle/logging unit. A binding is an owned socket such as
+`api:8080/tcp`. An endpoint alias assigns protocol meaning to a binding.
+Resolution order is exact alias, canonical `workload:target/protocol`, then a
+uniquely-bound workload. Handle `service-port-ambiguous` by using a reported
+selector or configured alias.
+
+Canonical port variables look like `HESTIA_API_9090_TCP_PORT`. Only a unique
+binding receives `HESTIA_API_PORT`. HTTP aliases also receive direct/local URL
+variables. Never invent an HTTP URL for a raw TCP/UDP endpoint.
+
+Use `hestia run` only for explicit ad-hoc processes not already declared as a
+workload:
+
+```bash
+hestia run --name web -- bun run dev
+hestia run --name consumer --no-port -- bun run consume
+```
+
+Hestia injects `$PORT` and substitutes `{port}`. Raw `--env` values remain in
+memory and are not persisted. Logs are bounded by the rotating relay.
+
+## Routes and exposure
+
+```bash
+hestia route add dashboard --json
+hestia route disable dashboard --json
+hestia route reset dashboard --json
+hestia open dashboard --local --json
+hestia expose dashboard --json
+hestia expose dashboard --tunnel tri --zone example.dev --json
+```
+
+Local route overrides are per worktree. `disable` suppresses repository or
+machine defaults; `reset` removes the override and restores defaults.
+
+Public ingress is fail-closed but unauthenticated. Hestiad verifies the current
+process/container identity and port ownership before every origin connection.
+If a port is recycled, the foreign listener receives zero bytes.
+
+Named mode never writes DNS. It requires:
+
+```text
+*.<zone> CNAME <tunnel-uuid>.cfargotunnel.com
+```
+
+Handle `dns-route-required` by reporting its `wildcardTarget` to the human.
+Never use the removed `--overwrite-dns`. Named mode may use
+`--keep-host-header`; quick mode rejects it. Never start another
+`cloudflared tunnel run` for an adopted tunnel.
+
+## Inspect and finish
+
+```bash
+hestia status --json
+hestia env --json
+hestia doctor --json
+hestia tui
+hestia down
+```
+
+Fleet shows the repository, selected branch, absolute worktree, project,
+workloads, endpoints, and logs. It is for human operation; agents should use
+JSON/NDJSON commands.
+
+Run `down` before switching or deleting the branch. After deletion, use the
+recorded project with `hestia down --project <project>`. Docker workloads
+cannot be stopped individually (`backend-not-stoppable`); proc/Wrangler
+workloads can. Named volumes are retained unless `--destroy` is explicit.
+
+## Stable error remedies
+
+| code | remedy |
+|---|---|
+| `setup-required` | follow `discover --json` suggestions with explicit authorization |
+| `config-conflict` / `config-invalid` | fix the reported layer/path; do not guess precedence |
+| `state-not-ignored` | add the exact `.hestia/` line reported by `doctor` |
+| `state-corrupt` | inspect the path, then use the reported `down --project` recovery |
+| `migration-required` | inspect if needed, then down the legacy stack |
+| `stack-identity-changed` | down the recorded project before continuing on this checkout |
+| `env-key-conflict` | rename one workload/alias so normalized env keys differ |
+| `compose-unsupported` | replace the unsupported global/shared construct or use a supported topology |
+| `service-port-ambiguous` | use a canonical selector or endpoint alias |
+| `proc-ready-timeout` | inspect logs; use `--no-port` only for non-servers |
+| `stack-limit` | down an owned stack or retry with `--wait=120` |
+| `dns-route-required` | configure its wildcard CNAME target |
+| `tunnel-busy` | stop the foreign connector; do not kill processes Hestia did not start |
+| `route-origin-unavailable` | restart the workload through Hestia |
+| `backend-not-stoppable` | use `hestia down` for Docker workloads |
+
+`--json` failures are `{ "error": { "code", "message", "details"? } }`.
+`hestia logs --json` is NDJSON, one `LogLine` per line.

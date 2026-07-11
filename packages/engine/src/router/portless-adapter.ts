@@ -29,7 +29,18 @@ export function hestiaPortlessAliasesPath(): string {
 }
 
 function portlessCliPath(): string {
-  return join(dirname(fileURLToPath(import.meta.resolve("portless"))), "cli.js");
+  const bundled = join(dirname(fileURLToPath(import.meta.url)), "assets", "portless", "dist", "cli.js");
+  if (existsSync(bundled)) return bundled;
+  const workspaceBuild = join(process.cwd(), "dist", "assets", "portless", "dist", "cli.js");
+  if (existsSync(workspaceBuild)) return workspaceBuild;
+  const development = join(dirname(fileURLToPath(import.meta.resolve("portless"))), "cli.js");
+  if (!readFileSync(development, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) {
+    throw new HestiaError(
+      "router-version-unsupported",
+      "development Portless is not hardened; run bun run build and retry through dist/cli.js",
+    );
+  }
+  return development;
 }
 
 function xmlEscape(value: string): string {
@@ -124,11 +135,35 @@ export async function readHestiaRouterStatus(): Promise<HestiaRouterStatus> {
   return {
     installed: portlessServiceOwnership() === "hestia",
     running,
-    trusted: existsSync(join(stateDir, "ca.pem")) && existsSync(join(stateDir, "ca.trusted")),
+    trusted: await hestiaPortlessCaIsTrusted(),
     version: HESTIA_PORTLESS_VERSION,
     port: Number.isInteger(port) && port > 0 ? port : 443,
     stateDir,
   };
+}
+
+async function hestiaPortlessCaIsTrusted(): Promise<boolean> {
+  const caPath = join(hestiaPortlessStateDir(), "ca.pem");
+  if (!existsSync(caPath)) return false;
+  try {
+    const { stdout } = await pexec(
+      "openssl",
+      ["x509", "-in", caPath, "-noout", "-fingerprint", "-sha1"],
+      { timeout: 10_000 },
+    );
+    const fingerprint = stdout.replace(/^.*=/, "").replaceAll(":", "").trim().toLowerCase();
+    const systemKeychain = "/Library/Keychains/System.keychain";
+    if (await keychainHasFingerprint(systemKeychain, fingerprint)) return true;
+    const { stdout: loginOutput } = await pexec(
+      "security",
+      ["default-keychain", "-d", "user"],
+      { timeout: 10_000 },
+    );
+    const loginKeychain = loginOutput.trim().replace(/^"|"$/g, "");
+    return loginKeychain !== "" && await keychainHasFingerprint(loginKeychain, fingerprint);
+  } catch {
+    return false;
+  }
 }
 
 async function runRootCommand(command: string, args: string[], interactive: boolean, optional = false): Promise<void> {

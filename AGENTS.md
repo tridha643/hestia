@@ -1,5 +1,13 @@
 # hestia
 
+> V1 contract: `hestia discover` is read-only; optional portable workload
+> configuration lives in committed `hestia.toml`, machine-only configuration
+> in `~/.hestia/repositories/<repoId>.toml`, and runtime intent in ignored
+> `.hestia/`. Workloads own lifecycle/logs; bindings are sockets; endpoint
+> aliases own reachability. Named public ingress requires user-managed wildcard
+> DNS and all Hestia routes traverse hestiad's ownership-verifying Unix gateway.
+> V1 is macOS/Bun-only and ships as public `@tridha643/hestia`.
+
 Per-worktree isolated dev stacks for parallel coding agents. `hestia up` in a
 git worktree brings up that worktree's docker compose services on **ephemeral
 host ports**; `hestia run` and `hestia up --workers` supervise **host

@@ -1,9 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hestiaHome } from "../state.ts";
+import { HestiaError } from "@hestia/core";
+import { writeAtomicTextFile } from "../atomic-json-file.ts";
 
 export const LAUNCHD_LABEL = "dev.hestia.daemon";
 
@@ -17,6 +19,8 @@ export function plistPath(): string {
 }
 
 export function daemonMainPath(): string {
+  const bundled = join(dirname(fileURLToPath(import.meta.url)), "daemon.js");
+  if (existsSync(bundled)) return bundled;
   return fileURLToPath(new URL("./main.ts", import.meta.url));
 }
 
@@ -160,15 +164,36 @@ export function installLaunchd(opts?: { print?: boolean }): InstallResult {
   mkdirSync(launchAgentsDir(), { recursive: true });
   mkdirSync(dirname(input.logPath), { recursive: true });
   const target = plistPath();
+  const previous = existsSync(target) ? readFileSync(target, "utf8") : null;
+  const previouslyBootstrapped = isBootstrapped();
+  const rollback = (): void => {
+    launchctl("bootout", `${domain()}/${LAUNCHD_LABEL}`);
+    if (previous === null) rmSync(target, { force: true });
+    else writeAtomicTextFile(target, previous);
+    if (previouslyBootstrapped && previous !== null) {
+      launchctl("bootstrap", domain(), target);
+      launchctl("kickstart", "-k", `${domain()}/${LAUNCHD_LABEL}`);
+    }
+  };
   // Re-install must supersede a live agent: boot it out first (ignore "not loaded").
   launchctl("bootout", `${domain()}/${LAUNCHD_LABEL}`);
-  writeFileSync(target, plist);
+  writeAtomicTextFile(target, plist);
   const boot = launchctl("bootstrap", domain(), target);
   if (!boot.ok) {
-    warnings.push(`launchctl bootstrap failed: ${boot.output.trim()}`);
-    return { plist, warnings };
+    rollback();
+    throw new HestiaError(
+      "launchd-install-failed",
+      `launchctl bootstrap failed and the previous agent was restored: ${boot.output.trim()}`,
+    );
   }
-  kickstart();
+  const started = kickstart();
+  if (!started.ok) {
+    rollback();
+    throw new HestiaError(
+      "launchd-install-failed",
+      `launchctl kickstart failed and the previous agent was restored: ${started.output.trim()}`,
+    );
+  }
   return { plist, installedAt: target, warnings };
 }
 

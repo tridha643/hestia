@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -8,7 +9,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { StackRecord } from "@hestia/core";
+import { HestiaError, STATE_SCHEMA_VERSION, type StackRecord } from "@hestia/core";
 import { procsDir, type Pidfile } from "./proc/pidfile.ts";
 import { writeAtomicJsonFile } from "./atomic-json-file.ts";
 
@@ -41,7 +42,59 @@ export function mirrorProcsDir(project: string): string {
 }
 
 export function ensureDir(dir: string): void {
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+}
+
+function corruptState(path: string, reason: string): HestiaError {
+  return new HestiaError(
+    "state-corrupt",
+    `invalid Hestia state at ${path}: ${reason}; recover with hestia down --project <project>`,
+    { path, recovery: "hestia down --project <project>" },
+  );
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    Object.values(value).every((entry) => typeof entry === "string");
+}
+
+/** Parse persisted stack state without trusting a JSON cast. */
+export function parseStackRecord(source: string, path: string): StackRecord {
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch (error) {
+    throw corruptState(path, `malformed JSON (${(error as Error).message})`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw corruptState(path, "expected an object");
+  }
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== undefined && record.schemaVersion !== STATE_SCHEMA_VERSION) {
+    throw corruptState(path, `unsupported schemaVersion ${String(record.schemaVersion)}`);
+  }
+  for (const key of ["project", "repo", "branch", "worktree", "state", "createdAt"] as const) {
+    if (typeof record[key] !== "string" || record[key] === "") {
+      throw corruptState(path, `expected non-empty ${key}`);
+    }
+  }
+  if (!Array.isArray(record.services) || !Array.isArray(record.endpoints)) {
+    throw corruptState(path, "services and endpoints must be arrays");
+  }
+  if (!isStringRecord(record.env)) throw corruptState(path, "env must contain only string values");
+  return record as unknown as StackRecord;
+}
+
+/** Reject mutation of legacy state while preserving inspection and teardown. */
+export function assertMutableStackRecord(record: StackRecord, path: string): void {
+  if (record.schemaVersion !== STATE_SCHEMA_VERSION) {
+    throw new HestiaError(
+      "migration-required",
+      `legacy Hestia state at ${path} is inspection/down-only; run hestia down before starting it again`,
+      { path, recovery: `hestia down --project ${record.project}` },
+    );
+  }
 }
 
 /**
@@ -50,6 +103,7 @@ export function ensureDir(dir: string): void {
  * containers after the worktree itself has been deleted.
  */
 export function writeState(worktreeRoot: string, record: StackRecord): void {
+  assertMutableStackRecord(record, statePath(worktreeRoot));
   ensureDir(hestiaDir(worktreeRoot));
   writeAtomicJsonFile(statePath(worktreeRoot), record);
   const mdir = mirrorDir(record.project);
@@ -83,13 +137,17 @@ export function mirrorPidfile(project: string, pf: Pidfile): void {
 export function readState(worktreeRoot: string): StackRecord | null {
   const p = statePath(worktreeRoot);
   if (!existsSync(p)) return null;
-  return JSON.parse(readFileSync(p, "utf8")) as StackRecord;
+  const record = parseStackRecord(readFileSync(p, "utf8"), p);
+  chmodSync(p, 0o600);
+  return record;
 }
 
 export function readMirrorState(project: string): StackRecord | null {
   const p = join(mirrorDir(project), STATE_FILE);
   if (!existsSync(p)) return null;
-  return JSON.parse(readFileSync(p, "utf8")) as StackRecord;
+  const record = parseStackRecord(readFileSync(p, "utf8"), p);
+  chmodSync(p, 0o600);
+  return record;
 }
 
 export function clearState(worktreeRoot: string, project: string): void {

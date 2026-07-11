@@ -1,9 +1,12 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
-import { parse as parseYaml } from "yaml";
+import { createHash } from "node:crypto";
+import { resolveCname } from "node:dns/promises";
+import { stringify as stringifyYaml } from "yaml";
 import {
+  STATE_SCHEMA_VERSION,
   type AdmitOptions,
   type DownOptions,
   type Endpoint,
@@ -23,7 +26,14 @@ import {
   projectName,
 } from "@hestia/core";
 import { loadConfig, tryLoadConfig } from "./config.ts";
-import { getRepoInfo } from "./git.ts";
+import { getRepoInfo, type RepoInfo } from "./git.ts";
+import {
+  assertDiscoveryRunnable,
+  discoverRepository,
+  resolveConfiguredWorkloads,
+} from "./discovery.ts";
+import type { ConfiguredWorkload } from "./repository-config.ts";
+import { resolveEndpointSelection } from "./endpoint-resolution.ts";
 import { generateOverride } from "./compose/override.ts";
 import {
   type ComposeCtx,
@@ -32,8 +42,11 @@ import {
   composePs,
   composeUp,
   publishedPortFor,
+  resolveComposeModel,
+  type ResolvedComposeModel,
   waitReady,
 } from "./compose/cli.ts";
+import { writeAtomicTextFile } from "./atomic-json-file.ts";
 import {
   clearState,
   ensureDir,
@@ -44,6 +57,7 @@ import {
   mirrorProcsDir,
   readMirrorState,
   readState,
+  assertMutableStackRecord,
   writeState,
 } from "./state.ts";
 import { withLock } from "./proc/lock.ts";
@@ -53,13 +67,19 @@ import {
   isLive,
   listPidfiles,
   procsDir,
+  procSpecFingerprint,
   readPidfile,
   removePidfile,
   startTimeOf,
 } from "./proc/pidfile.ts";
 import { stopProcTree } from "./proc/shutdown.ts";
 import { inspectPort } from "./proc/ports.ts";
-import { resolvedLocalRouteHostname, verifyStackServiceOrigin } from "./router/local-http-router.ts";
+import {
+  internalEndpointAuthority,
+  publicGatewaySocketPath,
+  resolvedLocalRouteHostname,
+  verifyStackServiceOrigin,
+} from "./router/local-http-router.ts";
 import { detectVarlock } from "./proc/resolver.ts";
 import { planWorkers, privateRegistryDir } from "./wrangler/adapter.ts";
 import {
@@ -67,13 +87,11 @@ import {
   snapshotGlobalRegistry,
   verifyPrivateRegistry,
 } from "./wrangler/verify.ts";
-import { adoptTunnel, routeDns } from "./tunnel/cloudflared.ts";
+import { adoptTunnel } from "./tunnel/cloudflared.ts";
 import { hostnameFor, importBaseRules, inferZone } from "./tunnel/ingress.ts";
 import {
   connectorPidfile,
   isAdopted,
-  ledgerAdd,
-  ledgerHas,
   reconcileTunnel,
 } from "./tunnel/registry.ts";
 import { isReady, quickTunnelUrl } from "./tunnel/verify.ts";
@@ -126,6 +144,7 @@ export {
   effectiveLocalRouteServices,
   hestiaConfigTomlPath,
   localRouteHostname,
+  migrateHestiaMachineConfig,
   readHestiaMachineConfig,
 } from "./router/router-config.ts";
 export {
@@ -149,6 +168,10 @@ export {
 } from "./daemon/client.ts";
 export { createRepoId, getRepoInfo } from "./git.ts";
 export { writeAtomicJsonFile } from "./atomic-json-file.ts";
+export * from "./repository-config.ts";
+export * from "./discovery.ts";
+export * from "./init-config.ts";
+export * from "./endpoint-resolution.ts";
 export {
   LAUNCHD_LABEL,
   installLaunchd,
@@ -159,29 +182,164 @@ export {
 } from "./daemon/launchd.ts";
 
 const OVERRIDE_FILE = "compose.override.yml";
+const DOCKERFILE_COMPOSE_FILE = "dockerfile.compose.yml";
 
 interface Prepared {
   ctx: ComposeCtx;
   services: string[];
-  servicePorts: Record<string, number[]>;
+  serviceBindings: Record<string, Array<{ target: number; protocol: "tcp" | "udp" }>>;
   composeFile: string;
   overridePath: string;
 }
 
-/** Compose-side preparation: parse the user file, write the override. */
-function prepareCompose(
+function composeUnsupported(message: string): never {
+  throw new HestiaError("compose-unsupported", message);
+}
+
+export function validateResolvedComposeModel(model: ResolvedComposeModel, project: string): void {
+  for (const [name, service] of Object.entries(model.services)) {
+    if (service.network_mode === "host") composeUnsupported(`service ${name} uses host network mode`);
+    if (service.pid === "host") composeUnsupported(`service ${name} uses host PID mode`);
+    if (service.ipc === "host") composeUnsupported(`service ${name} uses host IPC mode`);
+    for (const port of service.ports ?? []) {
+      const target = typeof port.target === "number" ? port.target : Number(port.target);
+      if (!Number.isInteger(target) || target < 1 || target > 65_535 || String(port.target).includes("-")) {
+        composeUnsupported(`service ${name} has unsupported port target ${String(port.target)} (ranges are not supported)`);
+      }
+      if (port.published?.includes("-")) {
+        composeUnsupported(`service ${name} has unsupported published port range ${port.published}`);
+      }
+      if (port.protocol !== undefined && port.protocol !== "tcp" && port.protocol !== "udp") {
+        composeUnsupported(`service ${name} uses unsupported port protocol ${port.protocol}`);
+      }
+    }
+  }
+  for (const [kind, resources] of [
+    ["network", model.networks],
+    ["volume", model.volumes],
+  ] as const) {
+    for (const [key, resource] of Object.entries(resources ?? {})) {
+      if (resource.external) composeUnsupported(`${kind} ${key} is external`);
+      if (resource.name !== undefined && !resource.name.startsWith(`${project}_`)) {
+        composeUnsupported(`${kind} ${key} has explicit machine-global name ${resource.name}`);
+      }
+    }
+  }
+}
+
+export function expandComposeDependencies(model: ResolvedComposeModel, requested?: string[]): string[] {
+  const roots = requested ?? Object.keys(model.services);
+  const expanded = new Set<string>();
+  const visit = (name: string): void => {
+    const service = model.services[name];
+    if (service === undefined) {
+      throw new HestiaError(
+        "service-not-found",
+        `compose service ${JSON.stringify(name)} is not defined (have: ${Object.keys(model.services).join(", ")})`,
+      );
+    }
+    if (expanded.has(name)) return;
+    expanded.add(name);
+    for (const dependency of Object.keys(service.depends_on ?? {})) visit(dependency);
+  };
+  for (const root of roots) visit(root);
+  return [...expanded];
+}
+
+function assertNoEnvironmentKeyConflicts(
+  workloads: Array<{ name: string; endpoints: Array<{ alias: string }> }>,
+): void {
+  const owners = new Map<string, string>();
+  for (const workload of workloads) {
+    for (const owner of [workload.name, ...workload.endpoints.map((endpoint) => endpoint.alias)]) {
+      const key = envKey(owner);
+      const previous = owners.get(key);
+      if (previous !== undefined && previous !== owner) {
+        throw new HestiaError(
+          "env-key-conflict",
+          `${JSON.stringify(previous)} and ${JSON.stringify(owner)} both normalize to HESTIA_${key}`,
+          { key: `HESTIA_${key}`, owners: [previous, owner] },
+        );
+      }
+      owners.set(key, owner);
+    }
+  }
+}
+
+export function applyConfiguredEndpoints(
+  record: StackRecord,
+  configuredWorkloads: Record<string, ConfiguredWorkload>,
+): void {
+  for (const [workloadName, configured] of Object.entries(configuredWorkloads)) {
+    const serviceName = configured.composeService ?? workloadName;
+    const service = record.services.find((candidate) => candidate.name === serviceName);
+    if (service === undefined) continue;
+    for (const [alias, endpointConfig] of Object.entries(configured.endpoints)) {
+      const [target, protocol] = endpointConfig.binding.split("/") as [string, "tcp" | "udp"];
+      const binding = service.bindings?.find((candidate) =>
+        candidate.target === target && candidate.protocol === protocol
+      );
+      if (binding === undefined) {
+        throw new HestiaError(
+          "endpoint-binding-not-found",
+          `endpoint ${alias} selects ${serviceName}:${endpointConfig.binding}, which is not published`,
+        );
+      }
+      const directUrl = endpointConfig.kind === "http"
+        ? `http://127.0.0.1:${binding.publishedPort}`
+        : undefined;
+      setEndpoint(record, {
+        name: alias,
+        alias,
+        workload: serviceName,
+        binding: endpointConfig.binding,
+        kind: endpointConfig.kind,
+        local: endpointConfig.local,
+        host: "127.0.0.1",
+        port: binding.publishedPort,
+        url: directUrl,
+      });
+      record.env[`HESTIA_${envKey(alias)}_PORT`] = String(binding.publishedPort);
+      if (directUrl !== undefined) record.env[`HESTIA_${envKey(alias)}_DIRECT_URL`] = directUrl;
+    }
+  }
+}
+
+/** Refuse to persist runtime state where Git could accidentally track it. */
+async function assertHestiaStateIgnored(worktreeRoot: string): Promise<void> {
+  try {
+    await pexec("git", ["-C", worktreeRoot, "rev-parse", "--is-inside-work-tree"], { timeout: 5_000 });
+  } catch {
+    return; // non-Git fallback mode has no index to protect
+  }
+  try {
+    await pexec("git", ["-C", worktreeRoot, "check-ignore", "-q", ".hestia/"], { timeout: 5_000 });
+  } catch {
+    throw new HestiaError(
+      "state-not-ignored",
+      `.hestia is not ignored in ${worktreeRoot}; add the line ".hestia/" to ${join(worktreeRoot, ".gitignore")}`,
+      { remedy: `.hestia/`, path: join(worktreeRoot, ".gitignore") },
+    );
+  }
+}
+
+/** Resolve and validate Compose before atomically publishing its isolation override. */
+async function prepareCompose(
   worktreeRoot: string,
   project: string,
   repo: string,
   branch: string,
   opts?: UpOptions,
-): Prepared {
-  const cfg = loadConfig(worktreeRoot);
-  const services = opts?.services ?? cfg.services;
-
-  const userCompose = parseYaml(readFileSync(cfg.composeFile, "utf8"));
-  const { yaml, servicePorts } = generateOverride({
-    userCompose,
+  configuredBaseFile?: string,
+): Promise<Prepared> {
+  const cfg = configuredBaseFile === undefined
+    ? loadConfig(worktreeRoot)
+    : { composeFile: configuredBaseFile, services: [] };
+  const resolvedModel = await resolveComposeModel(project, cfg.composeFile, worktreeRoot);
+  validateResolvedComposeModel(resolvedModel, project);
+  const services = expandComposeDependencies(resolvedModel, opts?.services);
+  const { yaml, serviceBindings } = generateOverride({
+    userCompose: resolvedModel,
     project,
     repo,
     branch,
@@ -191,7 +349,7 @@ function prepareCompose(
 
   ensureDir(hestiaDir(worktreeRoot));
   const overridePath = join(hestiaDir(worktreeRoot), OVERRIDE_FILE);
-  writeFileSync(overridePath, yaml);
+  writeAtomicTextFile(overridePath, yaml);
 
   return {
     ctx: {
@@ -201,10 +359,39 @@ function prepareCompose(
       cwd: worktreeRoot,
     },
     services,
-    servicePorts,
+    serviceBindings,
     composeFile: cfg.composeFile,
     overridePath,
   };
+}
+
+function writeDockerfileComposeModel(
+  worktreeRoot: string,
+  workloads: Record<string, ConfiguredWorkload>,
+  conventionalComposeFile?: string,
+): string | undefined {
+  const dockerfiles = Object.entries(workloads).filter(([, workload]) => workload.source === "dockerfile");
+  if (dockerfiles.length === 0) return conventionalComposeFile;
+  const services = Object.fromEntries(dockerfiles.map(([name, workload]) => {
+    const ports = [...new Set(Object.values(workload.endpoints).map((endpoint) => endpoint.binding))]
+      .filter((binding) => !binding.startsWith("main/"));
+    return [name, {
+      build: {
+        context: worktreeRoot,
+        dockerfile: workload.dockerfile ?? "Dockerfile",
+      },
+      ...(ports.length > 0 ? { ports } : {}),
+    }];
+  }));
+  const model = {
+    ...(conventionalComposeFile === undefined
+      ? {}
+      : { include: [{ path: conventionalComposeFile }] }),
+    services,
+  };
+  const path = join(hestiaDir(worktreeRoot), DOCKERFILE_COMPOSE_FILE);
+  writeAtomicTextFile(path, stringifyYaml(model));
+  return path;
 }
 
 function freshRecord(
@@ -215,6 +402,7 @@ function freshRecord(
   worktree: string,
 ): StackRecord {
   return {
+    schemaVersion: STATE_SCHEMA_VERSION,
     project,
     repoId,
     repo,
@@ -228,10 +416,53 @@ function freshRecord(
   };
 }
 
+/** Guard every stack mutation against legacy state and changed Git identity. */
+function assertCurrentStackIdentity(
+  record: StackRecord,
+  current: RepoInfo,
+): void {
+  const path = join(hestiaDir(current.worktreeRoot), "stack.json");
+  assertMutableStackRecord(record, path);
+  const matches =
+    record.repoId === current.repoId &&
+    record.repo === current.repo &&
+    record.branch === current.branch &&
+    resolve(record.worktree) === resolve(current.worktreeRoot) &&
+    record.project === projectName(
+      current.repoId,
+      current.repo,
+      current.branch,
+      current.worktreeRoot,
+    );
+  if (!matches) {
+    throw new HestiaError(
+      "stack-identity-changed",
+      `this checkout no longer matches stack ${record.project}; run hestia down before starting or changing it`,
+      {
+        recorded: {
+          repoId: record.repoId,
+          repo: record.repo,
+          branch: record.branch,
+          worktree: record.worktree,
+        },
+        current,
+        recovery: `hestia down --project ${record.project}`,
+      },
+    );
+  }
+}
+
 function upsertService(record: StackRecord, svc: ServiceRecord): void {
   const i = record.services.findIndex((s) => s.name === svc.name);
   if (i >= 0) record.services[i] = svc;
   else record.services.push(svc);
+}
+
+function upsertAuxiliary(record: StackRecord, auxiliary: ServiceRecord): void {
+  record.auxiliary ??= [];
+  const index = record.auxiliary.findIndex((candidate) => candidate.name === auxiliary.name);
+  if (index >= 0) record.auxiliary[index] = auxiliary;
+  else record.auxiliary.push(auxiliary);
 }
 
 function setEndpoint(record: StackRecord, ep: Endpoint): void {
@@ -239,7 +470,8 @@ function setEndpoint(record: StackRecord, ep: Endpoint): void {
   if (i >= 0) {
     const previous = record.endpoints[i]!;
     const portRotated = previous.port !== ep.port;
-    const namedExposure = record.tunnel?.exposures.some((exposure) => exposure.service === ep.name) ?? false;
+    const namedExposure = record.tunnel?.exposures.some((exposure) =>
+      (exposure.alias ?? exposure.service) === ep.name) ?? false;
     if (portRotated && previous.publicUrl !== undefined && !namedExposure) {
       delete previous.publicUrl;
       delete record.env[urlKey(ep.name)];
@@ -258,15 +490,41 @@ function dropService(record: StackRecord, name: string): void {
   delete record.env[localUrlKey(name)];
 }
 
+function persistStoppedService(record: StackRecord, name: string): void {
+  const service = record.services.find((candidate) => candidate.name === name);
+  if (service === undefined) return;
+  service.state = "stopped";
+  delete service.publishedPort;
+  service.bindings = [];
+  record.endpoints = record.endpoints.filter((endpoint) =>
+    endpoint.name !== name && endpoint.workload !== name
+  );
+  for (const key of Object.keys(record.env)) {
+    if (key.startsWith(`HESTIA_${envKey(name)}_`)) delete record.env[key];
+  }
+}
+
 function recordProc(
   record: StackRecord,
   svc: ServiceRecord,
 ): void {
-  upsertService(record, svc);
+  const recorded = svc.publishedPort === undefined ? svc : {
+    ...svc,
+    bindings: [{
+      id: `${svc.name}:main/tcp`,
+      target: "main",
+      protocol: "tcp" as const,
+      publishedPort: svc.publishedPort,
+    }],
+  };
+  upsertService(record, recorded);
   if (svc.publishedPort !== undefined) {
+    record.env[`HESTIA_${envKey(svc.name)}_MAIN_TCP_PORT`] = String(svc.publishedPort);
     record.env[`HESTIA_${envKey(svc.name)}_PORT`] = String(svc.publishedPort);
     setEndpoint(record, {
       name: svc.name,
+      workload: svc.name,
+      binding: "main/tcp",
       host: "127.0.0.1",
       port: svc.publishedPort,
       reservedName: `${svc.name}.${record.branch}.${record.repo}.localhost`,
@@ -292,20 +550,40 @@ function applyLocalRouteProjection(record: StackRecord): void {
   const selected = new Set(effectiveLocalRouteServices(record, config));
   for (const endpoint of record.endpoints) {
     endpoint.reservedName = resolvedLocalRouteHostname(record, endpoint.name, config);
+    const service = record.services.find(
+      (candidate) => candidate.name === (endpoint.workload ?? endpoint.name),
+    );
+    const selectedBinding = endpoint.binding === undefined
+      ? undefined
+      : service?.bindings?.find(
+          (binding) => `${binding.target}/${binding.protocol}` === endpoint.binding,
+        );
+    const publishedPort = selectedBinding?.publishedPort ?? service?.publishedPort;
     if (!selected.has(endpoint.name)) {
-      // A port is not automatically HTTP: route intent is the protocol declaration.
-      // Unselected TCP services retain the baseline host/port without invented URLs.
+      // Explicit endpoint kind is a protocol declaration. Legacy untyped ports
+      // remain raw until route intent declares HTTP.
+      if (endpoint.kind === "http" && publishedPort !== undefined) {
+        endpoint.url = `http://127.0.0.1:${publishedPort}`;
+        record.env[directUrlKey(endpoint.name)] = endpoint.url;
+      } else {
+        delete endpoint.url;
+        delete record.env[directUrlKey(endpoint.name)];
+      }
+      delete endpoint.localUrl;
+      delete record.env[localUrlKey(endpoint.name)];
+      continue;
+    }
+    if (service === undefined || publishedPort === undefined || service.backend === "tunnel") continue;
+    endpoint.host = "127.0.0.1";
+    endpoint.port = publishedPort;
+    if (endpoint.kind !== undefined && endpoint.kind !== "http") {
       delete endpoint.url;
       delete endpoint.localUrl;
       delete record.env[directUrlKey(endpoint.name)];
       delete record.env[localUrlKey(endpoint.name)];
       continue;
     }
-    const service = record.services.find((candidate) => candidate.name === endpoint.name);
-    if (service?.publishedPort === undefined || service.backend === "tunnel") continue;
-    endpoint.host = "127.0.0.1";
-    endpoint.port = service.publishedPort;
-    endpoint.url = `http://127.0.0.1:${service.publishedPort}`;
+    endpoint.url = `http://127.0.0.1:${publishedPort}`;
     endpoint.localUrl = `https://${endpoint.reservedName}`;
     record.env[directUrlKey(endpoint.name)] = endpoint.url;
     record.env[localUrlKey(endpoint.name)] = endpoint.localUrl;
@@ -326,10 +604,13 @@ function syncExposures(record: StackRecord): boolean {
   let changed = false;
   for (const exp of t.exposures) {
     const svc = record.services.find((s) => s.name === exp.service);
-    if (svc?.publishedPort === undefined) {
+    const binding = svc?.bindings?.find((candidate) =>
+      `${candidate.target}/${candidate.protocol}` === exp.binding);
+    const publishedPort = binding?.publishedPort ?? svc?.publishedPort;
+    if (publishedPort === undefined) {
       changed = true; // origin gone — regen drops the rule (404, never a stale port)
-    } else if (svc.publishedPort !== exp.originPort) {
-      exp.originPort = svc.publishedPort;
+    } else if (publishedPort !== exp.originPort) {
+      exp.originPort = publishedPort;
       changed = true;
     }
   }
@@ -350,6 +631,20 @@ function matchesExpectedStack(
 
 function projectMutationRoot(project: string): string {
   return join(hestiaHome(), "project-locks", project);
+}
+
+async function assertNamedTunnelDns(hostname: string, tunnelUuid: string): Promise<void> {
+  const expected = `${tunnelUuid}.cfargotunnel.com`;
+  if (process.env.HESTIA_E2E_DNS_RESOLVED === "1") return;
+  try {
+    const records = (await resolveCname(hostname)).map((record) => record.replace(/\.$/, "").toLowerCase());
+    if (records.includes(expected.toLowerCase())) return;
+  } catch {}
+  throw new HestiaError(
+    "dns-route-required",
+    `${hostname} does not resolve through Hestia's adopted tunnel; configure wildcard CNAME *.${hostname.split(".").slice(1).join(".")} -> ${expected}`,
+    { hostname, wildcardTarget: expected },
+  );
 }
 
 interface StartAdmissionGuard {
@@ -424,6 +719,9 @@ export class ComposeEngine implements IsolationEngine {
     worktreeRoot: string,
     opts?: AdmitOptions,
   ): Promise<StartAdmissionGuard> {
+    const currentIdentity = { repo, repoId, branch, worktreeRoot };
+    const existingRecord = readState(worktreeRoot);
+    if (existingRecord !== null) assertCurrentStackIdentity(existingRecord, currentIdentity);
     let handle: Awaited<ReturnType<typeof ensureDaemon>> | null = null;
     if (opts?.noDaemon) {
       process.stderr.write(
@@ -467,6 +765,7 @@ export class ComposeEngine implements IsolationEngine {
         provisional = true;
         createdAt = rec.createdAt;
       } else {
+        assertCurrentStackIdentity(rec, currentIdentity);
         if (rec.services.length === 0) {
           retainedEmpty = true;
           provisional = true;
@@ -488,7 +787,7 @@ export class ComposeEngine implements IsolationEngine {
       if (!provisional) return;
       await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
         const rec = readState(worktreeRoot);
-        if (rec !== null && rec.state === "starting" && rec.services.length === 0) {
+        if (rec !== null && rec.state === "starting" && rec.services.length === 0 && rec.composeFile === undefined) {
           if (retainedEmpty) {
             rec.state = previousState ?? "stopped";
             rec.starter = previousStarter;
@@ -503,16 +802,37 @@ export class ComposeEngine implements IsolationEngine {
   }
 
   async up(cwd: string, opts?: UpOptions): Promise<StackRecord> {
+    const discovery = await discoverRepository(cwd);
+    assertDiscoveryRunnable(discovery);
+    assertNoEnvironmentKeyConflicts(
+      [...discovery.runnableWorkloads, ...discovery.candidateWorkloads]
+        .map((workload) => ({ name: workload.name, endpoints: workload.endpoints })),
+    );
+    const configured = await resolveConfiguredWorkloads(cwd);
+    if (configured.conflicts.length > 0) {
+      throw new HestiaError("config-conflict", configured.conflicts.join("; "));
+    }
     const { repo, repoId, branch, worktreeRoot } = await getRepoInfo(cwd);
-    const project = projectName(repo, branch, worktreeRoot);
+    await assertHestiaStateIgnored(worktreeRoot);
+    const project = projectName(repoId, repo, branch, worktreeRoot);
     let tunnelDirty = false;
 
     const admission = await this.#admit(project, repoId, repo, branch, worktreeRoot, opts);
     let done: StackRecord;
     try {
-      done = await this.#upLocked(worktreeRoot, project, repoId, repo, branch, admission.createdAt, opts, (d) => {
+      done = await this.#upLocked(
+        worktreeRoot,
+        project,
+        repoId,
+        repo,
+        branch,
+        admission.createdAt,
+        opts,
+        configured.workloads,
+        (d) => {
         tunnelDirty = d;
-      });
+        },
+      );
     } catch (err) {
       await admission.rollback();
       throw err;
@@ -530,6 +850,7 @@ export class ComposeEngine implements IsolationEngine {
     branch: string,
     admittedCreatedAt: string,
     opts: UpOptions | undefined,
+    configuredWorkloads: Record<string, ConfiguredWorkload>,
     setTunnelDirty: (d: boolean) => void,
   ): Promise<StackRecord> {
     return withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
@@ -538,61 +859,150 @@ export class ComposeEngine implements IsolationEngine {
         throw new HestiaError("worktree-busy", "stack was removed after admission; start cancelled");
       }
       record.repoId ??= repoId;
-      const hasCompose = tryLoadConfig(worktreeRoot) !== null;
-      if (!hasCompose && !opts?.workers) {
+      const conventionalCompose = tryLoadConfig(worktreeRoot);
+      const composeBaseFile = writeDockerfileComposeModel(
+        worktreeRoot,
+        configuredWorkloads,
+        conventionalCompose?.composeFile,
+      );
+      const hasCompose = composeBaseFile !== undefined;
+      const configuredProcs = Object.entries(configuredWorkloads)
+        .filter(([, workload]) => workload.source === "proc");
+      const configuredWorkers = Object.entries(configuredWorkloads)
+        .filter(([, workload]) => workload.source === "wrangler");
+      if (!hasCompose && !opts?.workers && configuredProcs.length === 0 && configuredWorkers.length === 0) {
         // plain `up` still means "compose up" — procs arrive via `run`
         loadConfig(worktreeRoot); // throws config-missing
       }
 
       if (hasCompose) {
-        const p = prepareCompose(worktreeRoot, project, repo, branch, opts);
+        const p = await prepareCompose(worktreeRoot, project, repo, branch, opts, composeBaseFile);
         await composeConfig(p.ctx);
-        await composeUp(p.ctx);
-        const rows = await waitReady(p.ctx, p.services);
-        const byName = new Map(rows.map((r) => [r.Service, r]));
-
-        for (const svc of p.services) {
+        for (const serviceName of p.services) {
           const proc = record.services.find(
-            (s) => s.name === svc && s.backend !== "docker",
+            (service) => service.name === serviceName && service.backend !== "docker",
           );
           if (proc !== undefined) {
             throw new HestiaError(
               "name-conflict",
-              `compose service "${svc}" collides with a running proc of the same name`,
+              `compose service "${serviceName}" collides with a running proc of the same name`,
             );
           }
-          const row = byName.get(svc);
-          const cports = p.servicePorts[svc] ?? [];
-          let canonical: number | undefined;
-          for (const cp of cports) {
-            const pub = publishedPortFor(row, cp);
-            if (pub !== undefined && canonical === undefined) canonical = pub;
+        }
+        // Publish teardown intent before Compose may create anything. A later
+        // failure remains visible and `down` can always remove partial resources.
+        record.composeFile = p.composeFile;
+        record.overrideFile = p.overridePath;
+        writeState(worktreeRoot, record);
+        // The explicit list prevents unrelated profile services from starting;
+        // transitive dependencies were expanded before override generation.
+        let rows;
+        try {
+          await composeUp(p.ctx, p.services);
+          rows = await waitReady(p.ctx, p.services);
+        } catch (error) {
+          record.state = "degraded";
+          for (const serviceName of p.services) {
+            upsertService(record, {
+              name: serviceName,
+              backend: "docker",
+              state: "unhealthy",
+              containerPort: p.serviceBindings[serviceName]?.[0]?.target,
+              bindings: [],
+            });
           }
+          delete record.starter;
+          writeState(worktreeRoot, record);
+          throw error;
+        }
+        const byName = new Map(rows.map((r) => [r.Service, r]));
+
+        for (const svc of p.services) {
+          const row = byName.get(svc);
+          const targetBindings = p.serviceBindings[svc] ?? [];
+          const bindings = targetBindings.flatMap((binding) => {
+            const publishedPort = publishedPortFor(row, binding.target, binding.protocol);
+            return publishedPort === undefined ? [] : [{
+              id: `${svc}:${binding.target}/${binding.protocol}`,
+              target: String(binding.target),
+              protocol: binding.protocol,
+              publishedPort,
+            }];
+          });
+          const canonical = bindings.length === 1 ? bindings[0]!.publishedPort : undefined;
           upsertService(record, {
             name: svc,
             backend: "docker",
             state: "healthy",
-            containerPort: cports[0],
+            containerPort: targetBindings[0]?.target,
             publishedPort: canonical,
             containerId: row?.ID,
+            bindings,
           });
-          if (canonical !== undefined) {
+          for (const binding of bindings) {
+            record.env[
+              `HESTIA_${envKey(svc)}_${binding.target}_${binding.protocol.toUpperCase()}_PORT`
+            ] = String(binding.publishedPort);
+          }
+          if (bindings.length === 1 && canonical !== undefined) {
             record.env[`HESTIA_${envKey(svc)}_PORT`] = String(canonical);
             setEndpoint(record, {
               name: svc,
               host: "127.0.0.1",
               port: canonical,
+              workload: svc,
+              binding: `${bindings[0]!.target}/${bindings[0]!.protocol}`,
+              kind: bindings[0]!.protocol,
               reservedName: `${svc}.${branch}.${repo}.localhost`,
             });
           }
         }
-        record.composeFile = p.composeFile;
-        record.overrideFile = p.overridePath;
       }
 
-      if (opts?.workers) {
-        await this.#upWorkers(worktreeRoot, record, opts);
+      for (const [name, workload] of configuredProcs) {
+        const command = workload.command!;
+        const configuredSpec: ProcSpec = {
+          name,
+          argv: command,
+          port: workload.port ?? "auto",
+          backend: "proc",
+        };
+        const clash = record.services.find((service) => service.name === name && service.backend === "docker");
+        if (clash !== undefined) {
+          throw new HestiaError("name-conflict", `configured proc ${name} collides with a compose workload`);
+        }
+        const existing = readPidfile(worktreeRoot, name);
+        if (existing !== null && isLive(existing)) {
+          if (existing.specFingerprint === procSpecFingerprint(configuredSpec)) continue;
+          persistStoppedService(record, name);
+          setTunnelDirty(syncExposures(record));
+          writeState(worktreeRoot, record);
+          await stopProcTree(existing);
+          removePidfile(worktreeRoot, name);
+        } else if (existing !== null) {
+          removePidfile(worktreeRoot, name);
+        }
+        const result = await startProc(
+          worktreeRoot,
+          configuredSpec,
+          record.env,
+          (pidfile) => mirrorPidfile(record.project, pidfile),
+        );
+        recordProc(record, result.record);
+        writeState(worktreeRoot, record);
+        if (result.error !== undefined) throw result.error;
       }
+
+      if (opts?.workers || configuredWorkers.length > 0) {
+        const configuredFilters = configuredWorkers.map(([name, workload]) => workload.wranglerConfig ?? name);
+        const explicitFilters = Array.isArray(opts?.workers) ? opts.workers : [];
+        await this.#upWorkers(worktreeRoot, record, {
+          ...opts,
+          workers: opts?.workers === true ? true : [...new Set([...explicitFilters, ...configuredFilters])],
+        });
+      }
+
+      applyConfiguredEndpoints(record, configuredWorkloads);
 
       record.state = "up";
       delete record.starter; // no longer provisional — services carry the slot
@@ -661,7 +1071,8 @@ export class ComposeEngine implements IsolationEngine {
 
   async run(cwd: string, spec: ProcSpec, admit?: AdmitOptions): Promise<StackRecord> {
     const { repo, repoId, branch, worktreeRoot } = await getRepoInfo(cwd);
-    const project = projectName(repo, branch, worktreeRoot);
+    await assertHestiaStateIgnored(worktreeRoot);
+    const project = projectName(repoId, repo, branch, worktreeRoot);
     let tunnelDirty = false;
 
     const admission = await this.#admit(project, repoId, repo, branch, worktreeRoot, admit);
@@ -708,10 +1119,11 @@ export class ComposeEngine implements IsolationEngine {
 
       const existing = readPidfile(worktreeRoot, spec.name);
       if (existing !== null && isLive(existing)) {
-        const sameCmd =
-          JSON.stringify(existing.argv) === JSON.stringify(spec.argv) &&
-          JSON.stringify(existing.env ?? {}) === JSON.stringify(spec.env ?? {});
+        const sameCmd = existing.specFingerprint === procSpecFingerprint(spec);
         if (sameCmd) return record; // idempotent no-op: already running this
+        persistStoppedService(record, spec.name);
+        setTunnelDirty(syncExposures(record));
+        writeState(worktreeRoot, record);
         await stopProcTree(existing); // replace: same name, different command
         removePidfile(worktreeRoot, spec.name);
       } else if (existing !== null) {
@@ -733,26 +1145,57 @@ export class ComposeEngine implements IsolationEngine {
   }
 
   async stopService(cwd: string, name: string): Promise<void> {
-    const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
+    const currentIdentity = await getRepoInfo(cwd);
+    const { repo, repoId, branch, worktreeRoot } = currentIdentity;
     let tunnel: TunnelRef | undefined;
     let tunnelDirty = false;
-    const project = readState(worktreeRoot)?.project ?? projectName(repo, branch, worktreeRoot);
+    const project = readState(worktreeRoot)?.project ?? projectName(repoId, repo, branch, worktreeRoot);
     await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
+      const record = readState(worktreeRoot);
+      if (record !== null) {
+        assertCurrentStackIdentity(record, currentIdentity);
+        if (record.services.some((service) => service.name === name && service.backend === "docker")) {
+          throw new HestiaError(
+            "backend-not-stoppable",
+            `Docker workload ${name} cannot be stopped individually; use hestia down`,
+          );
+        }
+      }
       const pf = readPidfile(worktreeRoot, name);
       if (pf !== null) {
         await stopProcTree(pf);
         removePidfile(worktreeRoot, name);
       }
-      const record = readState(worktreeRoot);
       if (record !== null) {
+        const originAuxiliaries = (record.auxiliary ?? []).filter(
+          (auxiliary) => auxiliary.originService === name,
+        );
+        for (const auxiliary of originAuxiliaries) {
+          const auxiliaryPidfile = readPidfile(worktreeRoot, auxiliary.name);
+          if (auxiliaryPidfile !== null && isLive(auxiliaryPidfile)) {
+            await stopProcTree(auxiliaryPidfile);
+          }
+          removePidfile(worktreeRoot, auxiliary.name);
+        }
+        if (originAuxiliaries.length > 0) {
+          const auxiliaryNames = new Set(originAuxiliaries.map((auxiliary) => auxiliary.name));
+          record.auxiliary = (record.auxiliary ?? []).filter(
+            (auxiliary) => !auxiliaryNames.has(auxiliary.name),
+          );
+          for (const auxiliary of originAuxiliaries) {
+            const endpointName = auxiliary.originEndpoint ?? name;
+            const endpoint = record.endpoints.find((candidate) => candidate.name === endpointName);
+            if (endpoint !== undefined) delete endpoint.publicUrl;
+            delete record.env[urlKey(endpointName)];
+          }
+        }
         // a quick tunnel going down takes its origin's public URL with it
         const stopped = record.services.find((s) => s.name === name);
         if (stopped?.originService !== undefined) {
-          const ep = record.endpoints.find(
-            (e) => e.name === stopped.originService,
-          );
+          const endpointName = stopped.originEndpoint ?? stopped.originService;
+          const ep = record.endpoints.find((e) => e.name === endpointName);
           if (ep !== undefined) delete ep.publicUrl;
-          delete record.env[urlKey(stopped.originService)];
+          delete record.env[urlKey(endpointName)];
         }
         dropService(record, name);
         tunnel = record.tunnel;
@@ -772,34 +1215,55 @@ export class ComposeEngine implements IsolationEngine {
   async addLocalRoutes(cwd: string, services: string[]): Promise<StackRecord> {
     if (services.length === 0) throw new HestiaError("usage", "Route add: at least one service is required");
     const daemon = await ensureDaemon();
-    const { worktreeRoot } = await getRepoInfo(cwd);
+    const currentIdentity = await getRepoInfo(cwd);
+    const { worktreeRoot } = currentIdentity;
     const project = readState(worktreeRoot)?.project;
     if (project === undefined) throw new HestiaError("no-stack", "Route add: no stack for this worktree");
     const record = await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
       const current = readState(worktreeRoot);
       if (current === null) throw new HestiaError("no-stack", "Route add: no stack for this worktree");
-      for (const serviceName of services) {
-        const service = current.services.find((candidate) => candidate.name === serviceName);
-        if (service?.publishedPort === undefined || service.backend === "tunnel") {
+      assertCurrentStackIdentity(current, currentIdentity);
+      const resolvedRoutes = services.map((input) => ({
+        input,
+        selection: resolveEndpointSelection(current, input),
+      }));
+      for (const { input, selection } of resolvedRoutes) {
+        if (selection.endpoint.kind !== undefined && selection.endpoint.kind !== "http") {
           throw new HestiaError(
-            "route-origin-unavailable",
-            `Route add: service "${serviceName}" is not running with a direct port`,
+            "usage",
+            `Route add requires an HTTP endpoint; ${input} is ${selection.endpoint.kind}`,
           );
         }
-        if (!await verifyStackServiceOrigin(current, service)) {
+        const service = current.services.find((candidate) => candidate.name === selection.workload);
+        const binding = service?.bindings?.find(
+          (candidate) => `${candidate.target}/${candidate.protocol}` === selection.binding,
+        );
+        const publishedPort = binding?.publishedPort ?? service?.publishedPort;
+        if (service === undefined || publishedPort === undefined || service.backend === "tunnel") {
           throw new HestiaError(
             "route-origin-unavailable",
-            `Route add: service "${serviceName}" no longer owns its recorded direct port`,
+            `Route add: endpoint "${input}" is not running with a direct port`,
+          );
+        }
+        if (!await verifyStackServiceOrigin(current, service, publishedPort)) {
+          throw new HestiaError(
+            "route-origin-unavailable",
+            `Route add: endpoint "${input}" no longer owns its recorded direct port`,
           );
         }
       }
       current.localRoutes ??= [];
-      for (const service of services) {
-        if (!current.localRoutes.some((route) => route.service === service)) {
-          current.localRoutes.push({ service });
-        }
+      for (const { selection } of resolvedRoutes) {
+        const alias = selection.endpoint.name;
+        current.disabledLocalRoutes = (current.disabledLocalRoutes ?? []).filter(
+          (route) => (route.alias ?? route.service) !== alias,
+        );
+        const intent = { service: selection.workload, selector: selection.binding, alias };
+        const existing = current.localRoutes.findIndex((route) => (route.alias ?? route.service) === alias);
+        if (existing >= 0) current.localRoutes[existing] = intent;
+        else current.localRoutes.push(intent);
       }
-      current.localRoutes.sort((left, right) => left.service.localeCompare(right.service));
+      current.localRoutes.sort((left, right) => (left.alias ?? left.service).localeCompare(right.alias ?? right.service));
       applyLocalRouteProjection(current);
       writeState(worktreeRoot, current);
       return current;
@@ -809,16 +1273,50 @@ export class ComposeEngine implements IsolationEngine {
   }
 
   async removeLocalRoutes(cwd: string, services: string[]): Promise<StackRecord> {
-    if (services.length === 0) throw new HestiaError("usage", "Route remove: at least one service is required");
-    const { worktreeRoot } = await getRepoInfo(cwd);
+    return this.resetLocalRoutes(cwd, services);
+  }
+
+  async disableLocalRoutes(cwd: string, services: string[]): Promise<StackRecord> {
+    return this.#setLocalRouteOverride(cwd, services, "disable");
+  }
+
+  async resetLocalRoutes(cwd: string, services: string[]): Promise<StackRecord> {
+    return this.#setLocalRouteOverride(cwd, services, "reset");
+  }
+
+  async #setLocalRouteOverride(
+    cwd: string,
+    services: string[],
+    mode: "disable" | "reset",
+  ): Promise<StackRecord> {
+    if (services.length === 0) throw new HestiaError("usage", `Route ${mode}: at least one endpoint is required`);
+    const currentIdentity = await getRepoInfo(cwd);
+    const { worktreeRoot } = currentIdentity;
     const project = readState(worktreeRoot)?.project;
-    if (project === undefined) throw new HestiaError("no-stack", "Route remove: no stack for this worktree");
+    if (project === undefined) throw new HestiaError("no-stack", `Route ${mode}: no stack for this worktree`);
     const record = await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
       const current = readState(worktreeRoot);
-      if (current === null) throw new HestiaError("no-stack", "Route remove: no stack for this worktree");
-      const removing = new Set(services);
-      current.localRoutes = (current.localRoutes ?? []).filter((route) => !removing.has(route.service));
+      if (current === null) throw new HestiaError("no-stack", `Route ${mode}: no stack for this worktree`);
+      assertCurrentStackIdentity(current, currentIdentity);
+      const selections = services.map((input) => resolveEndpointSelection(current, input));
+      const names = new Set(selections.map((selection) => selection.endpoint.name));
+      current.localRoutes = (current.localRoutes ?? []).filter(
+        (route) => !names.has(route.alias ?? route.service),
+      );
       if (current.localRoutes.length === 0) delete current.localRoutes;
+      current.disabledLocalRoutes = (current.disabledLocalRoutes ?? []).filter(
+        (route) => !names.has(route.alias ?? route.service),
+      );
+      if (mode === "disable") {
+        for (const selection of selections) {
+          current.disabledLocalRoutes.push({
+            service: selection.workload,
+            selector: selection.binding,
+            alias: selection.endpoint.name,
+          });
+        }
+      }
+      if (current.disabledLocalRoutes.length === 0) delete current.disabledLocalRoutes;
       applyLocalRouteProjection(current);
       if (
         current.services.length === 0 &&
@@ -836,12 +1334,25 @@ export class ComposeEngine implements IsolationEngine {
   }
 
   async down(cwd: string, opts?: DownOptions): Promise<void> {
-    const { repo, branch, worktreeRoot } = await getRepoInfo(cwd);
+    const { repo, repoId, branch, worktreeRoot } = await getRepoInfo(cwd);
     let tunnel: TunnelRef | undefined;
-    const mutationProject = readState(worktreeRoot)?.project ??
-      projectName(repo, branch, worktreeRoot);
+    let initialRecord: StackRecord | null = null;
+    try {
+      initialRecord = readState(worktreeRoot);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "state-corrupt") throw error;
+    }
+    const mutationProject = initialRecord?.project ?? projectName(repoId, repo, branch, worktreeRoot);
     await withLock(worktreeRoot, () => withLock(projectMutationRoot(mutationProject), async () => {
-      const record = readState(worktreeRoot);
+      let record: StackRecord | null = null;
+      try {
+        record = readState(worktreeRoot);
+      } catch (error) {
+        if ((error as { code?: string }).code !== "state-corrupt") throw error;
+        if (opts?.expectedStack !== undefined) {
+          throw new HestiaError("worktree-busy", "cannot verify confirmed stack identity against corrupt state");
+        }
+      }
       if (opts?.expectedStack !== undefined && !matchesExpectedStack(record, opts.expectedStack)) {
         throw new HestiaError("worktree-busy", "stack changed after down confirmation; retry");
       }
@@ -857,7 +1368,7 @@ export class ComposeEngine implements IsolationEngine {
       const composeFile = record?.composeFile ?? tryLoadConfig(worktreeRoot)?.composeFile;
       if (composeFile !== undefined) {
         const project =
-          record?.project ?? projectName(repo, branch, worktreeRoot);
+          record?.project ?? projectName(repoId, repo, branch, worktreeRoot);
         const overrideFile =
           record?.overrideFile ?? join(hestiaDir(worktreeRoot), OVERRIDE_FILE);
         if (existsSync(overrideFile)) {
@@ -876,7 +1387,7 @@ export class ComposeEngine implements IsolationEngine {
         // (procs-only `run` in a compose repo) — nothing docker-side to do.
       }
 
-      const project = record?.project ?? projectName(repo, branch, worktreeRoot);
+      const project = record?.project ?? projectName(repoId, repo, branch, worktreeRoot);
       clearState(worktreeRoot, project);
       await this.#releaseAdmission(project);
     }));
@@ -901,14 +1412,33 @@ export class ComposeEngine implements IsolationEngine {
     if (!/^[a-z0-9][a-z0-9-]{0,99}$/.test(project)) {
       throw new HestiaError("usage", `invalid project name ${JSON.stringify(project)}`);
     }
-    const record = readMirrorState(project);
+    let record: StackRecord | null = null;
+    let mirrorCorrupt = false;
+    try {
+      record = readMirrorState(project);
+    } catch (error) {
+      if ((error as { code?: string }).code !== "state-corrupt") throw error;
+      mirrorCorrupt = true;
+    }
     const teardownFromMirror = async (): Promise<void> => {
-      const fresh = readMirrorState(project);
+      let fresh: StackRecord | null = null;
+      try {
+        fresh = readMirrorState(project);
+      } catch (error) {
+        if ((error as { code?: string }).code !== "state-corrupt") throw error;
+        mirrorCorrupt = true;
+      }
+      if (mirrorCorrupt && opts?.expectedStack !== undefined) {
+        throw new HestiaError("worktree-busy", "cannot verify confirmed stack identity against corrupt state");
+      }
       if (opts?.expectedStack !== undefined && !matchesExpectedStack(fresh, opts.expectedStack)) {
         throw new HestiaError("worktree-busy", "stack changed after down confirmation; retry");
       }
-      for (const pf of listPidfiles(mirrorProcsDir(project))) {
-        await stopProcTree(pf);
+      try {
+        for (const pf of listPidfiles(mirrorProcsDir(project))) await stopProcTree(pf);
+      } catch {
+        // A corrupt pidfile is unsafe to signal. Continue with label-only
+        // Docker cleanup and remove the corrupt mirror for manual proc audit.
       }
       try {
         const rest = ["compose", "-p", project, "down", "--remove-orphans"];
@@ -971,12 +1501,23 @@ export class ComposeEngine implements IsolationEngine {
     services: string[],
     opts?: ExposeOptions,
   ): Promise<StackRecord> {
-    const { worktreeRoot } = await getRepoInfo(cwd);
+    const currentIdentity = await getRepoInfo(cwd);
+    const { worktreeRoot } = currentIdentity;
     if (services.length === 0) {
       throw new HestiaError("usage", "expose requires at least one service name");
     }
     // Mode pick: --tunnel wins, else the sticky adoption, else quick tunnels.
-    const tunnelName = opts?.tunnel ?? readState(worktreeRoot)?.tunnel?.name;
+    const existingRecord = readState(worktreeRoot);
+    if (existingRecord !== null) assertCurrentStackIdentity(existingRecord, currentIdentity);
+    const tunnelName = opts?.tunnel ?? existingRecord?.tunnel?.name;
+    if (tunnelName === undefined && opts?.keepHostHeader) {
+      throw new HestiaError(
+        "usage",
+        "--keep-host-header is not supported for quick tunnels because guarded routing requires Hestia's internal authority",
+      );
+    }
+    await ensureDaemon();
+    await this.#refreshLocalRoutes(true);
     if (tunnelName === undefined) {
       return this.#exposeQuick(worktreeRoot, services, opts);
     }
@@ -1001,22 +1542,23 @@ export class ComposeEngine implements IsolationEngine {
           "no stack in this worktree — `hestia up`/`run` something first",
         );
       }
-      // An explicit empty config blocks cloudflared's implicit load of
-      // ~/.cloudflared/config.yml — its ingress rules would silently override
-      // --url and 404 every request (verified against 2026.3.0).
-      const quickCfg = join(hestiaDir(worktreeRoot), "quick-tunnel.yml");
-      ensureDir(hestiaDir(worktreeRoot));
-      writeFileSync(quickCfg, "# empty on purpose: keeps --url in effect\n");
-
-      for (const svc of services) {
-        const target = record.services.find((s) => s.name === svc);
-        if (target?.publishedPort === undefined || target.backend === "tunnel") {
-          throw new HestiaError(
-            "service-not-found",
-            `service "${svc}" is not running with a port in this stack`,
-          );
+      for (const input of services) {
+        const selection = resolveEndpointSelection(record, input);
+        if (selection.endpoint.kind !== undefined && selection.endpoint.kind !== "http") {
+          throw new HestiaError("usage", `public tunnels require an HTTP endpoint; ${input} is ${selection.endpoint.kind}`);
         }
-        const name = `tunnel-${svc}`;
+        const alias = selection.endpoint.alias ?? selection.endpoint.name;
+        const authority = internalEndpointAuthority(record.project, alias);
+        const name = `aux-quick-${createHash("sha256").update(alias).digest("hex").slice(0, 10)}`;
+        const quickCfg = join(hestiaDir(worktreeRoot), `quick-${name}.yml`);
+        // A hostname-less ingress entry matches every request and is therefore
+        // cloudflared's required terminal catch-all. It must remain the only
+        // rule; appending `http_status:404` would make this catch-all non-final.
+        writeAtomicTextFile(
+          quickCfg,
+          `ingress:\n  - service: ${JSON.stringify(`unix:${publicGatewaySocketPath()}`)}\n` +
+            `    originRequest:\n      httpHostHeader: ${JSON.stringify(authority)}\n`,
+        );
         const argv = [
           "cloudflared",
           "tunnel",
@@ -1028,14 +1570,22 @@ export class ComposeEngine implements IsolationEngine {
           "5s",
           "--no-autoupdate",
           "--url",
-          `http://127.0.0.1:${target.publishedPort}`,
+          "http://127.0.0.1:1",
         ];
         const existing = readPidfile(worktreeRoot, name);
         let metricsPort: number | undefined;
         if (
           existing !== null &&
           isLive(existing) &&
-          JSON.stringify(existing.argv) === JSON.stringify(argv)
+          existing.specFingerprint === procSpecFingerprint({
+            name,
+            argv,
+            port: "auto",
+            backend: "tunnel",
+            originService: selection.workload,
+            originEndpoint: alias,
+            readyTimeoutMs: opts?.readyTimeoutMs,
+          })
         ) {
           metricsPort = existing.port; // idempotent: same origin, still live
         } else {
@@ -1050,14 +1600,15 @@ export class ComposeEngine implements IsolationEngine {
               argv,
               port: "auto",
               backend: "tunnel",
-              originService: svc,
+              originService: selection.workload,
+              originEndpoint: alias,
               readyTimeoutMs: opts?.readyTimeoutMs,
             },
             record.env,
             (pf) => mirrorPidfile(record.project, pf),
           );
           // metrics port only — never a public surface, so no recordProc
-          upsertService(record, result.record);
+          upsertAuxiliary(record, result.record);
           metricsPort = result.record.publishedPort;
           if (result.error !== undefined) {
             writeState(worktreeRoot, record);
@@ -1072,21 +1623,25 @@ export class ComposeEngine implements IsolationEngine {
           writeState(worktreeRoot, record);
           throw new HestiaError(
             "tunnel-ready-timeout",
-            `quick tunnel for "${svc}" reported no URL in time (offline?) — ` +
+            `quick tunnel for "${alias}" reported no URL in time (offline?) — ` +
               `left running, logs: .hestia/logs/${name}.log`,
           );
         }
-        const ep = record.endpoints.find((e) => e.name === svc);
+        const ep = record.endpoints.find((endpoint) => endpoint.name === selection.endpoint.name);
         if (ep !== undefined) ep.publicUrl = url;
         else {
           setEndpoint(record, {
-            name: svc,
+            name: alias,
+            alias,
+            workload: selection.workload,
+            binding: selection.binding,
+            kind: "http",
             host: "127.0.0.1",
-            port: target.publishedPort,
+            port: selection.endpoint.port,
             publicUrl: url,
           });
         }
-        record.env[urlKey(svc)] = url;
+        record.env[urlKey(alias)] = url;
       }
       writeState(worktreeRoot, record);
       return record;
@@ -1123,21 +1678,38 @@ export class ComposeEngine implements IsolationEngine {
       );
     }
 
-    const newHostnames: string[] = [];
+    const preflightRecord = readState(worktreeRoot);
+    if (preflightRecord === null) {
+      throw new HestiaError("service-not-found", "stack disappeared while preparing exposure");
+    }
+    const baseRules = importBaseRules(adopted.uuid, tunnelName);
+    const zone = opts?.zone ?? preflightRecord.tunnel?.zone ?? inferZone(baseRules);
+    if (zone === undefined) {
+      throw new HestiaError("usage", "cannot infer a zone from the tunnel's existing rules — pass --zone");
+    }
+    const preparedHostnames = new Map<string, { hostname: string; alias: string; workload: string; binding: string }>();
+    for (const input of services) {
+      const selection = resolveEndpointSelection(preflightRecord, input);
+      if (selection.endpoint.kind !== undefined && selection.endpoint.kind !== "http") {
+        throw new HestiaError("usage", `public tunnels require an HTTP endpoint; ${input} is ${selection.endpoint.kind}`);
+      }
+      const alias = selection.endpoint.alias ?? selection.endpoint.name;
+      const hostname = hostnameFor(tunnelName, preflightRecord.branch, alias, zone);
+      await assertNamedTunnelDns(hostname, adopted.uuid);
+      preparedHostnames.set(input, {
+        hostname,
+        alias,
+        workload: selection.workload,
+        binding: selection.binding,
+      });
+    }
+
     await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
       const record = readState(worktreeRoot);
       if (record === null) {
         throw new HestiaError(
           "service-not-found",
           "no stack in this worktree — `hestia up`/`run` something first",
-        );
-      }
-      const base = importBaseRules(adopted.uuid, tunnelName);
-      const zone = opts?.zone ?? record.tunnel?.zone ?? inferZone(base);
-      if (zone === undefined) {
-        throw new HestiaError(
-          "usage",
-          "cannot infer a zone from the tunnel's existing rules — pass --zone",
         );
       }
       const t: TunnelRef =
@@ -1155,39 +1727,32 @@ export class ComposeEngine implements IsolationEngine {
       t.credFile = adopted.credFile;
       record.tunnel = t;
 
-      for (const svc of services) {
-        const target = record.services.find((s) => s.name === svc);
-        if (target?.publishedPort === undefined || target.backend === "tunnel") {
-          throw new HestiaError(
-            "service-not-found",
-            `service "${svc}" is not running with a port in this stack`,
-          );
-        }
-        const hostname = hostnameFor(tunnelName, record.branch, svc, zone);
-        const exp = t.exposures.find((e) => e.service === svc);
+      for (const input of services) {
+        const prepared = preparedHostnames.get(input)!;
+        const selection = resolveEndpointSelection(record, input);
+        const exp = t.exposures.find((candidate) =>
+          (candidate.alias ?? candidate.service) === prepared.alias);
         if (exp !== undefined) {
-          exp.hostname = hostname;
-          exp.originPort = target.publishedPort;
+          exp.service = prepared.workload;
+          exp.alias = prepared.alias;
+          exp.binding = prepared.binding;
+          exp.hostname = prepared.hostname;
+          exp.originPort = selection.endpoint.port;
           exp.keepHostHeader = opts?.keepHostHeader;
         } else {
           t.exposures.push({
-            service: svc,
-            hostname,
-            originPort: target.publishedPort,
+            service: prepared.workload,
+            alias: prepared.alias,
+            binding: prepared.binding,
+            hostname: prepared.hostname,
+            originPort: selection.endpoint.port,
             keepHostHeader: opts?.keepHostHeader,
           });
         }
-        if (!ledgerHas(adopted.uuid, hostname)) newHostnames.push(hostname);
       }
-      // exposure intent is on disk (and mirrored) before any account mutation
+      // DNS was verified before intent publication; Hestia never mutates DNS.
       writeState(worktreeRoot, record);
     }));
-
-    // DNS — network, no locks; ledger makes re-runs no-ops
-    for (const hostname of newHostnames) {
-      await routeDns(adopted.uuid, hostname, opts?.overwriteDns ?? false);
-      ledgerAdd(adopted.uuid, hostname);
-    }
 
     const outcome = await reconcileTunnel(
       { name: tunnelName, uuid: adopted.uuid, credFile: adopted.credFile },
@@ -1205,17 +1770,22 @@ export class ComposeEngine implements IsolationEngine {
       }
       for (const exp of record.tunnel?.exposures ?? []) {
         const url = `https://${exp.hostname}`;
-        const ep = record.endpoints.find((e) => e.name === exp.service);
+        const alias = exp.alias ?? exp.service;
+        const ep = record.endpoints.find((endpoint) => endpoint.name === alias);
         if (ep !== undefined) ep.publicUrl = url;
         else {
           setEndpoint(record, {
-            name: exp.service,
+            name: alias,
+            alias,
+            workload: exp.service,
+            binding: exp.binding,
+            kind: "http",
             host: "127.0.0.1",
             port: exp.originPort,
             publicUrl: url,
           });
         }
-        record.env[urlKey(exp.service)] = url;
+        record.env[urlKey(alias)] = url;
       }
       writeState(worktreeRoot, record);
       return record;
@@ -1270,8 +1840,9 @@ export class ComposeEngine implements IsolationEngine {
     }
 
     // procs: live (pid + verbatim start-time) and still owning their port
-    for (const svc of record.services) {
+    for (const svc of [...record.services, ...(record.auxiliary ?? [])]) {
       if (svc.backend === "docker") continue;
+      const auxiliary = record.auxiliary?.includes(svc) ?? false;
       if (
         svc.pid === undefined ||
         !isLive({ pid: svc.pid, startTime: svc.startTime ?? "" })
@@ -1279,7 +1850,7 @@ export class ComposeEngine implements IsolationEngine {
         svc.state = "exited";
         continue;
       }
-      anyUp = true;
+      if (!auxiliary) anyUp = true;
       if (svc.publishedPort !== undefined) {
         try {
           const view = await inspectPort(svc.pid, svc.publishedPort);
@@ -1298,12 +1869,13 @@ export class ComposeEngine implements IsolationEngine {
         svc.originService !== undefined &&
         svc.state === "healthy" &&
         svc.publishedPort !== undefined &&
-        record.env[urlKey(svc.originService)] === undefined
+        record.env[urlKey(svc.originEndpoint ?? svc.originService)] === undefined
       ) {
         const url = await quickTunnelUrl(svc.publishedPort, 1_000);
         if (url !== null) {
-          record.env[urlKey(svc.originService)] = url;
-          const ep = record.endpoints.find((e) => e.name === svc.originService);
+          const endpointName = svc.originEndpoint ?? svc.originService;
+          record.env[urlKey(endpointName)] = url;
+          const ep = record.endpoints.find((e) => e.name === endpointName);
           if (ep !== undefined) ep.publicUrl = url;
         }
       }
@@ -1318,7 +1890,9 @@ export class ComposeEngine implements IsolationEngine {
         // misdelivery hazard — report it, don't hide it behind /ready
         const portsCurrent = record.tunnel.exposures.every((exp) => {
           const svc = record.services.find((s) => s.name === exp.service);
-          return svc?.publishedPort === exp.originPort;
+          const binding = svc?.bindings?.find((candidate) =>
+            `${candidate.target}/${candidate.protocol}` === exp.binding);
+          return (binding?.publishedPort ?? svc?.publishedPort) === exp.originPort;
         });
         const ready =
           pf.port !== undefined ? await isReady(pf.port) : false;

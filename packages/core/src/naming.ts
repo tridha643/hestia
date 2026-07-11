@@ -17,7 +17,7 @@ export function slug(input: string): string {
   return s;
 }
 
-function shortHash(worktreePath: string, branch: string): string {
+function routeHash(worktreePath: string, branch: string): string {
   return createHash("sha256")
     .update(`${worktreePath}\0${branch}`)
     .digest("hex")
@@ -43,18 +43,19 @@ export function localRouteLabels(
   const repoLabel = repoFull.slice(0, REPO_MAX);
   let branchLabel = branchFull.slice(0, BRANCH_MAX);
   if (repoLabel !== repoFull || branchLabel !== branchFull) {
-    branchLabel = `${branchLabel}-${shortHash(worktreePath, branch)}`;
+    branchLabel = `${branchLabel}-${routeHash(worktreePath, branch)}`;
   }
   return { service: dnsServiceLabel(service), branch: branchLabel, repo: repoLabel };
 }
 
 /**
- * Deterministic compose project name = slug(repo)-slug(branch), each length
- * capped. If either side had to be truncated the result is ambiguous, so we
- * append a 6-hex hash of (worktreePath, branch) to keep it collision-free and
- * stable across re-`up` of the same worktree.
+ * Collision-safe compose project identity. The readable prefix is bounded,
+ * while the hash always covers the exact repository identity, branch, and
+ * canonical worktree path. Always hashing is intentional: distinct clones,
+ * normalized branch slugs, and short names must not collide either.
  */
 export function projectName(
+  repoId: string,
   repo: string,
   branch: string,
   worktreePath: string,
@@ -63,9 +64,15 @@ export function projectName(
   const branchFull = slug(branch);
   const repoPart = repoFull.slice(0, REPO_MAX);
   const branchPart = branchFull.slice(0, BRANCH_MAX);
-  const truncated = repoPart !== repoFull || branchPart !== branchFull;
-  const base = `${repoPart}-${branchPart}`;
-  return truncated ? `${base}-${shortHash(worktreePath, branch)}` : base;
+  const hash = createHash("sha256")
+    .update(repoId)
+    .update("\0")
+    .update(branch)
+    .update("\0")
+    .update(worktreePath)
+    .digest("hex")
+    .slice(0, 10);
+  return `${repoPart}-${branchPart}-${hash}`;
 }
 
 export const LABELS = {
