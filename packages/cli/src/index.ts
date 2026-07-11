@@ -215,6 +215,10 @@ usage:
         stream docker and supervised-process logs (default: all services,
         last 50 lines). --json emits one LogLine JSON object per line;
         --project reads the mirror and works after worktree deletion
+  hestia tui
+        open the interactive, repo-scoped Fleet cockpit. Shows only stacks
+        currently managed by hestia; the only mutation is confirmed down,
+        which always retains named volumes
 `;
 
 async function main(): Promise<void> {
@@ -393,6 +397,15 @@ async function main(): Promise<void> {
           }
         }
         if (rows.some((r) => r.level === "error")) process.exit(1);
+        break;
+      }
+      case "tui": {
+        if (flags.json) fail("usage", "hestia tui does not support --json", true);
+        if (!process.stdin.isTTY || !process.stdout.isTTY) {
+          fail("usage", "hestia tui requires interactive stdin and stdout", false);
+        }
+        const { runFleetTui } = await import("@hestia/tui");
+        await runFleetTui(cwd);
         break;
       }
       case "daemon": {

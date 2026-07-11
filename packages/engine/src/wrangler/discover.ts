@@ -51,19 +51,36 @@ export function stripJsonc(text: string): string {
       i += 2;
       continue;
     }
-    if (c === ",") {
-      // drop if the next non-whitespace closes a container
-      let j = i + 1;
-      while (j < text.length && /\s/.test(text[j]!)) j++;
-      if (text[j] === "}" || text[j] === "]") {
-        i++;
-        continue;
-      }
-    }
     out += c;
     i++;
   }
-  return out;
+
+  // Comments must be gone before trailing-comma detection: current modem
+  // configs legitimately place explanatory comments between the final comma
+  // and closing bracket. A second string-aware pass handles that JSONC shape.
+  let json = "";
+  inString = false;
+  for (i = 0; i < out.length; i++) {
+    const c = out[i]!;
+    if (inString) {
+      json += c;
+      if (c === "\\") json += out[++i] ?? "";
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      json += c;
+      continue;
+    }
+    if (c === ",") {
+      let next = i + 1;
+      while (next < out.length && /\s/.test(out[next]!)) next++;
+      if (out[next] === "}" || out[next] === "]") continue;
+    }
+    json += c;
+  }
+  return json;
 }
 
 function parseName(configPath: string, text: string): string | null {

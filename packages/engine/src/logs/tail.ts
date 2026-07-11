@@ -5,12 +5,16 @@ import {
   statSync,
   type Stats,
 } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
+import { BoundedLogLineAccumulator, boundLogLine, type BoundedLogText } from "./log-line-bounds.ts";
 
 const BACKFILL_CHUNK_BYTES = 64 * 1024;
+const MAX_BACKFILL_SCAN_BYTES = 4 * 1024 * 1024;
+const FORWARD_CHUNK_BYTES = 64 * 1024;
 const LOG_POLL_MS = 200;
 
 export type TailEvent =
-  | { kind: "line"; text: string }
+  | { kind: "line"; text: string; truncated?: true }
   | { kind: "reset" }
   | { kind: "gone" }
   | { kind: "absent" };
@@ -30,15 +34,20 @@ function statOrNull(path: string): Stats | null {
   }
 }
 
-function readLastLinesBeforeOffset(path: string, count: number, endOffset: number): string[] {
+function readLastLineEventsBeforeOffset(
+  path: string,
+  count: number,
+  endOffset: number,
+): BoundedLogText[] {
   if (count <= 0 || endOffset <= 0) return [];
   const fd = openSync(path, "r");
   try {
     let cursor = endOffset;
     let bytes = Buffer.alloc(0);
     let newlineCount = 0;
-    while (cursor > 0 && newlineCount <= count) {
-      const length = Math.min(BACKFILL_CHUNK_BYTES, cursor);
+    const scanFloor = Math.max(0, endOffset - MAX_BACKFILL_SCAN_BYTES);
+    while (cursor > scanFloor && newlineCount <= count) {
+      const length = Math.min(BACKFILL_CHUNK_BYTES, cursor - scanFloor);
       cursor -= length;
       const chunk = Buffer.allocUnsafe(length);
       const read = readSync(fd, chunk, 0, length, cursor);
@@ -48,7 +57,7 @@ function readLastLinesBeforeOffset(path: string, count: number, endOffset: numbe
     }
     const lines = bytes.toString("utf8").split("\n");
     if (lines.at(-1) === "") lines.pop();
-    return lines.slice(-count);
+    return lines.slice(-count).map(boundLogLine);
   } finally {
     closeSync(fd);
   }
@@ -58,7 +67,7 @@ function readLastLinesBeforeOffset(path: string, count: number, endOffset: numbe
 export function readLastLines(path: string, count: number): string[] {
   const stat = statOrNull(path);
   if (stat === null) return [];
-  return readLastLinesBeforeOffset(path, count, stat.size);
+  return readLastLineEventsBeforeOffset(path, count, stat.size).map((line) => line.text);
 }
 
 function waitForLogPoll(signal?: AbortSignal): Promise<void> {
@@ -88,7 +97,8 @@ export async function* tailFile(
   let identity = statOrNull(path);
   let existed = identity !== null;
   let offset = identity?.size ?? 0;
-  let pending = "";
+  const accumulator = new BoundedLogLineAccumulator();
+  let decoder = new StringDecoder("utf8");
 
   if (identity === null) {
     yield { kind: "absent" };
@@ -96,19 +106,22 @@ export async function* tailFile(
   } else {
     // Snapshot the forward cursor first. Backfill can then finish completely
     // before follow reads anything appended after this point.
-    const backfill = readLastLinesBeforeOffset(path, tail, offset);
+    const backfill = readLastLineEventsBeforeOffset(path, tail, offset);
     if (follow && offset > 0) {
       const fd = openSync(path, "r");
       try {
         const lastByte = Buffer.allocUnsafe(1);
         readSync(fd, lastByte, 0, 1, offset - 1);
-        if (lastByte[0] !== 10) pending = backfill.pop() ?? "";
+        if (lastByte[0] !== 10) {
+          const partial = backfill.pop();
+          if (partial !== undefined) accumulator.seed(partial);
+        }
       } finally {
         closeSync(fd);
       }
     }
-    for (const text of backfill) {
-      yield { kind: "line", text };
+    for (const line of backfill) {
+      yield { kind: "line", ...line };
     }
     if (!follow) return;
   }
@@ -117,7 +130,10 @@ export async function* tailFile(
     const current = statOrNull(path);
     if (current === null) {
       if (existed) {
-        if (pending !== "") yield { kind: "line", text: pending };
+        const decoded = decoder.end();
+        if (decoded !== "") accumulator.push(decoded);
+        const pending = accumulator.flush();
+        if (pending !== null) yield { kind: "line", ...pending };
         yield { kind: "gone" };
         return;
       }
@@ -132,24 +148,27 @@ export async function* tailFile(
     } else if (!sameFile(identity, current) || current.size < offset) {
       identity = current;
       offset = 0;
-      pending = "";
+      accumulator.reset();
+      decoder = new StringDecoder("utf8");
       yield { kind: "reset" };
     }
 
     if (current.size > offset) {
-      const length = current.size - offset;
       const fd = openSync(path, "r");
       try {
-        const chunk = Buffer.allocUnsafe(length);
-        const read = readSync(fd, chunk, 0, length, offset);
-        offset += read;
-        pending += chunk.subarray(0, read).toString("utf8");
+        while (offset < current.size) {
+          const length = Math.min(FORWARD_CHUNK_BYTES, current.size - offset);
+          const chunk = Buffer.allocUnsafe(length);
+          const read = readSync(fd, chunk, 0, length, offset);
+          if (read <= 0) break;
+          offset += read;
+          for (const line of accumulator.push(decoder.write(chunk.subarray(0, read)))) {
+            yield { kind: "line", ...line };
+          }
+        }
       } finally {
         closeSync(fd);
       }
-      const lines = pending.split("\n");
-      pending = lines.pop() ?? "";
-      for (const text of lines) yield { kind: "line", text };
     }
     await waitForLogPoll(options.signal);
   }

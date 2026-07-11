@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { rmSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { SessionBroker, createSessionBrokerDaemon } from "@hunk/session-broker";
 import { serveSessionBrokerDaemon } from "@hunk/session-broker-bun";
@@ -12,9 +13,12 @@ import {
   writePidfile,
 } from "../proc/pidfile.ts";
 import { ensureDir } from "../state.ts";
+import { writeAtomicJsonFile } from "../atomic-json-file.ts";
+import { ComposeEngine } from "../index.ts";
 import { Admission, HESTIAD_PROTOCOL_VERSION, createRoutes } from "./routes.ts";
 import { SlotLedger, daemonDir } from "./slots.ts";
 import { startDuties } from "./duties.ts";
+import { FleetMonitor } from "./fleet-monitor.ts";
 
 /**
  * hestiad — the machine-global admission + supervision daemon. One instance
@@ -30,6 +34,7 @@ const PIDFILE_NAME = "hestiad";
 async function main(): Promise<void> {
   const root = daemonDir();
   ensureDir(root);
+  chmodSync(root, 0o700);
 
   const won = await withLock(root, async () => {
     const existing = readPidfile(root, PIDFILE_NAME);
@@ -50,11 +55,18 @@ async function main(): Promise<void> {
     });
     const startedAt = new Date().toISOString();
     const admission = new Admission(new SlotLedger());
+    const fleet = new FleetMonitor(admission);
+    const engine = new ComposeEngine();
+    const token = randomBytes(32).toString("hex");
     const server = serveSessionBrokerDaemon({
       daemon,
       hostname: "127.0.0.1",
       port: 0,
-      handleRequest: createRoutes(admission, startedAt),
+      handleRequest: createRoutes(admission, startedAt, {
+        token,
+        fleet,
+        logsProject: (project, options) => engine.logsProject(project, options),
+      }),
     });
 
     // Written while still holding the lock: identity first, then discovery.
@@ -69,23 +81,22 @@ async function main(): Promise<void> {
       signal: "term",
       backend: "proc",
     });
-    writeFileSync(
+    writeAtomicJsonFile(
       join(root, "daemon.json"),
-      JSON.stringify(
-        {
-          pid: process.pid,
-          port: server.port,
-          protocolVersion: HESTIAD_PROTOCOL_VERSION,
-          startedAt,
-        },
-        null,
-        2,
-      ),
+      {
+        pid: process.pid,
+        port: server.port,
+        protocolVersion: HESTIAD_PROTOCOL_VERSION,
+        startedAt,
+        token,
+      },
+      { mode: 0o600 },
     );
 
     const stopDuties = startDuties(admission);
     const shutdown = () => {
       stopDuties();
+      fleet.stop();
       removePidfile(root, PIDFILE_NAME);
       rmSync(join(root, "daemon.json"), { force: true });
       server.stop(true);

@@ -1,7 +1,21 @@
-import type { DaemonHealth, DaemonStateView } from "@hestia/core";
+import {
+  type DaemonHealth,
+  type DaemonStateView,
+  type FleetEnvelope,
+  type LogLine,
+  type LogsOptions,
+  type RepoId,
+  type StackIdentity,
+} from "@hestia/core";
+import { readRequestTextWithLimit } from "@hunk/session-broker-core";
+import { readMirrorState } from "../state.ts";
+import { FleetMonitor } from "./fleet-monitor.ts";
 import { SlotLedger, resolveMaxStacks } from "./slots.ts";
 
-export const HESTIAD_PROTOCOL_VERSION = 1;
+export const HESTIAD_PROTOCOL_VERSION = 2;
+const MAX_JSON_BODY_BYTES = 16 * 1024;
+const MAX_LOG_STREAMS = 16;
+const MAX_LOG_TAIL = 200;
 
 export interface AcquireResult {
   granted: boolean;
@@ -15,19 +29,24 @@ interface Holder {
 }
 
 interface Waiter {
-  project: string;
+  identity: StackIdentity;
   holder: Holder;
-  resolve(r: AcquireResult): void;
+  resolve(result: AcquireResult): void;
   timer: ReturnType<typeof setTimeout>;
 }
 
-/**
- * Machine-wide admission. All occupancy math runs under a single in-process
- * mutex — two concurrent acquires must not both see "4 of 5" and both
- * reserve the fifth slot. Waiters are FIFO for FRESH slots; a waiter whose
- * project became live by another path is granted as a no-op out of order
- * (it needs no capacity, blocking it would head-of-line for nothing).
- */
+function admissionIdentity(identity: StackIdentity | string): StackIdentity {
+  if (typeof identity !== "string") return identity;
+  return {
+    project: identity,
+    repoId: "repo-0000000000000000" as RepoId,
+    repo: "legacy",
+    branch: identity,
+    worktree: `/legacy/${identity}`,
+  };
+}
+
+/** Machine-wide FIFO admission whose expensive occupancy probes never serve Fleet readers. */
 export class Admission {
   #queue: Waiter[] = [];
   #mutex: Promise<unknown> = Promise.resolve();
@@ -40,16 +59,21 @@ export class Admission {
     return next;
   }
 
-  async acquire(project: string, holder: Holder, waitMs: number): Promise<AcquireResult> {
-    const first = await this.#locked(() => this.#try(project, holder));
+  async acquire(
+    input: StackIdentity | string,
+    holder: Holder,
+    waitMs: number,
+  ): Promise<AcquireResult> {
+    const identity = admissionIdentity(input);
+    const first = await this.#locked(() => this.#try(identity, holder));
     if (first.granted || waitMs <= 0) return first;
     return new Promise<AcquireResult>((resolve) => {
       const waiter: Waiter = {
-        project,
+        identity,
         holder,
         resolve,
         timer: setTimeout(() => {
-          this.#queue = this.#queue.filter((w) => w !== waiter);
+          this.#queue = this.#queue.filter((candidate) => candidate !== waiter);
           resolve({ granted: false, live: first.live });
         }, waitMs),
       };
@@ -57,14 +81,15 @@ export class Admission {
     });
   }
 
-  /** Remove a waiter whose HTTP request went away (client abort/crash). */
-  forget(project: string, holder: Holder): void {
-    this.#queue = this.#queue.filter((w) => {
+  /** Remove a waiter whose long-polling CLI disconnected. */
+  forget(identity: StackIdentity, holder: Holder): void {
+    this.#queue = this.#queue.filter((waiter) => {
       const match =
-        w.project === project &&
-        w.holder.pid === holder.pid &&
-        w.holder.startTime === holder.startTime;
-      if (match) clearTimeout(w.timer);
+        waiter.identity.project === identity.project &&
+        waiter.identity.repoId === identity.repoId &&
+        waiter.holder.pid === holder.pid &&
+        waiter.holder.startTime === holder.startTime;
+      if (match) clearTimeout(waiter.timer);
       return !match;
     });
   }
@@ -81,84 +106,184 @@ export class Admission {
     return this.#locked(() => this.#pump());
   }
 
-  queuedProjects(): string[] {
-    return this.#queue.map((w) => w.project);
+  /** Copy queue identities synchronously without entering the occupancy mutex. */
+  queuedIdentitySnapshot(): StackIdentity[] {
+    return this.#queue.map((waiter) => ({ ...waiter.identity }));
   }
 
-  async #try(project: string, holder: Holder): Promise<AcquireResult> {
+  /** Project-only queue view retained for daemon status and compatibility. */
+  queuedProjects(): string[] {
+    return this.queuedIdentitySnapshot().map((identity) => identity.project);
+  }
+
+  async #try(identity: StackIdentity, holder: Holder): Promise<AcquireResult> {
     const { maxStacks } = resolveMaxStacks();
-    const occ = await this.ledger.occupancy();
-    if (occ.live.includes(project) || occ.reserved.includes(project)) {
-      return { granted: true, live: occ.live };
+    const occupancy = await this.ledger.occupancy();
+    if (
+      occupancy.live.includes(identity.project) ||
+      occupancy.reserved.includes(identity.project)
+    ) {
+      return { granted: true, live: occupancy.live };
     }
-    if (occ.live.length + occ.reserved.length < maxStacks) {
-      this.ledger.reserveFor(project, holder);
-      return { granted: true, live: occ.live };
+    if (occupancy.live.length + occupancy.reserved.length < maxStacks) {
+      this.ledger.reserveFor(identity, holder);
+      return { granted: true, live: occupancy.live };
     }
-    return { granted: false, live: occ.live };
+    return { granted: false, live: occupancy.live };
   }
 
   async #pump(): Promise<void> {
     if (this.#queue.length === 0) return;
     const { maxStacks } = resolveMaxStacks();
-    const occ = await this.ledger.occupancy();
-    let used = occ.live.length + occ.reserved.length;
+    const occupancy = await this.ledger.occupancy();
+    let used = occupancy.live.length + occupancy.reserved.length;
     const granted: Waiter[] = [];
-    // Pass 1: no-op grants for projects that hold capacity already.
-    // Pass 2: FIFO fresh grants while slots remain.
-    for (const w of this.#queue) {
-      if (occ.live.includes(w.project) || occ.reserved.includes(w.project)) {
-        granted.push(w);
+    for (const waiter of this.#queue) {
+      if (
+        occupancy.live.includes(waiter.identity.project) ||
+        occupancy.reserved.includes(waiter.identity.project)
+      ) {
+        granted.push(waiter);
       }
     }
-    for (const w of this.#queue) {
-      if (granted.includes(w)) continue;
-      if (used < maxStacks) {
-        this.ledger.reserveFor(w.project, w.holder);
-        used += 1;
-        granted.push(w);
-      } else break;
+    for (const waiter of this.#queue) {
+      if (granted.includes(waiter)) continue;
+      if (used >= maxStacks) break;
+      this.ledger.reserveFor(waiter.identity, waiter.holder);
+      used += 1;
+      granted.push(waiter);
     }
     if (granted.length === 0) return;
-    this.#queue = this.#queue.filter((w) => !granted.includes(w));
-    for (const w of granted) {
-      clearTimeout(w.timer);
-      w.resolve({ granted: true, live: occ.live });
+    this.#queue = this.#queue.filter((waiter) => !granted.includes(waiter));
+    for (const waiter of granted) {
+      clearTimeout(waiter.timer);
+      waiter.resolve({ granted: true, live: occupancy.live });
     }
   }
 
+  /** Legacy daemon status view; probes run outside the admission mutex. */
   async stateView(): Promise<DaemonStateView> {
-    return this.#locked(async () => {
-      const { maxStacks, warnings } = resolveMaxStacks();
-      const occ = await this.ledger.occupancy();
-      return {
-        maxStacks,
-        live: occ.live,
-        reserved: occ.reserved,
-        queued: this.queuedProjects(),
-        warnings: [...warnings, ...occ.warnings],
-      };
-    });
+    const { maxStacks, warnings } = resolveMaxStacks();
+    const occupancy = await this.ledger.occupancy();
+    return {
+      maxStacks,
+      live: occupancy.live,
+      reserved: occupancy.reserved,
+      queued: this.queuedProjects(),
+      warnings: [...warnings, ...occupancy.warnings],
+    };
   }
+}
+
+export interface DaemonRouteDependencies {
+  token: string;
+  fleet: FleetMonitor;
+  logsProject(project: string, options: LogsOptions): AsyncIterable<LogLine>;
 }
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status });
 }
 
-/**
- * hestia's routes on the broker's bun server. Runs BEFORE the broker's own
- * router (pinned in daemon-vendor.test.ts): return a Response for /hestia/*,
- * undefined for everything else so /health and the websocket path fall
- * through to the broker.
- */
+function authorized(request: Request, token: string): boolean {
+  return request.headers.get("authorization") === `Bearer ${token}`;
+}
+
+function isProject(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,99}$/.test(value);
+}
+
+function isRepoId(value: unknown): value is RepoId {
+  return typeof value === "string" && /^repo-[a-f0-9]{16}$/.test(value);
+}
+
+function isService(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+}
+
+function isStackIdentity(value: unknown): value is StackIdentity {
+  if (typeof value !== "object" || value === null) return false;
+  const identity = value as Partial<StackIdentity>;
+  return (
+    isProject(identity.project) &&
+    isRepoId(identity.repoId) &&
+    typeof identity.repo === "string" && identity.repo.length > 0 && identity.repo.length <= 256 &&
+    typeof identity.branch === "string" && identity.branch.length > 0 && identity.branch.length <= 512 &&
+    typeof identity.worktree === "string" && identity.worktree.startsWith("/") && identity.worktree.length <= 4096
+  );
+}
+
+async function parseJsonBody<T>(request: Request): Promise<T> {
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    throw new Error("content-type must be application/json");
+  }
+  const declaredLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_BODY_BYTES) {
+    throw new Error("request body exceeds 16 KiB");
+  }
+  const source = await readRequestTextWithLimit(request, MAX_JSON_BODY_BYTES);
+  return JSON.parse(source) as T;
+}
+
+function ndjsonResponse<T>(
+  request: Request,
+  createSource: (signal: AbortSignal) => AsyncIterable<T>,
+  finished?: () => void,
+): Response {
+  const encoder = new TextEncoder();
+  const controller = new AbortController();
+  let iterator: AsyncIterator<T> | undefined;
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    controller.abort();
+    request.signal.removeEventListener("abort", abort);
+    await iterator?.return?.();
+    finished?.();
+  };
+  const abort = () => void cleanup();
+  request.signal.addEventListener("abort", abort, { once: true });
+  const body = new ReadableStream<Uint8Array>({
+    async pull(streamController) {
+      try {
+        iterator ??= createSource(controller.signal)[Symbol.asyncIterator]();
+        const result = await iterator.next();
+        if (result.done) {
+          await cleanup();
+          streamController.close();
+          return;
+        }
+        streamController.enqueue(encoder.encode(`${JSON.stringify(result.value)}\n`));
+      } catch (error) {
+        await cleanup();
+        streamController.error(error);
+      }
+    },
+    async cancel() {
+      await cleanup();
+    },
+  });
+  return new Response(body, {
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-store",
+      connection: "keep-alive",
+    },
+  });
+}
+
+/** Authenticated hestiad HTTP routes layered before the vendored broker router. */
 export function createRoutes(
   admission: Admission,
   startedAt: string,
+  dependencies: DaemonRouteDependencies,
 ): (request: Request) => Promise<Response | undefined> | Response | undefined {
+  let activeLogStreams = 0;
   return async (request) => {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/hestia/")) return undefined;
+    if (!authorized(request, dependencies.token)) return json({ error: "unauthorized" }, 401);
 
     if (url.pathname === "/hestia/health" && request.method === "GET") {
       const state = await admission.stateView();
@@ -179,41 +304,79 @@ export function createRoutes(
       return json(await admission.stateView());
     }
 
+    if (url.pathname === "/hestia/fleet" && request.method === "GET") {
+      const repoId = url.searchParams.get("repoId");
+      if (!isRepoId(repoId)) return json({ error: "repoId is invalid" }, 400);
+      return ndjsonResponse<FleetEnvelope>(request, (signal) =>
+        dependencies.fleet.subscribe(repoId, signal),
+      );
+    }
+
+    if (url.pathname === "/hestia/logs" && request.method === "GET") {
+      const project = url.searchParams.get("project");
+      const service = url.searchParams.get("service");
+      const tailSource = url.searchParams.get("tail") ?? "50";
+      const tail = Number(tailSource);
+      if (!isProject(project)) return json({ error: "project is invalid" }, 400);
+      if (!isService(service)) return json({ error: "service is invalid" }, 400);
+      if (!Number.isInteger(tail) || tail < 0 || tail > MAX_LOG_TAIL) {
+        return json({ error: `tail must be an integer from 0 to ${MAX_LOG_TAIL}` }, 400);
+      }
+      const record = readMirrorState(project);
+      if (record === null) return json({ error: `no mirror for project ${project}` }, 404);
+      if (!record.services.some((candidate) => candidate.name === service)) {
+        return json({ error: `service ${service} is not in project ${project}` }, 404);
+      }
+      if (activeLogStreams >= MAX_LOG_STREAMS) {
+        return json({ error: "too many active log streams" }, 429);
+      }
+      activeLogStreams += 1;
+      return ndjsonResponse<LogLine>(
+        request,
+        (signal) => dependencies.logsProject(project, {
+          services: [service],
+          follow: true,
+          tail,
+          signal,
+        }),
+        () => { activeLogStreams -= 1; },
+      );
+    }
+
     if (url.pathname === "/hestia/acquire" && request.method === "POST") {
-      let body: { project?: string; pid?: number; startTime?: string; waitMs?: number };
+      let body: { identity?: unknown; pid?: unknown; startTime?: unknown; waitMs?: unknown };
       try {
-        body = (await request.json()) as typeof body;
-      } catch {
-        return json({ error: "expected a JSON body" }, 400);
+        body = await parseJsonBody(request);
+      } catch (error) {
+        return json({ error: `invalid JSON body: ${(error as Error).message}` }, 400);
       }
-      if (typeof body.project !== "string" || body.project === "") {
-        return json({ error: "project is required" }, 400);
-      }
+      if (!isStackIdentity(body.identity)) return json({ error: "identity is invalid" }, 400);
       const holder = {
-        pid: typeof body.pid === "number" ? body.pid : 0,
-        startTime: typeof body.startTime === "string" ? body.startTime : "",
+        pid: typeof body.pid === "number" && Number.isInteger(body.pid) ? body.pid : 0,
+        startTime: typeof body.startTime === "string" && body.startTime.length <= 128
+          ? body.startTime
+          : "",
       };
-      const waitMs = typeof body.waitMs === "number" && body.waitMs > 0 ? body.waitMs : 0;
-      // Drop the queue entry if the long-polling client goes away.
-      const onAbort = () => admission.forget(body.project!, holder);
+      const waitMs = typeof body.waitMs === "number" && Number.isFinite(body.waitMs) && body.waitMs > 0
+        ? Math.min(body.waitMs, 24 * 60 * 60 * 1_000)
+        : 0;
+      const onAbort = () => admission.forget(body.identity as StackIdentity, holder);
       request.signal.addEventListener("abort", onAbort, { once: true });
       try {
-        return json(await admission.acquire(body.project, holder, waitMs));
+        return json(await admission.acquire(body.identity, holder, waitMs));
       } finally {
         request.signal.removeEventListener("abort", onAbort);
       }
     }
 
     if (url.pathname === "/hestia/release" && request.method === "POST") {
-      let body: { project?: string };
+      let body: { project?: unknown };
       try {
-        body = (await request.json()) as typeof body;
-      } catch {
-        return json({ error: "expected a JSON body" }, 400);
+        body = await parseJsonBody(request);
+      } catch (error) {
+        return json({ error: `invalid JSON body: ${(error as Error).message}` }, 400);
       }
-      if (typeof body.project !== "string" || body.project === "") {
-        return json({ error: "project is required" }, 400);
-      }
+      if (!isProject(body.project)) return json({ error: "project is invalid" }, 400);
       await admission.release(body.project);
       return json({ ok: true });
     }

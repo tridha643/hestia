@@ -16,6 +16,18 @@ export type StackState =
   | "stopping"
   | "stopped";
 
+/** Stable identity for one physical git repository, shared by all its worktrees. */
+export type RepoId = string & { readonly __repoId: unique symbol };
+
+/** Complete repository-scoped stack identity carried through daemon admission. */
+export interface StackIdentity {
+  project: string;
+  repoId: RepoId;
+  repo: string;
+  branch: string;
+  worktree: string;
+}
+
 export interface Endpoint {
   /** Logical name, e.g. the service name. */
   name: string;
@@ -124,6 +136,8 @@ export interface StackStarter {
 export interface StackRecord {
   /** Deterministic compose project name, e.g. "modem-salem". */
   project: string;
+  /** Added in daemon protocol v2; absent only on legacy mirrors. */
+  repoId?: RepoId;
   repo: string;
   branch: string;
   worktree: string;
@@ -185,6 +199,8 @@ export interface UpOptions extends AdmitOptions {
 export interface DownOptions {
   /** Also remove named volumes (data loss). Default keeps them. */
   destroy?: boolean;
+  /** Refuse teardown if this named project has since been recreated. */
+  expectedStack?: Pick<StackRecord, "repoId" | "worktree" | "createdAt">;
 }
 
 /** hestiad `/health` view (broker health merged with hestia's capabilities). */
@@ -212,6 +228,76 @@ export interface DaemonStateView {
   warnings: string[];
 }
 
+/** Fleet-observed lifecycle, including daemon-only reservation and unknown states. */
+export type FleetStackPhase =
+  | "queued"
+  | "reserved"
+  | "starting"
+  | "up"
+  | "degraded"
+  | "stopped"
+  | "unknown";
+
+/** Sanitized endpoint data safe to expose to an authenticated local TUI. */
+export interface FleetEndpointView {
+  name: string;
+  host: string;
+  port: number;
+  url?: string;
+  publicUrl?: string;
+}
+
+/** Sanitized service observation; process identities and filesystem paths are omitted. */
+export interface FleetServiceView {
+  name: string;
+  backend: ServiceBackend;
+  state: ServiceState | "unknown";
+  publishedPort?: number;
+  endpoint?: FleetEndpointView;
+}
+
+/** One Hestia-managed stack in a repository-scoped Fleet snapshot. */
+export interface FleetStackView extends StackIdentity {
+  phase: FleetStackPhase;
+  services: FleetServiceView[];
+  createdAt?: string;
+  warning?: string;
+}
+
+/** Machine-wide cap counts shown alongside one repository's managed stacks. */
+export interface FleetCapacityView {
+  maxStacks: number;
+  live: number;
+  reserved: number;
+  queued: number;
+}
+
+/** Full-state Fleet projection; clients replace prior state rather than applying patches. */
+export interface FleetSnapshot {
+  repoId: RepoId;
+  observedAt: string;
+  capacity: FleetCapacityView;
+  stacks: FleetStackView[];
+  warnings: string[];
+}
+
+/** NDJSON full-state frame emitted when the semantic Fleet snapshot changes. */
+export interface FleetSnapshotEnvelope {
+  type: "snapshot";
+  sequence: number;
+  snapshot: FleetSnapshot;
+}
+
+/** NDJSON liveness frame emitted while a Fleet subscription is otherwise idle. */
+export interface FleetHeartbeatEnvelope {
+  type: "heartbeat";
+  sequence: number;
+  at: string;
+}
+
+/** Every frame accepted by the daemon Fleet stream. */
+export type FleetEnvelope = FleetSnapshotEnvelope | FleetHeartbeatEnvelope;
+
 /** One arrival-ordered log line; application ANSI bytes are preserved verbatim. */
 export interface LogLine {
   project: string;
@@ -221,6 +307,8 @@ export interface LogLine {
   text: string;
   /** True when Hestia synthesized this notice instead of reading application output. */
   meta?: boolean;
+  /** True when Hestia bounded an oversized source line before delivery. */
+  truncated?: boolean;
   /** Reserved for a future source timestamp; unset while ordering is arrival-only. */
   at?: string;
 }

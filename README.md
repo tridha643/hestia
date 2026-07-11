@@ -5,10 +5,10 @@ worktree's docker compose services on **ephemeral host ports** with connection
 env injected, isolated from every other worktree — so parallel agents never
 fight over ports, databases, or container names.
 
-This is the **MVP**: the docker compose backend only. Host processes (wrangler
-dev, next dev), the concurrency daemon, logs, and the TUI are later efforts
-layered on the same engine seam (see `packages/core/src/types.ts` →
-`IsolationEngine`). Full plan and roadmap: the approved plan doc.
+The shipped stack includes Docker Compose, supervised host processes
+(wrangler/next/vite), public Cloudflare ingress, the machine-wide hestiad
+capacity daemon, pull-based logs, and a repo-scoped Fleet TUI. Every surface
+drives the same `IsolationEngine` seam.
 
 **Nothing is committed to the target repo — there is one interface, zero-config.**
 `hestia up` reads the repo's existing compose file, brings up the services on
@@ -31,32 +31,42 @@ generates a compose **override** (never touching your compose file) that:
 It then reads the assigned ports back (`docker compose ps --format json`),
 surfaces them as `HESTIA_<SVC>_PORT` + `endpoints[]`, and writes state to
 `<worktree>/.hestia/stack.json` (mirrored to `~/.hestia/stacks/<project>/` so
-`down` works even if the worktree is deleted). No config file, no long-lived
-daemon.
+`down` works even if the worktree is deleted). hestiad derives live Fleet
+state from those mirrors and owns capacity admission plus authenticated log
+streaming; it never becomes the source of truth for stack liveness.
 
 ## Usage
 
 ```
-hestia up   [--services a,b] [--json]   # bring up this worktree's stack
-hestia down [--destroy]     [--json]    # tear down (--destroy also drops volumes)
-hestia status               [--json]
-hestia env                  [--json]    # HESTIA_<SVC>_PORT as export lines, or JSON
-hestia endpoint list        [--json]
+hestia up [--workers[=a,b]] [--json]    # compose + optional wrangler workers
+hestia run --name web -- <command...>   # supervised host process on a safe port
+hestia logs [service...] -f [--json]    # pull-based proc/docker stream
+hestia expose web [--tunnel tri]        # quick or adopted named public ingress
+hestia tui                              # interactive repo-scoped Fleet cockpit
+hestia down [--destroy] [--json]        # default retains named volumes
+hestia status | env | endpoint list
+hestia doctor [--json]
 ```
 
-Just run `hestia up` in a repo with a compose file; read the ports back from
-`--json` (`env.HESTIA_<SVC>_PORT` or `endpoints[]`) and wire your own URLs.
-`--services a,b` restricts to a subset of the compose services.
+`hestia tui` shows only stacks Hestia currently manages for the invoking Git
+repository. Its first release is observational except for a named,
+double-confirmed `down` action; that action always retains named volumes.
 
 ## Develop
 
 ```
 bun install
-bun test            # unit (naming, override) + docker-gated e2e isolation test
+bun test            # unit + proc/daemon/TUI PTY; Docker/Wrangler auto-gated
+bun run test:tui    # OpenTUI component + Tuistory PTY gates
 bunx tsc --noEmit   # typecheck
 ```
 
-The e2e test (`test/e2e/isolation.test.ts`) spins two real git worktrees of a
-self-contained, config-free postgres fixture, brings up both stacks, and asserts
-distinct ephemeral ports, live TCP connectivity, and isolated teardown. It skips
-cleanly when Docker is unavailable.
+The opt-in modem ship gate runs the real Postgres, ingest/slack Wrangler
+workers, Next dashboard, Fleet transport, logs, and confirmed-down behavior:
+
+```
+HESTIA_E2E_MODEM_REPO=/path/to/modem \
+HESTIA_E2E_MODEM_REF=origin/main \
+HESTIA_E2E_MODEM_ENV_FILE=/path/to/modem-e2e.env \
+bun test test/e2e/modem-tui.test.ts
+```

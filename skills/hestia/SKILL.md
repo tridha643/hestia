@@ -22,6 +22,7 @@ hestia run --name web -- pnpm dev  # supervise any dev server ($PORT injected)
 hestia env                         # export lines: HESTIA_<SVC>_PORT / _URL
 hestia endpoint list --json        # [{name, host, port, publicUrl?}, ...]
 hestia logs -f web --json          # ndjson LogLine stream (docker or proc)
+hestia tui                          # human Fleet cockpit for managed repo stacks
 hestia expose web                  # public URL (quick tunnel, rotates per run)
 hestia expose web --tunnel tri     # sticky named tunnel, stable hostname
 hestia open web /auth/login        # resolve public URL (+path), open browser
@@ -37,6 +38,10 @@ hestia doctor --json               # report-only audit; exit 1 on error rows
 - Logs: `hestia logs [service...] [-f] [--tail N] [--project P]`; the default
   is all services and 50 backfill lines. `--json` is ndjson: one `LogLine`
   (`project`, `service`, `source`, `text`, optional `meta`) per output line.
+- Fleet: `hestia tui` requires an interactive terminal and shows only stacks
+  Hestia currently manages for this Git repository. The only mutation is a
+  confirmed `down`; named volumes are always retained. Agents should continue
+  using the JSON CLI while humans use Fleet for live observation.
 - Public URLs are guarded only by obscurity — fine for webhooks/dev demos.
 - **Before deleting a worktree, run `hestia down`.** Forgot? `hestia status
   --json` in any worktree won't show it, but `hestia down --project <name>`

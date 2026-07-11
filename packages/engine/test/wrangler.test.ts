@@ -2,7 +2,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverWorkers, filterWorkers, stripJsonc } from "../src/index.ts";
+import {
+  discoverWorkers,
+  filterWorkers,
+  planWorkers,
+  stripJsonc,
+} from "../src/index.ts";
 
 let tmp: string;
 
@@ -59,6 +64,19 @@ describe("stripJsonc", () => {
     expect(parsed.brace).toBe("not // a comment, has , and }");
     expect(parsed.list).toEqual([1, 2, 3]);
   });
+
+  test("drops a trailing comma separated from its bracket by a comment", () => {
+    const source = `{
+      "name": "modem-slack",
+      "migrations": [
+        { "tag": "v3" }, // the production config explains this migration here
+      ],
+    }`;
+    expect(JSON.parse(stripJsonc(source))).toEqual({
+      name: "modem-slack",
+      migrations: [{ tag: "v3" }],
+    });
+  });
 });
 
 describe("discoverWorkers", () => {
@@ -87,5 +105,39 @@ describe("discoverWorkers", () => {
       filterWorkers(workers, root, ["modem-ingest", "apps/agent"]).length,
     ).toBe(2);
     expect(filterWorkers(workers, root, []).length).toBe(workers.length);
+  });
+});
+
+describe("planWorkers resource mode", () => {
+  test("forces ordinary bindings local", async () => {
+    const root = fixtureTree();
+    const bin = join(root, "node_modules", ".bin", "wrangler");
+    mkdirSync(join(bin, ".."), { recursive: true });
+    writeFileSync(bin, "#!/bin/sh\n");
+
+    const plan = await planWorkers(root, {
+      filter: ["modem-ingest"],
+      allowRemote: false,
+      force: true,
+      varlock: false,
+    });
+
+    expect(plan.specs[0]?.argv).toContain("--local");
+  });
+
+  test("permits declared remote bindings only after explicit opt-in", async () => {
+    const root = fixtureTree();
+    const bin = join(root, "node_modules", ".bin", "wrangler");
+    mkdirSync(join(bin, ".."), { recursive: true });
+    writeFileSync(bin, "#!/bin/sh\n");
+
+    const plan = await planWorkers(root, {
+      filter: ["modem-remote"],
+      allowRemote: true,
+      force: true,
+      varlock: false,
+    });
+
+    expect(plan.specs[0]?.argv).not.toContain("--local");
   });
 });

@@ -163,8 +163,10 @@ describe("per-worktree proc isolation (hestia run)", () => {
       expect(crash.code).toBe(1);
       expect(crash.stdout).toContain("proc-exited");
 
-      // 7. down A kills A's whole tree; B keeps serving
-      expect(runCli(wtA, ["down"]).code).toBe(0);
+      // 7. if local state disappears, project teardown falls back to the
+      //    surviving mirror instead of orphaning A's live process tree.
+      rmSync(join(wtA, ".hestia"), { recursive: true, force: true });
+      expect(runCli(tmpRoot, ["down", "--project", a.project]).code).toBe(0);
       expect(await httpJson(portA2)).toBeNull();
       expect((await httpJson(portB))?.marker).toBe("B");
 

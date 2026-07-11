@@ -9,7 +9,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StackRecord } from "@hestia/core";
-import { readLastLines, streamStackLogs, tailFile } from "../src/index.ts";
+import {
+  BoundedLogMergeQueue,
+  MAX_LOG_LINE_BYTES,
+  readLastLines,
+  streamStackLogs,
+  tailFile,
+} from "../src/index.ts";
 
 const scratchDirs: string[] = [];
 
@@ -43,6 +49,44 @@ describe("readLastLines", () => {
     expect(readLastLines(path, 1)).toEqual(["two"]);
     writeFileSync(path, "");
     expect(readLastLines(path, 5)).toEqual([]);
+  });
+
+  test("bounds huge unterminated lines and marks truncation", async () => {
+    const path = join(scratch(), "huge.log");
+    writeFileSync(path, "x".repeat(5 * 1024 * 1024));
+    const iterator = tailFile(path, { follow: false, tail: 1 });
+    const event = await iterator.next();
+    expect(event.value).toMatchObject({ kind: "line", truncated: true });
+    expect(Buffer.byteLength((event.value as { text: string }).text)).toBeLessThanOrEqual(
+      MAX_LOG_LINE_BYTES,
+    );
+  });
+});
+
+describe("BoundedLogMergeQueue", () => {
+  test("backpressures at capacity and wakes a blocked producer on consumption", async () => {
+    const queue = new BoundedLogMergeQueue(2);
+    await queue.push({ line: { project: "p", service: "s", source: "proc", text: "1" } });
+    await queue.push({ line: { project: "p", service: "s", source: "proc", text: "2" } });
+    let pushed = false;
+    const blocked = queue.push({ line: { project: "p", service: "s", source: "proc", text: "3" } })
+      .then((result) => { pushed = result; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(pushed).toBe(false);
+    await queue.next();
+    await blocked;
+    expect(pushed).toBe(true);
+    queue.close();
+  });
+
+  test("abort wakes a producer blocked behind a full queue", async () => {
+    const queue = new BoundedLogMergeQueue(1);
+    await queue.push({ done: true });
+    const controller = new AbortController();
+    const blocked = queue.push({ done: true }, controller.signal);
+    controller.abort();
+    expect(await blocked).toBe(false);
+    queue.close();
   });
 });
 

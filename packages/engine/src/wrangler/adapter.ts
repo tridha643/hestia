@@ -92,6 +92,19 @@ export interface WorkerPlanOptions {
   varlock: boolean;
 }
 
+/**
+ * Keep Wrangler resources local unless the config explicitly declares a
+ * remote binding and the caller has acknowledged it with --allow-remote.
+ * Wrangler can otherwise create remote proxies for bindings such as AI even
+ * when its general `--remote` option defaults to false.
+ */
+export function wranglerResourceModeArgs(
+  worker: Pick<WorkerConfig, "hasRemote">,
+  allowRemote: boolean,
+): string[] {
+  return worker.hasRemote && allowRemote ? [] : ["--local"];
+}
+
 /** Discover, gate, and turn wrangler configs into supervised ProcSpecs. */
 export async function planWorkers(
   worktreeRoot: string,
@@ -170,6 +183,7 @@ export async function planWorkers(
       argv: [
         bin,
         "dev",
+        ...wranglerResourceModeArgs(w, opts.allowRemote),
         "-c",
         w.configPath,
         "--port",

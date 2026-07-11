@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StackRecord } from "@hestia/core";
-import { startTimeOf } from "../src/proc/pidfile.ts";
+import { startTimeOf, writePidfile } from "../src/proc/pidfile.ts";
 import {
   DEFAULT_MAX_STACKS,
   SlotLedger,
@@ -13,6 +13,8 @@ import {
 import { Admission } from "../src/daemon/routes.ts";
 import { generatePlist } from "../src/daemon/launchd.ts";
 import { readAdopted } from "../src/tunnel/registry.ts";
+import { daemonAuthHeaders } from "../src/daemon/client.ts";
+import { daemonDir } from "../src/daemon/slots.ts";
 
 let home: string;
 const savedEnv: Record<string, string | undefined> = {};
@@ -161,6 +163,51 @@ describe("SlotLedger occupancy", () => {
     // a NEW ledger sees the same reservation — it's on disk, restart-safe
     const occ2 = await new SlotLedger(noDocker).occupancy();
     expect(occ2.reserved).toEqual(["fresh"]);
+  });
+
+  test("reservation scans remove atomic temp files instead of reviving them", () => {
+    const dir = join(home, "daemon", "reservations");
+    mkdirSync(dir, { recursive: true });
+    const temporary = join(dir, "ghost.123.random.tmp");
+    writeFileSync(temporary, JSON.stringify({ project: "ghost", ...me(), at: Date.now() }));
+    expect(new SlotLedger(noDocker).reservationSnapshot()).toEqual([]);
+    expect(() => readFileSync(temporary)).toThrow();
+  });
+});
+
+describe("daemon client authentication", () => {
+  test("attaches the bearer token only while the published daemon identity is live", () => {
+    mkdirSync(daemonDir(), { recursive: true });
+    writePidfile(daemonDir(), {
+      name: "hestiad",
+      pid: process.pid,
+      pgid: process.pid,
+      startTime: startTimeOf(process.pid) ?? "",
+      argv: [],
+      logPath: join(home, "daemon.log"),
+      signal: "term",
+      backend: "proc",
+    });
+    writeFileSync(join(daemonDir(), "daemon.json"), JSON.stringify({
+      pid: process.pid,
+      port: 41234,
+      protocolVersion: 2,
+      startedAt: new Date(0).toISOString(),
+      token: "secret-token",
+    }));
+    expect(daemonAuthHeaders(41234)).toEqual({ authorization: "Bearer secret-token" });
+
+    writePidfile(daemonDir(), {
+      name: "hestiad",
+      pid: 999_999_999,
+      pgid: 999_999_999,
+      startTime: "dead",
+      argv: [],
+      logPath: join(home, "daemon.log"),
+      signal: "term",
+      backend: "proc",
+    });
+    expect(daemonAuthHeaders(41234)).toEqual({});
   });
 });
 

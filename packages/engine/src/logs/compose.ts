@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
+import { BoundedLogLineAccumulator } from "./log-line-bounds.ts";
 
 export type ComposeLogEvent =
-  | { kind: "line"; text: string }
+  | { kind: "line"; text: string; truncated?: true }
   | { kind: "meta"; text: string };
 
 export interface ComposeLogOptions {
@@ -44,15 +45,15 @@ export async function* composeLogLines(
   options.signal?.addEventListener("abort", abort, { once: true });
 
   try {
-    let pending = "";
+    const accumulator = new BoundedLogLineAccumulator();
     child.stdout.setEncoding("utf8");
     for await (const chunk of child.stdout) {
-      pending += chunk as string;
-      const lines = pending.split("\n");
-      pending = lines.pop() ?? "";
-      for (const text of lines) yield { kind: "line", text };
+      for (const line of accumulator.push(chunk as string)) {
+        yield { kind: "line", ...line };
+      }
     }
-    if (pending !== "") yield { kind: "line", text: pending };
+    const pending = accumulator.flush();
+    if (pending !== null) yield { kind: "line", ...pending };
     const exitCode = await completion;
     if (spawnErrorMessage !== undefined) {
       yield { kind: "meta", text: `docker logs unavailable: ${spawnErrorMessage}` };

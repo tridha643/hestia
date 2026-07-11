@@ -5,12 +5,12 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { StackRecord } from "@hestia/core";
 import { procsDir, type Pidfile } from "./proc/pidfile.ts";
+import { writeAtomicJsonFile } from "./atomic-json-file.ts";
 
 const STATE_FILE = "stack.json";
 
@@ -51,11 +51,10 @@ export function ensureDir(dir: string): void {
  */
 export function writeState(worktreeRoot: string, record: StackRecord): void {
   ensureDir(hestiaDir(worktreeRoot));
-  const json = JSON.stringify(record, null, 2);
-  writeFileSync(statePath(worktreeRoot), json);
+  writeAtomicJsonFile(statePath(worktreeRoot), record);
   const mdir = mirrorDir(record.project);
   ensureDir(mdir);
-  writeFileSync(join(mdir, STATE_FILE), json);
+  writeAtomicJsonFile(join(mdir, STATE_FILE), record);
   syncMirrorPidfiles(worktreeRoot, record.project);
 }
 
@@ -78,7 +77,7 @@ export function syncMirrorPidfiles(
 export function mirrorPidfile(project: string, pf: Pidfile): void {
   const dst = mirrorProcsDir(project);
   ensureDir(dst);
-  writeFileSync(join(dst, `${pf.name}.json`), JSON.stringify(pf, null, 2));
+  writeAtomicJsonFile(join(dst, `${pf.name}.json`), pf);
 }
 
 export function readState(worktreeRoot: string): StackRecord | null {

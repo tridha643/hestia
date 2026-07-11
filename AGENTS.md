@@ -12,8 +12,9 @@ This branch (`scope-hestia-terminal-tool`) holds the **docker-compose MVP**,
 the **phase-2 proc + wrangler backend**, the **phase-3 unified-tunnel public
 ingress**, and the **phase-4 hestiad daemon** (machine-wide stack cap +
 connector supervision) with `hestia doctor` and the agent skill, plus the
-phase-5 pull-based log stream and `hestia logs`. The TUI and the portless
-localhost URL router are later efforts layered on the same
+phase-5 pull-based log stream and `hestia logs`, and the phase-6 authenticated
+Fleet transport + Hunk-modeled `hestia tui`. The portless localhost URL router
+is a later effort layered on the same
 `IsolationEngine` seam.
 
 ## Layout
@@ -48,7 +49,10 @@ localhost URL router are later efforts layered on the same
   (not on npm; see `packages/VENDORED.md` for the pinned commit and the
   no-fork rule). hestiad composes them as an external consumer would.
 - `packages/cli` — the `hestia` CLI (`up`/`run`/`expose`/`open`/`stop`/`down`/
-  `status`/`env`/`endpoint`/`logs`/`daemon`/`doctor`), `--json` on every command.
+  `status`/`env`/`endpoint`/`logs`/`tui`/`daemon`/`doctor`), `--json` on every
+  non-interactive command.
+- `packages/tui` — OpenTUI/React Fleet cockpit: daemon reconnect, responsive
+  managed-stack/service/log panes, report-only doctor, and confirmed safe down.
 - `skills/hestia/SKILL.md` — the agent skill: workflow, `--json` contract,
   error-code table with remedies, invariants agents must respect.
 - `bin/hestia` — bash launcher that execs `bun run packages/cli/src/index.ts`.
@@ -70,6 +74,10 @@ localhost URL router are later efforts layered on the same
   stop-leaves-stacks, stub-connector revival, doctor budget.
 - `test/e2e/logs.test.ts` — always-run proc logs plus docker-gated compose
   backfill/follow, including reset handling and mirror reads after deletion.
+- `test/pty/fleet-tui.test.ts` — Tuistory gate for live Fleet/log updates,
+  resize, daemon reconnect, confirmed down, and terminal restoration.
+- `test/e2e/modem-tui.test.ts` — explicit-env gated real modem Postgres +
+  Wrangler + Next Fleet acceptance; never silently skips once enabled.
 - `hestia-scope.html` / `hestia-tui.html` — scoping doc + TUI design spec.
   Reference-only; not shipped.
 
@@ -90,6 +98,7 @@ bin/hestia expose <svc...> [--tunnel <name>] [--zone <z>] [--keep-host-header]
                   [--overwrite-dns] [--force]
 bin/hestia daemon status|start|stop|install [--print]|uninstall
 bin/hestia doctor [--json]     # report-only; exit 1 only on error rows
+bin/hestia tui                 # interactive repo-scoped managed Fleet
 bin/hestia stop <name> | down [--project <name>] | status | env | endpoint list
 ```
 
@@ -202,6 +211,12 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
   an `AsyncIterable<LogLine>`; consumer return/abort tears down file polls and
   docker children. The old unimplementable `EngineHooks.onLog` was removed;
   stdout and stderr share one proc fd and cannot be labeled truthfully.
+- **The TUI reuses that exact pull stream.** hestiad protocol v2 exposes one
+  authenticated, bounded NDJSON service stream plus full repo-scoped Fleet
+  snapshots; it never tails a second copy of application logs.
+- **Fleet means Hestia-managed mirrors only.** It never enumerates unrelated
+  stopped Git worktrees. `d` delegates to locked engine teardown and always
+  retains named volumes; volume deletion remains CLI-only via `--destroy`.
 - **All state mutations serialize on `<worktree>/.hestia/lock`** (`withLock`):
   parallel agents in one worktree are the product premise; unserialized
   read-modify-write of `stack.json` loses records. Stale locks (dead holder)
@@ -304,12 +319,10 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
 
 ## What's NOT here yet (planned)
 
-- Daemon HTTP log streaming (the CLI intentionally reads the engine seam
-  directly; the TUI phase will design the daemon transport it consumes)
 - `hestia gc` (CF-API-token DNS cleanup for stale per-branch CNAMEs)
 - Remote-managed tunnel config (would remove the connector-restart blip on
   ingress changes — reserved as an upgrade, needs an API token)
-- TUI (spec at `hestia-tui.html`)
+- Event journal, metrics, queue steering, shell/restart/expose controls in TUI
 - Portless localhost URL router (`Endpoint.reservedName` is populated but
   dormant)
 - Daemon queue persistence (FIFO order dies with a daemon restart; waiters

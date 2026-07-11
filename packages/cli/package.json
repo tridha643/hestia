@@ -6,6 +6,7 @@
   "bin": { "hestia": "./src/index.ts" },
   "dependencies": {
     "@hestia/core": "workspace:*",
-    "@hestia/engine": "workspace:*"
+    "@hestia/engine": "workspace:*",
+    "@hestia/tui": "workspace:*"
   }
 }

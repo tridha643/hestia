@@ -1,16 +1,17 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
-import { LABELS, type StackRecord } from "@hestia/core";
+import { LABELS, type StackIdentity, type StackRecord } from "@hestia/core";
 import { hestiaHome, mirrorProcsDir } from "../state.ts";
 import { isLive, listPidfiles } from "../proc/pidfile.ts";
+import { writeAtomicJsonFile } from "../atomic-json-file.ts";
 
 /**
  * Admission slots for the machine-wide stack cap. Truth is DERIVED, never
@@ -33,8 +34,10 @@ function reservationsDir(): string {
   return join(daemonDir(), "reservations");
 }
 
-interface Reservation {
+/** Persisted grant bridging daemon admission to the first stack mirror write. */
+export interface StackReservation {
   project: string;
+  identity?: StackIdentity;
   /** Holder identity — a dead holder frees the reservation before the TTL. */
   pid: number;
   startTime: string;
@@ -113,28 +116,45 @@ export class SlotLedger {
   constructor(private readonly probe: DockerProbe = dockerProbe) {}
 
   /** Record the acquiring CLI's identity so its crash frees the reservation early. */
-  reserveFor(project: string, holder: { pid: number; startTime: string }): void {
-    mkdirSync(reservationsDir(), { recursive: true });
-    const r: Reservation = { project, ...holder, at: Date.now() };
-    writeFileSync(join(reservationsDir(), project), JSON.stringify(r));
+  reserveFor(
+    identity: StackIdentity | string,
+    holder: { pid: number; startTime: string },
+  ): void {
+    const project = typeof identity === "string" ? identity : identity.project;
+    const reservation: StackReservation = {
+      project,
+      identity: typeof identity === "string" ? undefined : identity,
+      ...holder,
+      at: Date.now(),
+    };
+    mkdirSync(reservationsDir(), { recursive: true, mode: 0o700 });
+    chmodSync(reservationsDir(), 0o700);
+    writeAtomicJsonFile(join(reservationsDir(), project), reservation, { pretty: false });
   }
 
   release(project: string): void {
     rmSync(join(reservationsDir(), project), { force: true });
   }
 
-  #reservations(): Reservation[] {
+  /** Read current reservation identities without probing Docker or taking admission locks. */
+  reservationSnapshot(): StackReservation[] {
     const dir = reservationsDir();
     if (!existsSync(dir)) return [];
-    const out: Reservation[] = [];
+    const out: StackReservation[] = [];
     for (const f of readdirSync(dir)) {
+      if (f.endsWith(".tmp")) {
+        rmSync(join(dir, f), { force: true });
+        continue;
+      }
       try {
-        out.push(JSON.parse(readFileSync(join(dir, f), "utf8")) as Reservation);
+        const reservation = JSON.parse(readFileSync(join(dir, f), "utf8")) as StackReservation;
+        if (reservation.project !== f) throw new Error("reservation filename mismatch");
+        out.push(reservation);
       } catch {
         rmSync(join(dir, f), { force: true });
       }
     }
-    return out;
+    return out.sort((left, right) => left.at - right.at || left.project.localeCompare(right.project));
   }
 
   /**
@@ -143,7 +163,7 @@ export class SlotLedger {
    * died, or the TTL backstop expired.
    */
   expireStale(hasRecord: (project: string) => boolean): void {
-    for (const r of this.#reservations()) {
+    for (const r of this.reservationSnapshot()) {
       const holderDead = r.startTime !== "" && !isLive({ pid: r.pid, startTime: r.startTime });
       const expired = Date.now() - r.at > RESERVATION_TTL_MS;
       if (hasRecord(r.project) || holderDead || expired) this.release(r.project);
@@ -206,7 +226,7 @@ export class SlotLedger {
       }
     }
     this.expireStale((project) => recorded.has(project));
-    const reserved = this.#reservations()
+    const reserved = this.reservationSnapshot()
       .map((r) => r.project)
       .filter((p) => !live.includes(p));
     return { live, reserved, warnings };

@@ -3,16 +3,24 @@
   "private": true,
   "type": "module",
   "workspaces": ["packages/*"],
-  "bin": { "hestia": "./bin/hestia" },
+  "bin": {
+    "hestia": "./bin/hestia"
+  },
   "scripts": {
     "hestia": "bun run packages/cli/src/index.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "test:tui": "bun test packages/tui/test test/pty"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/react": "19.2.14",
+    "tuistory": "0.0.16",
     "typescript": "^5.9.0"
   },
   "dependencies": {
+    "@opentui/core": "0.4.3",
+    "@opentui/react": "0.4.3",
+    "react": "19.2.4",
     "yaml": "^2.6.0"
   }
 }
