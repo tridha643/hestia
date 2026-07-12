@@ -322,4 +322,129 @@ describe("hestiad admission + supervision (daemon e2e)", () => {
     },
     120_000,
   );
+
+  // ---- shared hostnames: stable URL, consent handoff, zero-restart switch ----
+
+  function gatewaySocket(): string {
+    const raw = JSON.parse(readFileSync(join(home, "daemon", "daemon.json"), "utf8")) as {
+      gatewaySocket?: string;
+    };
+    expect(raw.gatewaySocket).toBeDefined();
+    return raw.gatewaySocket!;
+  }
+
+  async function gatewayGet(hostname: string): Promise<{ status: number; body: string }> {
+    const response = await fetch(`http://${hostname}/`, {
+      unix: gatewaySocket(),
+      signal: AbortSignal.timeout(5_000),
+    });
+    return { status: response.status, body: await response.text() };
+  }
+
+  function sharedFile(): { holder?: { project: string }; queue?: Array<{ project: string; denied?: boolean }> } {
+    return JSON.parse(readFileSync(join(home, "shared", "dmn-shared.json"), "utf8"));
+  }
+
+  function projectOf(wt: string): string {
+    return (JSON.parse(runCli(wt, ["status", "--json"]).stdout) as { project: string }).project;
+  }
+
+  test(
+    "expose --shared declares + claims a stable hostname routed through the gateway",
+    async () => {
+      // restart wtC's web with a marker so routing is attributable
+      expect(runCli(wtC, ["stop", "web"]).code).toBe(0);
+      expect(
+        runCli(wtC, ["run", "--name", "web", "--env", "WORKTREE_MARKER=C", "--json", "--", "bun", "server.ts"]).code,
+      ).toBe(0);
+      const exposed = runCli(wtC, ["expose", "web", "--shared", "dmn-shared", "--tunnel", "dmntun", "--zone", "stub.test", "--json"]);
+      expect(exposed.code).toBe(0);
+      expect(sharedFile().holder?.project).toBe(projectOf(wtC));
+      // holder-independent static rule in the connector config, Host untouched
+      const config = readFileSync(join(home, "tunnel", uuid, "config.yml"), "utf8");
+      expect(config).toContain("dmn-shared.stub.test");
+      expect(config.split("dmn-shared.stub.test")[1]!.split("- hostname")[0]).not.toContain("httpHostHeader");
+      // the stable URL lands in env + endpoints[]
+      const status = JSON.parse(runCli(wtC, ["status", "--json"]).stdout) as {
+        env: Record<string, string>;
+      };
+      expect(status.env.HESTIA_WEB_URL).toBe("https://dmn-shared.stub.test");
+      // and the gateway routes it to wtC's live process
+      const got = await gatewayGet("dmn-shared.stub.test");
+      expect(got.status).toBe(200);
+      expect(JSON.parse(got.body).marker).toBe("C");
+    },
+    120_000,
+  );
+
+  test(
+    "consent handoff: deny keeps the waiter durably queued, allow switches with ZERO connector restart",
+    async () => {
+      // wtB gets an attributable web too (web2 keeps its slot occupied)
+      expect(runCli(wtB, ["stop", "web"]).code).toBe(0);
+      expect(
+        runCli(wtB, ["run", "--name", "web", "--env", "WORKTREE_MARKER=B", "--json", "--", "bun", "server.ts"]).code,
+      ).toBe(0);
+      const connectorBefore = connectorPid();
+      expect(connectorBefore).not.toBeNull();
+
+      // fail-fast claim: stable code, durable queue entry
+      const denied = runCli(wtB, ["claim", "dmn-shared", "--json"]);
+      expect(denied.code).toBe(1);
+      expect(firstError(denied.stdout)).toBe("shared-held");
+      expect(sharedFile().queue?.map((waiter) => waiter.project)).toEqual([projectOf(wtB)]);
+
+      // blocked claim re-attaches to the same durable entry
+      const waiter = Bun.spawn(
+        ["bun", CLI, "claim", "dmn-shared", "--wait", "60", "--json"],
+        { cwd: wtB, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...env } },
+      );
+      await new Promise((r) => setTimeout(r, 1_500));
+
+      // the holder sees the pending request; deny leaves it queued
+      const requests = runCli(wtC, ["share", "requests", "--json"]);
+      expect(requests.stdout).toContain(projectOf(wtB));
+      expect(runCli(wtC, ["share", "deny", "dmn-shared", "--json"]).code).toBe(0);
+      expect(sharedFile().queue?.[0]).toMatchObject({ project: projectOf(wtB), denied: true });
+      expect(sharedFile().holder?.project).toBe(projectOf(wtC));
+
+      // allow hands over: the blocked CLI returns — that IS the notification
+      expect(runCli(wtC, ["share", "allow", "dmn-shared", "--json"]).code).toBe(0);
+      expect(await waiter.exited).toBe(0);
+      expect(sharedFile().holder?.project).toBe(projectOf(wtB));
+
+      // the switch was a hestiad route-table update: same connector pid
+      expect(connectorPid()).toBe(connectorBefore);
+      const got = await gatewayGet("dmn-shared.stub.test");
+      expect(got.status).toBe(200);
+      expect(JSON.parse(got.body).marker).toBe("B");
+    },
+    120_000,
+  );
+
+  test(
+    "down auto-releases to the queue head; a fully released hostname answers 503 unclaimed",
+    async () => {
+      // wtC queues behind wtB, then wtB goes down → automatic grant
+      const waiter = Bun.spawn(
+        ["bun", CLI, "claim", "dmn-shared", "--wait", "60", "--json"],
+        { cwd: wtC, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...env } },
+      );
+      await new Promise((r) => setTimeout(r, 1_500));
+      expect(runCli(wtB, ["down"]).code).toBe(0);
+      expect(await waiter.exited).toBe(0);
+      expect(sharedFile().holder?.project).toBe(projectOf(wtC));
+      const back = await gatewayGet("dmn-shared.stub.test");
+      expect(back.status).toBe(200);
+      expect(JSON.parse(back.body).marker).toBe("C");
+
+      // explicit release with an empty queue → unclaimed, 503 with the remedy
+      expect(runCli(wtC, ["release", "dmn-shared", "--json"]).code).toBe(0);
+      expect(sharedFile().holder).toBeUndefined();
+      const unclaimed = await gatewayGet("dmn-shared.stub.test");
+      expect(unclaimed.status).toBe(503);
+      expect(unclaimed.body).toContain("hestia claim dmn-shared");
+    },
+    120_000,
+  );
 });

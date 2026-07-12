@@ -7,6 +7,7 @@ import {
   type FleetEnvelope,
   type LogLine,
   type RepoId,
+  type SharedClaimResult,
   type StackIdentity,
   STATE_SCHEMA_VERSION,
 } from "@hestia/core";
@@ -222,6 +223,64 @@ export async function releaseSlot(port: number, project: string): Promise<void> 
       method: "POST",
       headers: { "content-type": "application/json", ...daemonAuthHeaders(port) },
       body: JSON.stringify({ project }),
+      signal: AbortSignal.timeout(2_000),
+    });
+  } catch {
+    // sweep reconciles
+  }
+}
+
+/**
+ * Arbitrated shared-hostname verbs. The daemon is the single writer for
+ * holder/queue transitions; the durable record files carry the state, so a
+ * daemon restart preserves queue positions.
+ */
+export async function sharedVerb(
+  port: number,
+  verb: "claim" | "allow" | "deny" | "release" | "cancel",
+  body: { name: string; project: string; worktree?: string; waitMs?: number },
+): Promise<SharedClaimResult> {
+  const timeoutMs = (body.waitMs ?? 0) + 5_000;
+  let response: Response;
+  try {
+    response = await fetch(`http://127.0.0.1:${port}/hestia/shared/${verb}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...daemonAuthHeaders(port) },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    throw new HestiaError(
+      "daemon-unreachable",
+      `could not reach hestiad on 127.0.0.1:${port}: ${(error as Error).message}`,
+    );
+  }
+  const payload = (await response.json().catch(() => ({}))) as
+    Partial<SharedClaimResult> & { error?: string; code?: string };
+  if (!response.ok) {
+    throw new HestiaError(
+      payload.code ?? "daemon-unreachable",
+      payload.error ?? `daemon rejected shared ${verb}: HTTP ${response.status}`,
+    );
+  }
+  return {
+    granted: payload.granted === true,
+    holder: payload.holder,
+    queued: payload.queued ?? [],
+  };
+}
+
+/** Best-effort auto-release on down/stop; the sweep is the fallback. */
+export async function releaseSharedForProject(
+  port: number,
+  project: string,
+  service?: string,
+): Promise<void> {
+  try {
+    await fetch(`http://127.0.0.1:${port}/hestia/shared/release-project`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...daemonAuthHeaders(port) },
+      body: JSON.stringify({ project, service }),
       signal: AbortSignal.timeout(2_000),
     });
   } catch {

@@ -11,6 +11,30 @@ import {
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
+/**
+ * fsync the directory holding `path` so the preceding rename is itself durable.
+ * A crash after `rename` but before the parent's metadata reaches disk can
+ * otherwise resurrect the old name (or lose the file) even though the file
+ * bytes were fsync'd — the classic atomic-write gap. Best-effort: some
+ * platforms reject O_RDONLY dir fsync (EINVAL/EISDIR/EPERM), which is
+ * harmless, so failures here are swallowed rather than failing the write.
+ */
+function fsyncDir(path: string): void {
+  let fd: number;
+  try {
+    fd = openSync(dirname(path), "r");
+  } catch {
+    return;
+  }
+  try {
+    fsyncSync(fd);
+  } catch {
+    // Directory fsync unsupported on this fs — the rename already happened.
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** Publish a JSON file atomically so readers observe either the old or complete new value. */
 export function writeAtomicJsonFile(
   path: string,
@@ -37,6 +61,7 @@ export function writeAtomicJsonFile(
     rmSync(temporaryPath, { force: true });
     throw error;
   }
+  fsyncDir(path);
 }
 
 /** Atomically publish private UTF-8 text (TOML, YAML, or other generated config). */
@@ -60,4 +85,5 @@ export function writeAtomicTextFile(path: string, source: string, mode = 0o600):
     rmSync(temporaryPath, { force: true });
     throw error;
   }
+  fsyncDir(path);
 }

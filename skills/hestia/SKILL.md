@@ -130,6 +130,62 @@ Hestia owns the process; surface whatever error code comes back (most often
 `dns-route-required` on a first-time branch/worktree) instead of working
 around it by hand.
 
+## Shared hostnames (externally-pinned URLs)
+
+Decide the routing mode by who controls the external side:
+
+- **Independent ingestion** (you open the URL; the external app accepts many
+  callback URLs): keep per-branch `expose` — full isolation, no arbitration.
+- **Dependent ingestion** (the external side is pinned to ONE URL: a Slack
+  app's request URL, a third-party webhook consumer, a strict OAuth
+  allowlist): use a SHARED hostname. One stable URL, machine-owned, held by
+  exactly one worktree at a time; hestiad routes each request to the holder.
+
+```bash
+hestia expose slack --shared tri-slack --tunnel tri --json   # declare + claim
+# The URL defaults to <name>.<zone>. Point ANY FQDN you control (any zone):
+hestia expose slack --shared slk --hostname slack.acme.com --tunnel tri --json
+# Several handles can share ONE hostname, split by URL path prefix (longest wins):
+hestia expose slack  --shared slk --hostname acme.com --path /webhooks/slack --tunnel tri --json
+hestia expose stripe --shared str --hostname acme.com --path /webhooks/stripe --tunnel tri --json
+hestia claim tri-slack --wait --json    # queue durably; returns when granted
+hestia claim tri-slack --cancel --json  # leave the queue
+hestia release tri-slack --json         # hand to the next in queue
+hestia share list --json                # who holds / who waits (with full URL)
+hestia share requests --json            # pending consent requests for you
+hestia share allow tri-slack --json     # holder consents — handover now
+hestia share deny tri-slack --json      # holder declines — requester stays queued
+```
+
+The hostname is arbitrary (any subdomain on any zone you control; apex domains
+need pre-existing DNS). `--path` routes by longest prefix at segment boundaries
+(`/slack` matches `/slack/events`, never `/slackbot`); a request no path covers
+is 404, a declared-but-unclaimed path is 503. cloudflared sees one rule per
+hostname — all path splitting happens in hestiad, so adding a path to an
+existing hostname needs no connector restart.
+
+In the Fleet TUI (`hestia tui`), press **`s`** to open the shared-hostnames
+panel: it lists every declared name with its holder and durable FIFO queue
+(denied waiters marked). `j/k` select; **`c`** claims the selected name as the
+currently-selected stack; **`a`/`x`** allow/deny the head as the holder;
+**`r`** releases. It reads the same daemon state as `hestia share list`.
+
+Protocol invariants agents must respect:
+
+- Claims are **consent-based**: a held name is never stolen. `claim --wait`
+  queues; the holder decides with `share allow`/`share deny`, and `release`/
+  `down`/a crashed stack grants the queue head automatically.
+- The queue is **durable** (survives daemon restarts and CLI timeouts). Your
+  blocked `claim --wait` returning success IS the grant notification; if it
+  timed out, your position is kept — re-run `claim --wait` to re-attach.
+- While holding a shared name, check `hestia share requests` at natural
+  breakpoints and answer allow/deny — another agent may be blocked on you.
+- Holder switches are hestiad route-table updates: zero connector restarts,
+  zero DNS writes. Declaring a NEW shared hostname restarts the connector
+  once (~2-5 s public blip) and requires the same wildcard DNS as named mode.
+- `down`/`stop` of the serving workload auto-releases; re-`up` does NOT
+  auto-reclaim — claiming is always an explicit `hestia claim`.
+
 ## Post-up health sweep
 
 After every `hestia up` (and again after `expose`), run `hestia doctor --json`
@@ -204,6 +260,11 @@ workloads can. Named volumes are retained unless `--destroy` is explicit.
 | `tunnel-busy` | stop the foreign connector; do not kill processes Hestia did not start — identify via `ps aux \| grep cloudflared` + `cloudflared tunnel list`, then confirm with the human before killing anything (see "Post-up health sweep") |
 | `route-origin-unavailable` | restart the workload through Hestia |
 | `backend-not-stoppable` | use `hestia down` for Docker workloads |
+| `shared-not-found` | `hestia share list` for declared names; `expose <svc> --shared <name>` declares one |
+| `shared-held` | queued durably — `hestia claim <name> --wait` to block on the grant; ask the holder to `share allow` |
+| `shared-not-holder` | only the holding worktree may allow/deny/release; check `hestia share list` |
+| `shared-conflict` | the name or hostname is already declared differently; pick another name or release+remove the old one |
+| `shared-requires-named-tunnel` | pass `--tunnel <name>` — shared hostnames need stable DNS, quick tunnels rotate |
 
 `--json` failures are `{ "error": { "code", "message", "details"? } }`.
 `hestia logs --json` is NDJSON, one `LogLine` per line.

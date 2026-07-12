@@ -14,9 +14,11 @@ import { isLive, readPidfile, removePidfile } from "../proc/pidfile.ts";
 import { stopProcTree } from "../proc/shutdown.ts";
 import {
   type DynamicRule,
+  type SharedRule,
   generateMergedConfig,
   importBaseRules,
 } from "./ingress.ts";
+import { listSharedHostnames } from "./shared.ts";
 import { pollReady } from "./verify.ts";
 import { writeAtomicJsonFile, writeAtomicTextFile } from "../atomic-json-file.ts";
 
@@ -222,6 +224,11 @@ export async function reconcileTunnel(
           `${d.project} is not running (hostname now 404s)`,
       );
     }
+    // Shared rules are holder-independent: claims switch inside hestiad's
+    // route table, so this config — and the connector — never notices.
+    const sharedRules: SharedRule[] = listSharedHostnames()
+      .filter((record) => record.tunnelUuid === ref.uuid)
+      .map((record) => ({ name: record.name, hostname: record.hostname }));
 
     const cfgPath = configPath(ref.uuid);
     const nextConfig = generateMergedConfig({
@@ -229,6 +236,7 @@ export async function reconcileTunnel(
       credFile: ref.credFile,
       baseRules,
       dynamicRules: rules,
+      sharedRules,
     });
 
     const pf = readPidfile(dir, CONNECTOR);
@@ -243,8 +251,9 @@ export async function reconcileTunnel(
 
     // Nothing to serve and nothing imported: stop rather than run a 404-only
     // connector (first adoption with no exposures never gets here — expose
-    // writes its records before reconciling).
-    if (baseRules.length === 0 && rules.length === 0) {
+    // writes its records before reconciling). A shared hostname alone keeps
+    // the connector up: its stable URL must answer even with zero live stacks.
+    if (baseRules.length === 0 && rules.length === 0 && sharedRules.length === 0) {
       if (pf !== null) {
         await stopProcTree(pf);
         removePidfile(dir, CONNECTOR);

@@ -13,6 +13,7 @@ const snapshot: FleetSnapshot = {
   repoId,
   observedAt: new Date(0).toISOString(),
   capacity: { maxStacks: 5, live: 2, reserved: 0, queued: 0 },
+  shared: [],
   warnings: [],
   stacks: [
     {
@@ -111,6 +112,31 @@ describe("Fleet selection reducer", () => {
     });
     expect(state.selection.project).toBe("modem-beta");
     expect(state.confirmDown?.project).toBe("modem-alpha");
+  });
+});
+
+describe("shared hostname overlay reducer", () => {
+  test("open resets selection to 0; close preserves it", () => {
+    let state = createFleetUiState();
+    state = reduceFleetUiState(state, { type: "move-shared", delta: 2, count: 5 });
+    expect(state.sharedSelection).toBe(2);
+    state = reduceFleetUiState(state, { type: "shared", open: true });
+    expect(state.sharedOpen).toBeTrue();
+    expect(state.sharedSelection).toBe(0);
+    state = reduceFleetUiState(state, { type: "move-shared", delta: 1, count: 3 });
+    state = reduceFleetUiState(state, { type: "shared", open: false });
+    expect(state.sharedOpen).toBeFalse();
+    expect(state.sharedSelection).toBe(1);
+  });
+
+  test("move-shared clamps within [0, count-1] and handles an empty list", () => {
+    let state = createFleetUiState();
+    state = reduceFleetUiState(state, { type: "move-shared", delta: -5, count: 3 });
+    expect(state.sharedSelection).toBe(0);
+    state = reduceFleetUiState(state, { type: "move-shared", delta: 99, count: 3 });
+    expect(state.sharedSelection).toBe(2);
+    state = reduceFleetUiState(state, { type: "move-shared", delta: 1, count: 0 });
+    expect(state.sharedSelection).toBe(0);
   });
 });
 

@@ -19,6 +19,8 @@ export interface FleetUiState {
   unseenLines: number;
   helpOpen: boolean;
   doctorOpen: boolean;
+  sharedOpen: boolean;
+  sharedSelection: number;
   confirmDown?: FleetStackView;
   downPending: boolean;
 }
@@ -38,6 +40,8 @@ export type FleetUiAction =
   | { type: "new-lines"; count: number; maxOffset?: number }
   | { type: "help"; open: boolean }
   | { type: "doctor"; open: boolean }
+  | { type: "shared"; open: boolean }
+  | { type: "move-shared"; delta: number; count: number }
   | { type: "confirm-down"; stack?: FleetStackView }
   | { type: "down-pending"; pending: boolean };
 
@@ -53,6 +57,8 @@ export function createFleetUiState(): FleetUiState {
     unseenLines: 0,
     helpOpen: false,
     doctorOpen: false,
+    sharedOpen: false,
+    sharedSelection: 0,
     downPending: false,
   };
 }
@@ -229,6 +235,12 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
         };
     case "help": return { ...state, helpOpen: action.open };
     case "doctor": return { ...state, doctorOpen: action.open };
+    case "shared": return { ...state, sharedOpen: action.open, sharedSelection: action.open ? 0 : state.sharedSelection };
+    case "move-shared": {
+      if (action.count <= 0) return { ...state, sharedSelection: 0 };
+      const next = Math.max(0, Math.min(action.count - 1, state.sharedSelection + action.delta));
+      return { ...state, sharedSelection: next };
+    }
     case "confirm-down": return {
       ...state,
       confirmDown: action.stack,

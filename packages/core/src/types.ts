@@ -158,6 +158,71 @@ export interface TunnelRef {
   exposures: TunnelExposure[];
 }
 
+/** The stack currently holding one shared hostname (exclusive claim). */
+export interface SharedHolder {
+  project: string;
+  worktree: string;
+  /** Endpoint alias inside the holder's stack that serves the hostname. */
+  service: string;
+  at: string;
+}
+
+/**
+ * One queued claim awaiting the holder's consent (or a release). Queue
+ * entries are DURABLE — persisted inside the shared record so positions
+ * survive daemon restarts and CLI disconnects; an entry leaves the queue
+ * only by grant, explicit cancel, or its stack dying.
+ */
+export interface SharedClaimWaiter {
+  project: string;
+  worktree: string;
+  at: string;
+  /** The holder explicitly denied this waiter; it stays queued until release. */
+  denied?: boolean;
+}
+
+/**
+ * A machine-owned stable public hostname (e.g. tri-slack.modem.codes) that is
+ * claimed by at most one worktree at a time. Unlike TunnelExposure hostnames
+ * (branch-scoped, stack-owned), a shared hostname outlives every stack: its
+ * cloudflared ingress rule is static and holder switches are pure hestiad
+ * route-table updates — no connector restart, no DNS write.
+ */
+export interface SharedHostnameRecord {
+  schemaVersion?: typeof STATE_SCHEMA_VERSION;
+  /** Machine-unique opaque handle (a DNS label by grammar, but never used as
+   * one): the record's file key and the CLI's name for claim/release. */
+  name: string;
+  /** Full public hostname — any user-controlled FQDN on any zone, not derived
+   * from `name`. Multiple handles may share one hostname iff their `path`
+   * differ; the connector routes the whole hostname to hestiad regardless. */
+  hostname: string;
+  /**
+   * Optional URL path prefix this handle owns on `hostname` (normalized:
+   * leading slash, no trailing slash, e.g. `/webhooks/slack`). Absent = the
+   * whole hostname. Routing is longest-prefix at segment boundaries in the
+   * hestiad router; cloudflared never sees the path (one host → one rule).
+   */
+  path?: string;
+  /** Adopted named tunnel this hostname rides (uuid — never the name). */
+  tunnelUuid: string;
+  /** The hostname's zone (parent of its first label); default-derivation hint. */
+  zone: string;
+  /** Endpoint alias contract: claimants must expose this alias. */
+  service: string;
+  holder?: SharedHolder;
+  /** Durable consent FIFO; absent and empty are equivalent. */
+  queue?: SharedClaimWaiter[];
+  createdAt: string;
+}
+
+/** Outcome of a claim request against the daemon's consent FIFO. */
+export interface SharedClaimResult {
+  granted: boolean;
+  holder?: SharedHolder;
+  queued: SharedClaimWaiter[];
+}
+
 /**
  * Identity of the CLI process holding a stack's admission slot while its
  * first services start (provisional `state: "starting"` records). A dead
@@ -214,6 +279,19 @@ export interface ExposeOptions {
   force?: boolean;
   /** Re-point an existing DNS record hestia has no ledger memory of. */
   overwriteDns?: boolean;
+  /** Declare + claim a machine-owned shared hostname (named tunnels only). */
+  shared?: string;
+  /**
+   * Full public hostname for `--shared` — any FQDN the user controls, on any
+   * zone. Default when omitted: `<shared>.<zone>` (derived, v1 behavior).
+   */
+  hostname?: string;
+  /**
+   * URL path prefix the shared handle owns (e.g. `/webhooks/slack`). Lets
+   * several handles share ONE hostname, routed by longest prefix. Absent = the
+   * whole hostname.
+   */
+  path?: string;
   readyTimeoutMs?: number;
 }
 
@@ -324,12 +402,37 @@ export interface FleetCapacityView {
   queued: number;
 }
 
+/** One queued claim on a shared hostname, as projected into a Fleet snapshot. */
+export interface FleetSharedWaiterView {
+  project: string;
+  worktree: string;
+  denied?: boolean;
+  /** The waiter belongs to a stack in the snapshot's repository. */
+  mine: boolean;
+}
+
+/**
+ * One machine-owned shared hostname projected for the Fleet TUI: its current
+ * holder and durable FIFO queue, with `mine` flags marking rows that belong to
+ * a stack in this repository so the TUI can offer the right claim/arbitrate keys.
+ */
+export interface FleetSharedView {
+  name: string;
+  hostname: string;
+  path?: string;
+  url: string;
+  holder?: { project: string; worktree: string; mine: boolean };
+  queue: FleetSharedWaiterView[];
+}
+
 /** Full-state Fleet projection; clients replace prior state rather than applying patches. */
 export interface FleetSnapshot {
   repoId: RepoId;
   observedAt: string;
   capacity: FleetCapacityView;
   stacks: FleetStackView[];
+  /** Machine-global shared hostnames (all of them), with repo-scoped `mine` flags. */
+  shared: FleetSharedView[];
   warnings: string[];
 }
 
@@ -440,11 +543,14 @@ export class NotImplemented extends Error {
  * Tunnel: cloudflared-missing · tunnel-not-found · tunnel-auth-missing ·
  * tunnel-busy · tunnel-ready-timeout · dns-route-failed · dns-record-conflict ·
  * hostname-conflict · service-not-found.
+ * Shared hostnames: shared-not-found · shared-held · shared-conflict ·
+ * shared-not-holder · shared-requires-named-tunnel.
  * Logs: no-stack · service-not-found.
  * Daemon: stack-limit · daemon-start-failed · daemon-unreachable.
  * Router: router-setup-required · router-privilege-required ·
  * router-port-busy · router-version-unsupported · router-unreachable ·
  * route-origin-unavailable.
+ * Upgrade: upgrade-failed.
  */
 export class HestiaError extends Error {
   code: string;

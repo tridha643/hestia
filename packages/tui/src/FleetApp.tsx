@@ -41,7 +41,7 @@ export function middleTruncateWorktreePath(path: string, width: number): string 
 }
 
 function emptySnapshot(repoId: RepoId): FleetSnapshot {
-  return { repoId, observedAt: new Date(0).toISOString(), capacity: EMPTY_CAPACITY, stacks: [], warnings: [] };
+  return { repoId, observedAt: new Date(0).toISOString(), capacity: EMPTY_CAPACITY, stacks: [], shared: [], warnings: [] };
 }
 
 function isEscape(key: { name: string; sequence?: string }): boolean {
@@ -153,6 +153,7 @@ export function FleetApp({
   const [notice, setNotice] = useState("connecting to hestiad…");
   const [doctorRows, setDoctorRows] = useState<DoctorRow[]>([]);
   const [doctorRunning, setDoctorRunning] = useState(false);
+  const [sharedBusy, setSharedBusy] = useState(false);
   const lastFrameAt = useRef(Date.now());
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -298,6 +299,52 @@ export function FleetApp({
       }
       return;
     }
+    if (current.sharedOpen) {
+      key.preventDefault();
+      key.stopPropagation();
+      if (isEscape(key) || isFleetKey(key, "s")) return dispatch({ type: "shared", open: false });
+      const list = snapshot.shared;
+      if (list.length === 0) return;
+      if (key.name === "down" || isFleetKey(key, "j")) return dispatch({ type: "move-shared", delta: 1, count: list.length });
+      if (key.name === "up" || isFleetKey(key, "k")) return dispatch({ type: "move-shared", delta: -1, count: list.length });
+      const selected = list[Math.min(current.sharedSelection, list.length - 1)];
+      if (selected === undefined || sharedBusy) return;
+      const runShared = (label: string, action: Promise<void>): void => {
+        setSharedBusy(true);
+        setNotice(`${label} ${selected.name}…`);
+        void action
+          .then(() => setNotice(`${label} ${selected.name}: done`))
+          .catch((error) => setNotice(`${label} ${selected.name} failed: ${(error as Error).message}`))
+          .finally(() => setSharedBusy(false));
+      };
+      // allow/deny/release act AS the holder (must be one of this repo's stacks).
+      if (isFleetKey(key, "a") || isFleetKey(key, "x") || isFleetKey(key, "r")) {
+        if (selected.holder?.mine !== true) {
+          setNotice(`this worktree does not hold ${selected.name}`);
+          return;
+        }
+        const worktree = selected.holder.worktree;
+        if (isFleetKey(key, "a")) runShared("allowing", source.allowShared(worktree, selected.name));
+        else if (isFleetKey(key, "x")) runShared("denying", source.denyShared(worktree, selected.name));
+        else runShared("releasing", source.releaseShared(worktree, selected.name));
+        return;
+      }
+      // claim acts AS the currently-selected stack in the fleet list.
+      if (isFleetKey(key, "c")) {
+        const acting = selectedStack(snapshot, current.selection.project);
+        if (acting === undefined) {
+          setNotice("select a stack (in the fleet list) to claim as");
+          return;
+        }
+        if (selected.holder?.project === acting.project) {
+          setNotice(`${acting.project} already holds ${selected.name}`);
+          return;
+        }
+        runShared(`claiming as ${acting.project},`, source.claimShared(acting.worktree, selected.name));
+        return;
+      }
+      return;
+    }
     if (current.focus === "filter") {
       if (isEscape(key) || key.name === "return" || key.name === "enter") {
         key.preventDefault();
@@ -309,6 +356,7 @@ export function FleetApp({
 
     if (isFleetKey(key, "q")) return onQuit();
     if (isFleetKey(key, "?")) return dispatch({ type: "help", open: true });
+    if (isFleetKey(key, "s")) return dispatch({ type: "shared", open: true });
     if (isFleetKey(key, "/")) return dispatch({ type: "focus", focus: "filter" });
     if (isFleetKey(key, "0")) return dispatch({ type: "layout", layout: "auto" });
     if (isFleetKey(key, "1")) return dispatch({ type: "layout", layout: "split" });
@@ -486,7 +534,7 @@ export function FleetApp({
           <text fg={fleetTheme.text}>[ / ]  previous / next service</text>
           <text fg={fleetTheme.text}>/ filter · G follow logs · 0/1/2 layout</text>
           <text fg={fleetTheme.text}>o open · y primary · c direct · l local · p public</text>
-          <text fg={fleetTheme.text}>D doctor</text>
+          <text fg={fleetTheme.text}>D doctor · s shared hostnames (claim / allow / deny / release)</text>
           <text fg={fleetTheme.danger}>d confirmed down (named volumes retained)</text>
           <text fg={fleetTheme.muted}>Esc closes this dialog</text>
         </FleetModal>
@@ -503,6 +551,35 @@ export function FleetApp({
             <text fg={fleetTheme.warning}>{doctorOmissionSummary(doctorRows)}</text>
           ) : null}
           <text fg={fleetTheme.muted}>Esc closes this report</text>
+        </FleetModal>
+      ) : null}
+
+      {state.sharedOpen ? (
+        <FleetModal title="Shared hostnames" terminalWidth={terminal.width} terminalHeight={terminal.height}>
+          {snapshot.shared.length === 0 ? (
+            <text fg={fleetTheme.muted}>No shared hostnames declared. `hestia expose &lt;svc&gt; --shared &lt;name&gt;` creates one.</text>
+          ) : snapshot.shared.map((entry, index) => {
+            const active = index === Math.min(state.sharedSelection, snapshot.shared.length - 1);
+            const holder = entry.holder === undefined
+              ? "unclaimed"
+              : `held by ${entry.holder.project}${entry.holder.mine ? " (yours)" : ""}`;
+            return (
+              <box key={entry.name} style={{ flexDirection: "column" }}>
+                <text fg={active ? fleetTheme.accent : fleetTheme.text}>
+                  {`${active ? "▸ " : "  "}${sanitizeFleetTerminalText(entry.name)}  ${sanitizeFleetTerminalText(entry.url)}  ${holder}`}
+                </text>
+                {entry.queue.map((waiter, position) => (
+                  <text key={`${entry.name}:${waiter.project}`} fg={fleetTheme.muted}>
+                    {`      ${position + 1}. ${sanitizeFleetTerminalText(waiter.project)}${waiter.mine ? " (yours)" : ""}${waiter.denied ? " — denied, still queued" : ""}`}
+                  </text>
+                ))}
+              </box>
+            );
+          })}
+          <box style={{ height: 1 }} />
+          <text fg={fleetTheme.muted}>
+            {sharedBusy ? "working…" : "j/k select · c claim (as selected stack) · a allow · x deny · r release · Esc/s close"}
+          </text>
         </FleetModal>
       ) : null}
 

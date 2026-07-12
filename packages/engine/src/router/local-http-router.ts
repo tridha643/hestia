@@ -21,6 +21,7 @@ import {
   type HestiaMachineConfig,
 } from "./router-config.ts";
 import { reconcilePortlessAliases } from "./portless-adapter.ts";
+import { listSharedHostnames, sharedPathMatches } from "../tunnel/shared.ts";
 
 const pexec = promisify(execFile);
 const ROUTE_REFRESH_MS = 1_000;
@@ -36,6 +37,27 @@ interface LocalRouterTarget {
   project: string;
   service?: ServiceRecord;
   agent?: Agent;
+}
+
+/**
+ * One path-scoped route on a shared hostname. `path` undefined = the whole
+ * hostname. `claimed` distinguishes an unclaimed handle (503 "claim it") from a
+ * held-but-down origin (503 "unavailable"); `target` is present only when the
+ * holder resolves to a routable live service.
+ */
+interface SharedRouteEntry {
+  path?: string;
+  name: string;
+  claimed: boolean;
+  target?: LocalRouterTarget;
+}
+
+/** Pathname of a request target, query/fragment stripped, defaulting to "/". */
+function pathnameOf(target: string | undefined): string {
+  if (target === undefined || target.length === 0) return "/";
+  const cut = target.search(/[?#]/);
+  const path = cut < 0 ? target : target.slice(0, cut);
+  return path.startsWith("/") ? path : "/";
 }
 
 class OriginOwnershipError extends Error {}
@@ -240,6 +262,13 @@ export class HestiaLocalHttpRouter {
   readonly #frontServer = createNetServer((socket) => this.#acceptFrontSocket(socket));
   readonly #unixServer = createNetServer((socket) => this.#acceptFrontSocket(socket));
   #targets = new Map<string, LocalRouterTarget>();
+  /**
+   * Shared hostnames → their path-scoped routes (most-specific path first).
+   * A shared hostname is served ONLY from here, never `#targets`, so per-branch
+   * publicUrl projections can't shadow a path route. Empty list is impossible —
+   * a hostname appears only if at least one handle declares it.
+   */
+  #sharedRoutes = new Map<string, SharedRouteEntry[]>();
   #timer?: ReturnType<typeof setInterval>;
 
   async start(): Promise<number> {
@@ -362,14 +391,71 @@ export class HestiaLocalHttpRouter {
         }
       }
     }
+    // Shared hostnames are served ONLY from #sharedRoutes (path-scoped), never
+    // #targets — so a former holder's stale publicUrl projection can't shadow a
+    // path route. A hostname may carry several path-scoped handles.
+    const sharedRoutes = new Map<string, SharedRouteEntry[]>();
+    for (const shared of listSharedHostnames()) {
+      const hostname = shared.hostname.toLowerCase();
+      targets.delete(hostname);
+      const holder = shared.holder;
+      let target: LocalRouterTarget | undefined;
+      if (holder !== undefined) {
+        const stack = records.find((record) => record.project === holder.project);
+        const endpoint = stack?.endpoints.find(
+          (candidate) => (candidate.alias ?? candidate.name) === holder.service,
+        );
+        const service = stack?.services.find(
+          (candidate) => candidate.name === (endpoint?.workload ?? endpoint?.name),
+        );
+        const binding = service?.bindings?.find(
+          (candidate) => `${candidate.target}/${candidate.protocol}` === endpoint?.binding,
+        );
+        const publishedPort = binding?.publishedPort ?? service?.publishedPort;
+        const candidate: LocalRouterTarget = {
+          hostname,
+          project: holder.project,
+          // Holder without a resolvable live origin keeps a target so requests
+          // answer 503 "origin unavailable" instead of 404 — the claim is real,
+          // the stack is just down (it re-`up`s straight back into service).
+          service: service === undefined || service.backend === "tunnel" || publishedPort === undefined
+            ? undefined
+            : { ...service, publishedPort },
+        };
+        // Reuse the prior entry's target object (and its keep-alive agent) when
+        // nothing material changed, so long-lived connections aren't churned.
+        const previous = this.#sharedRoutes.get(hostname)?.find((entry) => entry.name === shared.name)?.target;
+        target = previous !== undefined && targetIdentity(previous) === targetIdentity(candidate)
+          ? previous
+          : candidate;
+      }
+      const list = sharedRoutes.get(hostname) ?? [];
+      list.push({ path: shared.path, name: shared.name, claimed: holder !== undefined, target });
+      sharedRoutes.set(hostname, list);
+    }
+    // Most-specific path first; the whole-host route (undefined) matches last.
+    for (const list of sharedRoutes.values()) {
+      list.sort((left, right) => (right.path?.length ?? -1) - (left.path?.length ?? -1));
+    }
     reconcilePortlessAliases(
       [...targets.keys()].filter((hostname) => hostname.endsWith(".localhost")),
       this.port,
     );
-    for (const [hostname, target] of this.#targets) {
-      if (targets.get(hostname) !== target) target.agent?.destroy();
+    // Destroy keep-alive agents whose target object is no longer retained in
+    // either the direct-target map or the shared-route table.
+    const retained = new Set<LocalRouterTarget>(targets.values());
+    for (const list of sharedRoutes.values()) {
+      for (const entry of list) if (entry.target !== undefined) retained.add(entry.target);
+    }
+    const priorTargets: LocalRouterTarget[] = [...this.#targets.values()];
+    for (const list of this.#sharedRoutes.values()) {
+      for (const entry of list) if (entry.target !== undefined) priorTargets.push(entry.target);
+    }
+    for (const target of priorTargets) {
+      if (!retained.has(target)) target.agent?.destroy();
     }
     this.#targets = targets;
+    this.#sharedRoutes = sharedRoutes;
   }
 
   stop(): void {
@@ -421,13 +507,45 @@ export class HestiaLocalHttpRouter {
     socket.once("error", () => internal.destroy());
   }
 
+  /**
+   * Resolve a request to its origin target, or a terminal status to send.
+   * Shared hostnames route by longest path prefix (a hostname present in
+   * `#sharedRoutes` is served ONLY from there); everything else is a direct
+   * `#targets` lookup.
+   */
+  #matchTarget(hostname: string, requestPath: string):
+    | { target: LocalRouterTarget }
+    | { status: number; message: string } {
+    const routes = this.#sharedRoutes.get(hostname);
+    if (routes !== undefined) {
+      const entry = routes.find((candidate) => sharedPathMatches(candidate.path, requestPath));
+      if (entry === undefined) return { status: 404, message: "Hestia route not found" };
+      if (!entry.claimed) {
+        return {
+          status: 503,
+          message: `Shared hostname unclaimed — run \`hestia claim ${entry.name}\` in the worktree that should receive this traffic`,
+        };
+      }
+      if (entry.target?.service?.publishedPort === undefined) {
+        return { status: 503, message: "Hestia route origin unavailable" };
+      }
+      return { target: entry.target };
+    }
+    const target = this.#targets.get(hostname);
+    if (target === undefined) return { status: 404, message: "Hestia route not found" };
+    if (target.service?.publishedPort === undefined) {
+      return { status: 503, message: "Hestia route origin unavailable" };
+    }
+    return { target };
+  }
+
   async #proxyHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const hostname = parseRouteAuthority(request.headers.host);
     if (hostname === null) return sendRouterResponse(response, 400, "Malformed Host authority");
-    const target = this.#targets.get(hostname);
-    if (target === undefined) return sendRouterResponse(response, 404, "Hestia route not found");
-    const port = target.service?.publishedPort;
-    if (port === undefined) return sendRouterResponse(response, 503, "Hestia route origin unavailable");
+    const match = this.#matchTarget(hostname, pathnameOf(request.url));
+    if ("status" in match) return sendRouterResponse(response, match.status, match.message);
+    const target = match.target;
+    const port = target.service!.publishedPort!;
     if (await verifyLocalRouterTarget(target) !== port) {
       return sendRouterResponse(response, 503, "Hestia route origin unavailable");
     }
@@ -469,13 +587,17 @@ export class HestiaLocalHttpRouter {
       socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
       return;
     }
-    const target = this.#targets.get(host);
-    const port = target?.service?.publishedPort;
-    if (target === undefined || port === undefined) {
-      socket.end(`HTTP/1.1 ${target === undefined ? "404 Not Found" : "503 Service Unavailable"}\r\n\r\n`);
+    const rawHeaderLines = header.slice(0, -4).split("\r\n");
+    // Request-target from the start line ("GET /path HTTP/1.1") for path routing.
+    const requestPath = pathnameOf(rawHeaderLines[0]?.split(" ")[1]);
+    const match = this.#matchTarget(host, requestPath);
+    if ("status" in match) {
+      const reason = match.status === 404 ? "404 Not Found" : "503 Service Unavailable";
+      socket.end(`HTTP/1.1 ${reason}\r\n\r\n`);
       return;
     }
-    const rawHeaderLines = header.slice(0, -4).split("\r\n");
+    const target = match.target;
+    const port = target.service!.publishedPort!;
     const connectionValues = rawHeaderLines.slice(1)
       .filter((line) => /^connection:/i.test(line))
       .map((line) => line.slice(line.indexOf(":") + 1));

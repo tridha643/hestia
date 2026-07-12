@@ -17,6 +17,7 @@ import { ensureDir } from "../state.ts";
 import { writeAtomicJsonFile } from "../atomic-json-file.ts";
 import { ComposeEngine } from "../index.ts";
 import { Admission, HESTIAD_PROTOCOL_VERSION, createRoutes } from "./routes.ts";
+import { SharedArbiter } from "./shared-arbiter.ts";
 import { SlotLedger, daemonDir } from "./slots.ts";
 import { startDuties } from "./duties.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
@@ -71,6 +72,8 @@ async function main(): Promise<void> {
     const engine = new ComposeEngine();
     const localRouter = new HestiaLocalHttpRouter();
     const routerPort = await localRouter.start();
+    // Holder switches take effect on the arbiter's push, not the 1s poll.
+    const shared = new SharedArbiter(() => localRouter.refreshRoutes());
     const token = randomBytes(32).toString("hex");
     const server = serveSessionBrokerDaemon({
       daemon,
@@ -81,6 +84,7 @@ async function main(): Promise<void> {
         fleet,
         routerPort,
         gatewaySocket: localRouter.socketPath,
+        shared,
         refreshLocalRoutes: () => localRouter.refreshRoutes(),
         logsProject: (project, options) => engine.logsProject(project, options),
       }),
@@ -118,7 +122,7 @@ async function main(): Promise<void> {
       { mode: 0o600 },
     );
 
-    const stopDuties = startDuties(admission);
+    const stopDuties = startDuties(admission, { shared });
     const shutdown = () => {
       stopDuties();
       fleet.stop();

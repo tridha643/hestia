@@ -17,6 +17,7 @@ function snapshot(): FleetSnapshot {
     repoId,
     observedAt: new Date().toISOString(),
     capacity: { maxStacks: 5, live: 2, reserved: 0, queued: 0 },
+    shared: [],
     warnings: [],
     stacks: [
       {
@@ -72,8 +73,17 @@ class FakeFleetSource {
     await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
   }
 
+  claims: string[] = [];
+  allows: string[] = [];
+  denies: string[] = [];
+  releases: string[] = [];
+
   diagnose() { return Promise.resolve([]); }
   down(stack: FleetStackView) { this.downs.push(stack.project); return Promise.resolve(); }
+  claimShared(worktree: string, name: string) { this.claims.push(`${worktree}:${name}`); return Promise.resolve(); }
+  allowShared(worktree: string, name: string) { this.allows.push(`${worktree}:${name}`); return Promise.resolve(); }
+  denyShared(worktree: string, name: string) { this.denies.push(`${worktree}:${name}`); return Promise.resolve(); }
+  releaseShared(worktree: string, name: string) { this.releases.push(`${worktree}:${name}`); return Promise.resolve(); }
   stop() {}
 }
 
@@ -148,6 +158,55 @@ describe("FleetApp", () => {
       await act(async () => setup.mockInput.pressEnter());
       await setup.waitForFrame((candidate) => candidate.includes("named volumes retained"));
       expect(source.downs).toEqual(["modem-alpha"]);
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test("s opens the shared overlay; claim acts as the selected stack, allow as the holder", async () => {
+    const withShared: FleetSnapshot = {
+      ...snapshot(),
+      shared: [{
+        name: "tri-slack",
+        hostname: "tri-slack.modem.codes",
+        url: "https://tri-slack.modem.codes",
+        holder: { project: "modem-beta", worktree: "/tmp/beta", mine: true },
+        queue: [],
+      }],
+    };
+    const source = new FakeFleetSource(withShared);
+    const setup = await testRender(
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
+      { width: 120, height: 28 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("dashboard ready"));
+      await act(async () => {
+        await setup.mockInput.typeText("s");
+      });
+      await setup.waitForFrame((candidate) =>
+        candidate.includes("tri-slack.modem.codes") && candidate.includes("held by modem-beta"));
+      // claim runs AS the selected stack (modem-alpha), not the holder
+      await act(async () => {
+        await setup.mockInput.typeText("c");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("claiming as modem-alpha"));
+      expect(source.claims).toEqual(["/tmp/alpha:tri-slack"]);
+      // allow runs AS the holder (modem-beta)
+      await act(async () => {
+        await setup.mockInput.typeText("a");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("allowing tri-slack"));
+      expect(source.allows).toEqual(["/tmp/beta:tri-slack"]);
+      // Esc closes the overlay
+      await act(async () => {
+        await setup.mockInput.pressKeys(["ESCAPE"], 30);
+      });
+      await setup.waitForFrame((candidate) => !candidate.includes("held by modem-beta"));
     } finally {
       await act(async () => setup.renderer.destroy());
     }

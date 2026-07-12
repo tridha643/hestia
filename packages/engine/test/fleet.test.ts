@@ -9,6 +9,7 @@ import { collectFleetSnapshot, FleetMonitor } from "../src/daemon/fleet-monitor.
 import { parseDockerFleetServices } from "../src/daemon/fleet-monitor.ts";
 import { Admission, createRoutes } from "../src/daemon/routes.ts";
 import { SlotLedger } from "../src/daemon/slots.ts";
+import { declareSharedHostname, setSharedHolder, updateSharedHostname } from "../src/tunnel/shared.ts";
 
 const roots: string[] = [];
 const repoId = "repo-1234567890abcdef" as RepoId;
@@ -63,6 +64,34 @@ describe("Fleet snapshot collection", () => {
     expect(services.get("project")?.get("db")).toBe("healthy");
     expect(services.get("project")?.get("api")).toBe("unhealthy");
     expect(services.get("project")?.get("worker")).toBe("unhealthy");
+  });
+
+  test("projects shared hostnames with repo-scoped mine flags and path url", async () => {
+    const { root, admission } = setupFleet();
+    // fixtureRecord.project === "fixture-fleet" is in THIS repo; "other-repo" is not.
+    await declareSharedHostname({
+      name: "acme", hostname: "acme.com", path: "/webhooks/slack",
+      tunnelUuid: "u", zone: "acme.com", service: "web",
+    });
+    await setSharedHolder("acme", {
+      project: "fixture-fleet", worktree: root, service: "web", at: new Date(0).toISOString(),
+    });
+    await updateSharedHostname("acme", (record) => ({
+      ...record,
+      queue: [
+        { project: "other-repo", worktree: "/wt/x", at: new Date(0).toISOString() },
+        { project: "fixture-fleet", worktree: root, at: new Date(0).toISOString(), denied: true },
+      ],
+    }));
+    const snapshot = await collectFleetSnapshot(repoId, admission);
+    const shared = snapshot.shared.find((entry) => entry.name === "acme");
+    expect(shared?.url).toBe("https://acme.com/webhooks/slack");
+    expect(shared?.path).toBe("/webhooks/slack");
+    expect(shared?.holder).toMatchObject({ project: "fixture-fleet", mine: true });
+    expect(shared?.queue.map((waiter) => ({ project: waiter.project, mine: waiter.mine, denied: waiter.denied }))).toEqual([
+      { project: "other-repo", mine: false, denied: undefined },
+      { project: "fixture-fleet", mine: true, denied: true },
+    ]);
   });
 
   test("does not count a dead empty provisional mirror as live", async () => {

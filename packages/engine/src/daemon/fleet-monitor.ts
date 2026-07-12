@@ -7,6 +7,7 @@ import {
   projectName,
   type FleetEnvelope,
   type FleetServiceView,
+  type FleetSharedView,
   type FleetSnapshot,
   type FleetStackPhase,
   type FleetStackView,
@@ -19,6 +20,7 @@ import { getRepoInfo } from "../git.ts";
 import { allListeners, processTree, type Listener } from "../proc/ports.ts";
 import { isLive, listPidfiles } from "../proc/pidfile.ts";
 import { hestiaHome, mirrorProcsDir, parseStackRecord } from "../state.ts";
+import { listSharedHostnames } from "../tunnel/shared.ts";
 import {
   effectiveLocalRouteServices,
   readHestiaMachineConfig,
@@ -248,6 +250,36 @@ function reservationIdentity(
 }
 
 /** Collect one sanitized repository Fleet snapshot with a single machine-wide Docker query. */
+/**
+ * Project every machine-global shared hostname for the Fleet TUI. `mine` marks
+ * holder/queue rows belonging to a stack in THIS repo, so the TUI knows which
+ * claim/arbitrate keys to offer. Shared names are machine-wide (few), so all
+ * are included regardless of repo — a worktree may want to claim any of them.
+ */
+function collectFleetShared(repoProjects: Set<string>): FleetSharedView[] {
+  return listSharedHostnames()
+    .map((record) => ({
+      name: record.name,
+      hostname: record.hostname,
+      ...(record.path === undefined ? {} : { path: record.path }),
+      url: `https://${record.hostname}${record.path ?? ""}`,
+      holder: record.holder === undefined
+        ? undefined
+        : {
+            project: record.holder.project,
+            worktree: record.holder.worktree,
+            mine: repoProjects.has(record.holder.project),
+          },
+      queue: (record.queue ?? []).map((waiter) => ({
+        project: waiter.project,
+        worktree: waiter.worktree,
+        ...(waiter.denied === true ? { denied: true } : {}),
+        mine: repoProjects.has(waiter.project),
+      })),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export async function collectFleetSnapshot(
   repoId: RepoId,
   admission: FleetAdmissionSource,
@@ -371,6 +403,9 @@ export async function collectFleetSnapshot(
     (reservation) => !allRecordedProjects.has(reservation.project),
   );
   const { maxStacks, warnings: capWarnings } = resolveMaxStacks();
+  const repoProjects = new Set(
+    attributed.filter((record) => record.repoId === repoId).map((record) => record.project),
+  );
   return {
     repoId,
     observedAt: new Date().toISOString(),
@@ -381,6 +416,7 @@ export async function collectFleetSnapshot(
       queued: queued.length,
     },
     stacks: stackViews,
+    shared: collectFleetShared(repoProjects),
     warnings: [...capWarnings, ...warnings].sort(),
   };
 }
@@ -390,6 +426,7 @@ function semanticFleetSnapshot(snapshot: FleetSnapshot): string {
     repoId: snapshot.repoId,
     capacity: snapshot.capacity,
     stacks: snapshot.stacks,
+    shared: snapshot.shared,
     warnings: snapshot.warnings,
   });
 }
