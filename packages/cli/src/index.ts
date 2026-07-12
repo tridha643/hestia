@@ -401,7 +401,7 @@ async function main(): Promise<void> {
     switch (cmd) {
       case "version": {
         const version = {
-          cliVersion: "1.0.0",
+          cliVersion: "1.0.1",
           stateSchema: STATE_SCHEMA_VERSION,
           daemonProtocol: HESTIAD_PROTOCOL_VERSION,
           runtime: "bun",
