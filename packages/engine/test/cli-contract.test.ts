@@ -19,7 +19,7 @@ describe("stable CLI contract", () => {
     const result = run(["version", "--json"]);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({
-      cliVersion: "1.2.0",
+      cliVersion: "1.3.0",
       stateSchema: 1,
       daemonProtocol: 5,
       runtime: "bun",

@@ -525,11 +525,11 @@ services = ["dashboard", "modem-ingest", "modem-slack"]
       await routedFetch(new URL(secondDashboardEndpoint.localUrl!).hostname, "/", true);
 
       await session.press("d");
-      await session.waitForText("Named volumes are retained", { timeout: 5_000 });
+      await session.waitForText("Removes named volumes and project-built images", { timeout: 5_000 });
       await session.press("esc");
       await waitForSnapshot(session, (frame) => !frame.includes("Confirm stack down"));
       await session.press("d");
-      await session.waitForText("Named volumes are retained", { timeout: 5_000 });
+      await session.waitForText("Removes named volumes and project-built images", { timeout: 5_000 });
       await session.press("enter");
       await waitForSnapshot(
         session,
@@ -537,12 +537,12 @@ services = ["dashboard", "modem-ingest", "modem-slack"]
         180_000,
       );
 
-      const retainedVolumes = execFileSync(
+      const remainingVolumes = execFileSync(
         "docker",
         ["volume", "ls", "-q", "--filter", `label=com.docker.compose.project=${composeA.project}`],
         { encoding: "utf8" },
       ).trim();
-      expect(retainedVolumes).not.toBe("");
+      expect(remainingVolumes).toBe("");
       await Promise.all([
         waitForHealth(worktreeB, "modem-ingest", ingestB),
         waitForHealth(worktreeB, "modem-slack", slackB),
