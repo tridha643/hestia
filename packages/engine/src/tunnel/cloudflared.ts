@@ -49,7 +49,11 @@ async function run(args: string[], timeoutMs = 30_000): Promise<string> {
 export interface TunnelListEntry {
   id: string;
   name: string;
-  /** Live connector records — non-empty means someone is running this tunnel. */
+  /**
+   * Live EDGE-CONNECTION records, flattened across connectors — one healthy
+   * connector holds ~4 of these. Non-empty means someone is running this
+   * tunnel; the length is NOT a connector count (use countConnectors).
+   */
   connections: Array<{ id?: string; origin_ip?: string; colo_name?: string }>;
 }
 
@@ -64,6 +68,17 @@ export async function listTunnels(): Promise<TunnelListEntry[]> {
       ? (t.connections as TunnelListEntry["connections"])
       : [],
   }));
+}
+
+/**
+ * Count CONNECTORS registered on a tunnel. `tunnel info -o json` nests edge
+ * connections under one `conns[]` entry per connector, so its top-level
+ * length is the replica count `tunnel list` cannot provide.
+ */
+export async function countConnectors(uuid: string): Promise<number> {
+  const out = await run(["tunnel", "info", "-o", "json", uuid]);
+  const parsed = JSON.parse(out) as { conns?: unknown };
+  return Array.isArray(parsed.conns) ? parsed.conns.length : 0;
 }
 
 /** Resolve an adopted tunnel by name; requires its credentials JSON locally. */

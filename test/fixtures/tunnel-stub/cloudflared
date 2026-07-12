@@ -6,6 +6,8 @@
  * readiness machinery runs unmodified.
  *
  *   tunnel list -o json            → cat $HESTIA_STUB_STATE/tunnels.json
+ *   tunnel info -o json <uuid>     → cat $HESTIA_STUB_STATE/info-<uuid>.json
+ *                                    (default: zero registered connectors)
  *   tunnel route dns [...]         → append argv to route.log; conflict if the
  *                                    hostname is listed in dns-existing.json
  *                                    and --overwrite-dns was not passed
@@ -35,6 +37,12 @@ if (args[0] !== "tunnel") {
 
 if (args.includes("list")) {
   process.stdout.write(JSON.stringify(readJson("tunnels.json", [])) + "\n");
+  process.exit(0);
+}
+
+if (args.includes("info")) {
+  const uuid = args[args.length - 1]!;
+  process.stdout.write(JSON.stringify(readJson(`info-${uuid}.json`, { id: uuid, conns: [] })) + "\n");
   process.exit(0);
 }
 
