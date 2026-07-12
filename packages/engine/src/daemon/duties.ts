@@ -6,6 +6,7 @@ import {
   reconcileTunnel,
 } from "../tunnel/registry.ts";
 import type { Admission } from "./routes.ts";
+import type { SharedArbiter } from "./shared-arbiter.ts";
 
 const SWEEP_INTERVAL_MS = 15_000;
 
@@ -23,7 +24,7 @@ const SWEEP_INTERVAL_MS = 15_000;
  */
 export function startDuties(
   admission: Admission,
-  opts?: { intervalMs?: number; log?: (line: string) => void },
+  opts?: { intervalMs?: number; log?: (line: string) => void; shared?: SharedArbiter },
 ): () => void {
   const log = opts?.log ?? ((line) => console.error(line));
   let running = false;
@@ -36,6 +37,16 @@ export function startDuties(
         await admission.pump();
       } catch (err) {
         log(`sweep: pump failed: ${(err as Error).message}`);
+      }
+      if (opts?.shared !== undefined) {
+        try {
+          // pump() just refreshed the cached occupancy — live ∪ reserved is
+          // the "still occupying a slot" set that keeps a holder's claim.
+          const state = admission.healthSnapshot();
+          await opts.shared.sweep(new Set([...state.live, ...state.reserved]));
+        } catch (err) {
+          log(`sweep: shared-hostname sweep failed: ${(err as Error).message}`);
+        }
       }
       for (const uuid of listAdopted()) {
         try {

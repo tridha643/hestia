@@ -120,6 +120,26 @@ export class DaemonFleetSource {
     return doctor(worktree);
   }
 
+  /** Claim a shared hostname AS the given worktree (enqueues durably if held). */
+  async claimShared(worktree: string, name: string): Promise<void> {
+    await engine.claimShared(worktree, name);
+  }
+
+  /** Holder consents: hand the shared hostname to the queue head. */
+  async allowShared(worktree: string, name: string): Promise<void> {
+    await engine.allowShared(worktree, name);
+  }
+
+  /** Holder declines the head request; the waiter stays durably queued. */
+  async denyShared(worktree: string, name: string): Promise<void> {
+    await engine.denyShared(worktree, name);
+  }
+
+  /** Holder releases the shared hostname; the queue head is granted at once. */
+  async releaseShared(worktree: string, name: string): Promise<void> {
+    await engine.releaseShared(worktree, name);
+  }
+
   /** Tear down one managed project while always retaining named volumes. */
   down(stack: FleetStackView): Promise<void> {
     if (stack.createdAt === undefined) {

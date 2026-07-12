@@ -8,8 +8,10 @@ import {
   type StackIdentity,
 } from "@hestia/core";
 import { readRequestTextWithLimit } from "@hunk/session-broker-core";
+import { HestiaError } from "@hestia/core";
 import { readMirrorState } from "../state.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
+import { SharedArbiter } from "./shared-arbiter.ts";
 import { SlotLedger, resolveMaxStacks } from "./slots.ts";
 
 export const HESTIAD_PROTOCOL_VERSION = 5;
@@ -212,6 +214,7 @@ export interface DaemonRouteDependencies {
   fleet: FleetMonitor;
   routerPort: number;
   gatewaySocket: string;
+  shared: SharedArbiter;
   refreshLocalRoutes(): Promise<void>;
   logsProject(project: string, options: LogsOptions): AsyncIterable<LogLine>;
 }
@@ -423,6 +426,63 @@ export function createRoutes(
       return json({ ok: true });
     }
 
+    if (url.pathname.startsWith("/hestia/shared/") && request.method === "POST") {
+      let body: {
+        name?: unknown; project?: unknown; worktree?: unknown;
+        service?: unknown; waitMs?: unknown;
+      };
+      try {
+        body = await parseJsonBody(request);
+      } catch (error) {
+        return json({ error: `invalid JSON body: ${(error as Error).message}` }, 400);
+      }
+      const verb = url.pathname.slice("/hestia/shared/".length);
+      if (!isProject(body.project)) return json({ error: "project is invalid" }, 400);
+      const project = body.project;
+      try {
+        if (verb === "release-project") {
+          const service = body.service === undefined
+            ? undefined
+            : isService(body.service) ? body.service : null;
+          if (service === null) return json({ error: "service is invalid" }, 400);
+          await dependencies.shared.releaseProject(project, service);
+          return json({ ok: true });
+        }
+        if (!isSharedName(body.name)) return json({ error: "name is invalid" }, 400);
+        const name = body.name;
+        if (verb === "claim") {
+          if (typeof body.worktree !== "string" || !body.worktree.startsWith("/") || body.worktree.length > 4096) {
+            return json({ error: "worktree is invalid" }, 400);
+          }
+          const waitMs = typeof body.waitMs === "number" && Number.isFinite(body.waitMs) && body.waitMs > 0
+            ? Math.min(body.waitMs, 24 * 60 * 60 * 1_000)
+            : 0;
+          return json(await dependencies.shared.request(
+            name,
+            { project, worktree: body.worktree },
+            waitMs,
+          ));
+        }
+        if (verb === "allow") return json(await dependencies.shared.allow(name, project));
+        if (verb === "deny") return json(await dependencies.shared.deny(name, project));
+        if (verb === "release") return json(await dependencies.shared.release(name, project));
+        if (verb === "cancel") return json(await dependencies.shared.cancel(name, project));
+      } catch (error) {
+        if (error instanceof HestiaError) {
+          return json(
+            { error: error.message, code: error.code },
+            error.code === "shared-not-found" ? 404 : 409,
+          );
+        }
+        return json({ error: (error as Error).message }, 500);
+      }
+      return json({ error: `unknown route ${url.pathname}` }, 404);
+    }
+
     return json({ error: `unknown route ${url.pathname}` }, 404);
   };
+}
+
+function isSharedName(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,62}$/.test(value);
 }

@@ -95,6 +95,9 @@ bin/hestia run --name web [--env K=V] [--no-port] [--varlock] [--signal int]
                [--wait[=secs]] [--no-daemon] -- <cmd...>
 bin/hestia expose <svc...> [--tunnel <name>] [--zone <z>] [--keep-host-header]
                   [--overwrite-dns] [--force]
+bin/hestia expose <svc> --shared <name>   # declare+claim a stable shared hostname
+bin/hestia claim <name> [--wait[=secs]] [--cancel] | release <name>
+bin/hestia share list|requests|allow <name>|deny <name>
 bin/hestia daemon status|start|stop|install [--print]|uninstall
 bin/hestia doctor [--json]     # report-only; exit 1 only on error rows
 bin/hestia stop <name> | down [--project <name>] | status | env | endpoint list
@@ -239,6 +242,29 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
   (`~/.hestia/tunnel/<uuid>/.hestia/lock`) covers only config regen +
   connector restart. The tunnel dir doubles as a proc-machinery "worktree
   root" so the connector reuses startProc/pidfile/tree-shutdown unchanged.
+- **Shared hostnames route in hestiad, not in cloudflared.** A shared record
+  (`~/.hestia/shared/<name>.json`) declares an ARBITRARY user-owned `hostname`
+  (any FQDN on any zone — no longer derived from `<name>.<zone>`, that's just
+  the default) plus an optional `path` prefix. cloudflared gets ONE static rule
+  per unique hostname → the gateway, never `httpHostHeader` (its
+  `origin_proxy.go` rewrites Host only when configured), so the public Host
+  reaches the gateway verbatim and the router maps it to the CURRENT holder each
+  refresh. **Path routing lives entirely in hestiad**: several handles may share
+  one hostname, keyed by longest-prefix path match at segment boundaries
+  (`ingress/rule.go` in cloudflared can match paths too, but we don't use it —
+  splitting in the router means adding a path to an existing hostname needs no
+  connector restart). Holder switches AND new same-host paths need zero
+  connector restarts and zero DNS writes; only a brand-new hostname regenerates
+  the config. `(hostname, path)` uniqueness is enforced at declare under the
+  shared lock — sibling handles on one hostname are legal, an identical pair is
+  not. The claim queue is DURABLE — holder + FIFO live in the record file, one
+  atomic write per transition (and `writeAtomicJsonFile` now fsyncs the parent
+  dir after rename, so the rename itself survives a crash); daemon restarts and
+  CLI timeouts never lose a position. hestiad is the single writer for
+  transitions (consent protocol: allow/deny by the holder; deny keeps the waiter
+  queued; only grant, cancel, or a dead stack dequeues; the sweep auto-releases
+  dead holders). The shared lock (`~/.hestia/shared/.hestia/lock`) never nests
+  inside worktree/tunnel locks.
 - **Quick tunnels must pass an explicit empty `--config`**: cloudflared
   implicitly loads `~/.cloudflared/config.yml`, whose ingress rules override
   `--url` and 404 every request (found by the gated edge e2e; the stub can't

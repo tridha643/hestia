@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import { LABELS, type StackRecord } from "@hestia/core";
 import { getRepoInfo } from "./git.ts";
 import { tryLoadConfig } from "./config.ts";
-import { hestiaDir, hestiaHome, parseStackRecord, readState } from "./state.ts";
+import { hestiaDir, hestiaHome, parseStackRecord, readMirrorState, readState } from "./state.ts";
+import { listSharedHostnames } from "./tunnel/shared.ts";
 import { isLive, listPidfiles, procsDir } from "./proc/pidfile.ts";
 import { detectVarlock } from "./proc/resolver.ts";
 import { discoverWorkers } from "./wrangler/discover.ts";
@@ -318,6 +319,38 @@ async function tunnelChecks(): Promise<DoctorRow[]> {
   return rows;
 }
 
+async function sharedHostnameChecks(): Promise<DoctorRow[]> {
+  const rows: DoctorRow[] = [];
+  for (const shared of listSharedHostnames()) {
+    const label = `shared:${shared.name}`;
+    const url = `https://${shared.hostname}${shared.path ?? ""}`;
+    const pending = (shared.queue ?? []).length;
+    const queueSuffix = pending > 0 ? ` (${pending} queued)` : "";
+    if (shared.holder === undefined) {
+      rows.push(row(label, "warn", `${url} unclaimed — requests answer 503 until \`hestia claim ${shared.name}\`${queueSuffix}`));
+      continue;
+    }
+    const mirror = readMirrorState(shared.holder.project);
+    if (mirror === null) {
+      rows.push(
+        row(
+          label,
+          "warn",
+          `held by ${shared.holder.project} but its stack mirror is gone — the daemon sweep auto-releases it${queueSuffix}`,
+        ),
+      );
+      continue;
+    }
+    const endpoint = mirror.endpoints.find((candidate) => (candidate.alias ?? candidate.name) === shared.service);
+    rows.push(
+      endpoint === undefined
+        ? row(label, "warn", `held by ${shared.holder.project} but endpoint "${shared.service}" is not running — requests answer 503${queueSuffix}`)
+        : row(label, "ok", `${url} → ${shared.holder.project}${queueSuffix}`),
+    );
+  }
+  return rows;
+}
+
 async function daemonChecks(): Promise<DoctorRow[]> {
   const rows: DoctorRow[] = [];
   const j = readDaemonJson();
@@ -409,6 +442,7 @@ export async function doctor(cwd: string): Promise<DoctorRow[]> {
     ctx !== null ? bounded("state", () => stateChecks(ctx)) : Promise.resolve([]),
     bounded("machine", () => machineChecks()),
     bounded("tunnel", () => tunnelChecks()),
+    bounded("shared", () => sharedHostnameChecks()),
     bounded("daemon", () => daemonChecks()),
     bounded("local-router", () => localRouterChecks()),
   ]);

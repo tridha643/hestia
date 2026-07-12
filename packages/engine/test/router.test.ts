@@ -18,6 +18,7 @@ import {
   internalEndpointAuthority,
   resolvedLocalRouteHostname,
 } from "../src/router/local-http-router.ts";
+import { declareSharedHostname, setSharedHolder } from "../src/tunnel/shared.ts";
 
 const homes: string[] = [];
 
@@ -318,6 +319,55 @@ describe("hestiad local HTTP router", () => {
       expect(foreignBytes).toBe(0);
     } finally {
       await new Promise<void>((resolve) => foreign.close(() => resolve()));
+      router.stop();
+    }
+  }, 15_000);
+
+  test("shared hostname routes by longest path prefix at segment boundaries", async () => {
+    const home = useTemporaryHome();
+    const origin = createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ path: request.url, host: request.headers.host }));
+    });
+    await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+    const address = origin.address();
+    const originPort = typeof address === "object" && address ? address.port : 0;
+    const worktree = join(home, "worktree");
+    const record = sampleRecord(worktree, originPort);
+    ensureDir(worktree);
+    writeState(worktree, record);
+
+    // One hostname, two path-scoped handles: /slack held by the live stack,
+    // /stripe declared but unclaimed. No whole-host handle → off-path is 404.
+    await declareSharedHostname({
+      name: "sl", hostname: "acme.test", path: "/slack",
+      tunnelUuid: "u", zone: "acme.test", service: "dashboard",
+    });
+    await declareSharedHostname({
+      name: "st", hostname: "acme.test", path: "/stripe",
+      tunnelUuid: "u", zone: "acme.test", service: "dashboard",
+    });
+    await setSharedHolder("sl", {
+      project: record.project, worktree, service: "dashboard", at: new Date().toISOString(),
+    });
+
+    const router = new HestiaLocalHttpRouter();
+    const routerPort = await router.start();
+    try {
+      const get = (path: string) => fetch(`http://127.0.0.1:${routerPort}${path}`, {
+        headers: { host: "acme.test" },
+      });
+      const slack = await get("/slack/events");
+      expect(slack.status).toBe(200);
+      expect(await slack.json()).toMatchObject({ path: "/slack/events", host: `127.0.0.1:${originPort}` });
+      // segment boundary: /slackbot must NOT match the /slack prefix
+      expect((await get("/slackbot")).status).toBe(404);
+      // declared-but-unclaimed path answers 503, never 404
+      expect((await get("/stripe/hooks")).status).toBe(503);
+      // a path no handle covers is 404
+      expect((await get("/other")).status).toBe(404);
+    } finally {
+      await new Promise<void>((resolve) => origin.close(() => resolve()));
       router.stop();
     }
   }, 15_000);

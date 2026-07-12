@@ -21,6 +21,7 @@ import {
   uninstallLaunchd,
   uninstallHestiaRouter,
   initializeRepositoryConfig,
+  listSharedHostnames,
   type EndpointKind,
   type InitRequest,
   type InitScope,
@@ -38,6 +39,47 @@ import {
   type ProcSpec,
   type StackRecord,
 } from "@hestia/core";
+
+/** The published version + npm coordinates (kept in sync with package.json at release). */
+const CLI_VERSION = "1.1.0";
+const PACKAGE_NAME = "@tridha643/hestia";
+
+/**
+ * Compare two dotted numeric versions. Returns >0 when `a` is newer than `b`,
+ * <0 when older, 0 when equal. A pre-release suffix (e.g. `-rc.1`) is treated as
+ * older than the same release, matching npm's `latest` dist-tag semantics.
+ */
+export function compareVersions(a: string, b: string): number {
+  const parse = (value: string): { core: number[]; pre: boolean } => {
+    const [core, pre] = value.split("-", 2);
+    return {
+      core: (core ?? "").split(".").map((part) => Number.parseInt(part, 10) || 0),
+      pre: pre !== undefined && pre.length > 0,
+    };
+  };
+  const left = parse(a);
+  const right = parse(b);
+  const length = Math.max(left.core.length, right.core.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (left.core[index] ?? 0) - (right.core[index] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  if (left.pre === right.pre) return 0;
+  return left.pre ? -1 : 1;
+}
+
+/** Ask the npm registry for the current `latest` version of the hestia package. */
+async function fetchLatestVersion(): Promise<string> {
+  const response = await fetch(`https://registry.npmjs.org/${PACKAGE_NAME}/latest`, {
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(`npm registry responded ${response.status}`);
+  const body = (await response.json()) as { version?: unknown };
+  if (typeof body.version !== "string" || body.version.length === 0) {
+    throw new Error("npm registry response has no version");
+  }
+  return body.version;
+}
 
 interface Flags {
   json: boolean;
@@ -60,6 +102,16 @@ interface Flags {
   zone?: string;
   keepHostHeader: boolean;
   overwriteDns: boolean;
+  /** Shared hostname handle for `expose --shared`. */
+  shared?: string;
+  /** Explicit FQDN target for `--shared` (any zone; default `<shared>.<zone>`). */
+  hostname?: string;
+  /** URL path prefix for `--shared` (several handles share one hostname). */
+  path?: string;
+  /** Drop this worktree's durable claim-queue entry instead of claiming. */
+  cancel: boolean;
+  /** `upgrade --check`: report whether a newer release exists, don't install. */
+  check: boolean;
   /** seconds to queue for a stack slot at the cap (absent = fail fast). */
   wait?: number;
   noDaemon: boolean;
@@ -90,6 +142,8 @@ function parseFlags(argv: string[]): Flags {
     noPort: false,
     keepHostHeader: false,
     overwriteDns: false,
+    cancel: false,
+    check: false,
     noDaemon: false,
     print: false,
     interactive: false,
@@ -158,6 +212,20 @@ function parseFlags(argv: string[]): Flags {
     }
     else if (a === "--keep-host-header") f.keepHostHeader = true;
     else if (a === "--overwrite-dns") f.overwriteDns = true;
+    else if (a === "--shared") {
+      f.shared = takeValue();
+      if (!f.shared || f.shared.startsWith("--")) f.errors.push("--shared requires a value");
+    }
+    else if (a === "--hostname") {
+      f.hostname = takeValue();
+      if (!f.hostname || f.hostname.startsWith("--")) f.errors.push("--hostname requires a value");
+    }
+    else if (a === "--path") {
+      f.path = takeValue();
+      if (!f.path || f.path.startsWith("--")) f.errors.push("--path requires a value");
+    }
+    else if (a === "--cancel") f.cancel = true;
+    else if (a === "--check") f.check = true;
     else if (a === "--no-daemon") f.noDaemon = true;
     else if (a === "--print") f.print = true;
     else if (a === "--interactive") f.interactive = true;
@@ -215,12 +283,16 @@ function parseFlags(argv: string[]): Flags {
 function validateCommandOptions(argv: string[], command: string | undefined): string | null {
   const allowedByCommand: Record<string, Set<string>> = {
     version: new Set(["--json"]),
+    upgrade: new Set(["--json", "--check"]),
     skill: new Set(["--json"]),
     discover: new Set(["--json"]),
     init: new Set(["--json", "--print", "--scope", "--write", "--no-port"]),
     up: new Set(["--json", "--services", "--workers", "--allow-remote", "--force", "--no-varlock", "--wait", "--no-daemon"]),
     run: new Set(["--json", "--name", "--env", "--no-port", "--varlock", "--signal", "--ready-timeout", "--cwd", "--wait", "--no-daemon"]),
-    expose: new Set(["--json", "--tunnel", "--zone", "--keep-host-header", "--overwrite-dns", "--force", "--ready-timeout"]),
+    expose: new Set(["--json", "--tunnel", "--zone", "--keep-host-header", "--overwrite-dns", "--force", "--ready-timeout", "--shared", "--hostname", "--path"]),
+    claim: new Set(["--json", "--wait", "--cancel"]),
+    release: new Set(["--json"]),
+    share: new Set(["--json"]),
     route: new Set(["--json"]),
     router: new Set(["--json", "--interactive"]),
     config: new Set(["--json", "--file"]),
@@ -240,7 +312,8 @@ function validateCommandOptions(argv: string[], command: string | undefined): st
   if (allowed === undefined) return null;
   const optionArguments = new Set([
     "--services", "--name", "--env", "--signal", "--ready-timeout", "--cwd",
-    "--project", "--tunnel", "--zone", "--file", "--scope", "--tail",
+    "--project", "--tunnel", "--zone", "--file", "--scope", "--tail", "--shared",
+    "--hostname", "--path",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const raw = argv[index]!;
@@ -298,6 +371,19 @@ function printStackHuman(r: StackRecord): void {
         (pub !== undefined ? `  ${pub}` : ""),
     );
   }
+  for (const shared of listSharedHostnames()) {
+    const holds = shared.holder?.project === r.project;
+    const queuedHere = (shared.queue ?? []).some((waiter) => waiter.project === r.project);
+    if (!holds && !queuedHere) continue;
+    const pending = (shared.queue ?? []).length;
+    const url = `https://${shared.hostname}${shared.path ?? ""}`;
+    out.push(
+      holds
+        ? `  ⇄ shared ${shared.name.padEnd(10)} ${url}  HELD` +
+          (pending > 0 ? `  (${pending} queued — \`hestia share requests\`)` : "")
+        : `  ⇄ shared ${shared.name.padEnd(10)} ${url}  queued behind ${shared.holder?.project ?? "?"}`,
+    );
+  }
   process.stdout.write(out.join("\n") + "\n");
 }
 
@@ -306,6 +392,9 @@ const HELP = `hestia — per-worktree isolated dev stacks
 usage:
   hestia version [--json]
         print CLI version, state schema, and daemon protocol
+  hestia upgrade [--check] [--json]
+        upgrade hestia to the latest npm release via \`bun add --global\`;
+        --check only reports whether a newer version is available
   hestia skill path [--json]
         print the packaged Hestia agent skill path
   hestia discover [--json]
@@ -347,6 +436,27 @@ usage:
         worktrees). URLs land in endpoints[] + HESTIA_<SVC>_URL. These are
         fail-closed but unauthenticated public URLs. Named v1 performs no DNS
         writes and requires wildcard CNAME *.<zone> → <uuid>.cfargotunnel.com.
+  hestia expose <endpoint> --shared <name> [--hostname <fqdn>] [--path <prefix>]
+                           [--tunnel <t>] [--zone <zone>] [--json]
+        declare + claim a machine-owned SHARED hostname — a stable public URL
+        for externally-pinned integrations (Slack request URLs, webhook
+        consumers) that cannot chase per-branch hostnames. Exactly one worktree
+        holds it at a time; handoffs are consent-based and switch inside
+        hestiad with zero connector restarts. The target defaults to
+        <name>.<zone>; --hostname points ANY FQDN you control (any zone) at it,
+        and --path /prefix lets several handles share one hostname routed by
+        longest path prefix (e.g. acme.com/slack vs acme.com/stripe). Prefer
+        plain per-branch expose whenever the external side can be configured
+        per branch (dashboards, multi-redirect OAuth)
+  hestia claim <name> [--wait[=secs]] [--cancel] [--json]
+        claim a shared hostname for this worktree. Held names queue DURABLY
+        (position survives daemon restarts and CLI timeouts); --wait blocks
+        until the holder allows or releases, --cancel leaves the queue
+  hestia release <name> [--json]
+        release a held shared hostname; the queue head is granted immediately
+  hestia share list|requests [--json] | share allow|deny <name> [--json]
+        inspect shared hostnames and arbitrate queued claims as the holder:
+        allow hands over now; deny keeps the requester queued until release
   hestia open <service> [path] [--json]
         resolve a service's public URL (from \`expose\`) and open it in the
         browser; the URL is always printed too, so a headless agent can hand
@@ -401,7 +511,7 @@ async function main(): Promise<void> {
     switch (cmd) {
       case "version": {
         const version = {
-          cliVersion: "1.0.1",
+          cliVersion: CLI_VERSION,
           stateSchema: STATE_SCHEMA_VERSION,
           daemonProtocol: HESTIAD_PROTOCOL_VERSION,
           runtime: "bun",
@@ -410,6 +520,40 @@ async function main(): Promise<void> {
         else process.stdout.write(
           `hestia ${version.cliVersion} (state v${version.stateSchema}, daemon v${version.daemonProtocol}, Bun)\n`,
         );
+        break;
+      }
+      case "upgrade": {
+        let latest: string;
+        try {
+          latest = await fetchLatestVersion();
+        } catch (error) {
+          fail("upgrade-failed", `could not check the latest ${PACKAGE_NAME} version: ${(error as Error).message}`, flags.json);
+        }
+        const available = compareVersions(latest, CLI_VERSION) > 0;
+        // `--check`, or already current: report and stop — never install.
+        if (flags.check || !available) {
+          if (flags.json) {
+            process.stdout.write(JSON.stringify({ current: CLI_VERSION, latest, upgradeAvailable: available }) + "\n");
+          } else if (available) {
+            process.stdout.write(`hestia ${latest} is available (you have ${CLI_VERSION}) — run \`hestia upgrade\`\n`);
+          } else {
+            process.stdout.write(`hestia ${CLI_VERSION} is the latest release\n`);
+          }
+          break;
+        }
+        // hestia ships macOS/Bun-only through npm; the documented install is a
+        // global bun add, so the upgrade is the same command pinned to latest.
+        const installArgs = ["add", "--global", `${PACKAGE_NAME}@${latest}`];
+        if (!flags.json) {
+          process.stderr.write(`upgrading hestia ${CLI_VERSION} → ${latest} via \`bun ${installArgs.join(" ")}\`…\n`);
+        }
+        try {
+          execFileSync("bun", installArgs, { stdio: flags.json ? "ignore" : "inherit" });
+        } catch (error) {
+          fail("upgrade-failed", `\`bun ${installArgs.join(" ")}\` failed: ${(error as Error).message}`, flags.json);
+        }
+        if (flags.json) process.stdout.write(JSON.stringify({ current: CLI_VERSION, latest, upgraded: true }) + "\n");
+        else process.stdout.write(`hestia upgraded ${CLI_VERSION} → ${latest}\n`);
         break;
       }
       case "skill": {
@@ -547,16 +691,98 @@ async function main(): Promise<void> {
         if (flags.overwriteDns) {
           fail("usage", "--overwrite-dns was removed; named v1 requires user-managed wildcard DNS", flags.json);
         }
+        if ((flags.hostname !== undefined || flags.path !== undefined) && flags.shared === undefined) {
+          fail("usage", "--hostname/--path only apply with --shared <name>", flags.json);
+        }
         const r = await engine.expose(cwd, services, {
           tunnel: flags.tunnel,
           zone: flags.zone,
           keepHostHeader: flags.keepHostHeader,
           overwriteDns: flags.overwriteDns,
+          shared: flags.shared,
+          hostname: flags.hostname,
+          path: flags.path,
           force: flags.force,
           readyTimeoutMs: flags.readyTimeout,
         });
         if (flags.json) process.stdout.write(JSON.stringify(r, null, 2) + "\n");
         else printStackHuman(r);
+        break;
+      }
+      case "claim": {
+        const name = flags._[1];
+        if (!name || flags._.length > 2) {
+          fail("usage", "usage: hestia claim <name> [--wait[=secs]] [--cancel]", flags.json);
+        }
+        if (flags.cancel) {
+          await engine.cancelSharedClaim(cwd, name);
+          if (flags.json) process.stdout.write(JSON.stringify({ ok: true, cancelled: name }) + "\n");
+          else process.stdout.write(`left the queue for "${name}"\n`);
+          break;
+        }
+        const { record, result } = await engine.claimShared(cwd, name, {
+          waitMs: flags.wait !== undefined ? flags.wait * 1000 : 0,
+        });
+        const hostname = listSharedHostnames().find((candidate) => candidate.name === name)?.hostname;
+        if (flags.json) {
+          process.stdout.write(JSON.stringify({ granted: true, holder: result.holder, record }, null, 2) + "\n");
+        } else {
+          process.stdout.write(`claimed "${name}"${hostname !== undefined ? ` — https://${hostname}` : ""} now routes here\n`);
+        }
+        break;
+      }
+      case "release": {
+        const name = flags._[1];
+        if (!name || flags._.length > 2) fail("usage", "usage: hestia release <name>", flags.json);
+        await engine.releaseShared(cwd, name);
+        if (flags.json) process.stdout.write(JSON.stringify({ ok: true, released: name }) + "\n");
+        else process.stdout.write(`released "${name}" — next in queue (if any) now holds it\n`);
+        break;
+      }
+      case "share": {
+        const action = flags._[1];
+        if (action === "list" || action === "requests") {
+          const records = listSharedHostnames();
+          const view = records
+            .map((record) => ({
+              name: record.name,
+              hostname: record.hostname,
+              path: record.path,
+              url: `https://${record.hostname}${record.path ?? ""}`,
+              service: record.service,
+              holder: record.holder,
+              queued: record.queue ?? [],
+            }))
+            .filter((entry) => action === "list" || entry.queued.length > 0);
+          if (flags.json) process.stdout.write(JSON.stringify(view, null, 2) + "\n");
+          else if (view.length === 0) {
+            process.stdout.write(action === "list" ? "no shared hostnames declared\n" : "no pending claim requests\n");
+          } else {
+            for (const entry of view) {
+              const holder = entry.holder === undefined ? "unclaimed" : `held by ${entry.holder.project}`;
+              process.stdout.write(`${entry.name.padEnd(16)} ${entry.url}  ${holder}\n`);
+              entry.queued.forEach((waiter, index) => {
+                process.stdout.write(
+                  `  ${String(index + 1).padStart(2)}. ${waiter.project}${waiter.denied ? "  (denied — still queued)" : ""}\n`,
+                );
+              });
+            }
+          }
+          break;
+        }
+        const name = flags._[2];
+        if ((action !== "allow" && action !== "deny") || !name) {
+          fail("usage", "usage: hestia share list|requests | share allow|deny <name>", flags.json);
+        }
+        if (action === "allow") {
+          await engine.allowShared(cwd, name);
+          if (flags.json) process.stdout.write(JSON.stringify({ ok: true, allowed: name }) + "\n");
+          else process.stdout.write(`allowed — "${name}" handed to the next in queue\n`);
+        } else {
+          await engine.denyShared(cwd, name);
+          if (flags.json) process.stdout.write(JSON.stringify({ ok: true, denied: name }) + "\n");
+          else process.stdout.write(`denied — the requester stays queued until you release "${name}"\n`);
+        }
         break;
       }
       case "route": {
@@ -891,4 +1117,6 @@ async function main(): Promise<void> {
   }
 }
 
-main();
+// Only run the CLI when invoked as the entrypoint; importing (e.g. for unit
+// tests of exported helpers) must not execute a command.
+if (import.meta.main) main();

@@ -17,6 +17,7 @@ import {
   type ProcSpec,
   type RepoId,
   type ServiceRecord,
+  type SharedClaimResult,
   type StackIdentity,
   type StackRecord,
   type TunnelRef,
@@ -88,19 +89,30 @@ import {
   verifyPrivateRegistry,
 } from "./wrangler/verify.ts";
 import { adoptTunnel } from "./tunnel/cloudflared.ts";
-import { hostnameFor, importBaseRules, inferZone } from "./tunnel/ingress.ts";
+import { hostnameFor, importBaseRules, inferZone, zoneOf } from "./tunnel/ingress.ts";
 import {
+  collectDynamicRules,
   connectorPidfile,
   isAdopted,
   reconcileTunnel,
 } from "./tunnel/registry.ts";
+import {
+  assertSharedHostnameFqdn,
+  assertSharedName,
+  declareSharedHostname,
+  listSharedHostnames,
+  normalizeSharedPath,
+  readSharedHostname,
+} from "./tunnel/shared.ts";
 import { isReady, quickTunnelUrl } from "./tunnel/verify.ts";
 import { ensureDaemon } from "./daemon/ensure.ts";
 import {
   acquireSlot,
   readDaemonJson,
   reconcileDaemonLocalRoutes,
+  releaseSharedForProject,
   releaseSlot,
+  sharedVerb,
 } from "./daemon/client.ts";
 import { streamStackLogs } from "./logs/stream.ts";
 import {
@@ -111,6 +123,13 @@ import { readHestiaRouterStatus } from "./router/portless-adapter.ts";
 
 export { dockerAvailable } from "./compose/cli.ts";
 export * from "./compose/override.ts";
+export {
+  listSharedHostnames,
+  readSharedHostname,
+  removeSharedHostname,
+  sharedRoot,
+} from "./tunnel/shared.ts";
+export { SharedArbiter } from "./daemon/shared-arbiter.ts";
 export { withLock } from "./proc/lock.ts";
 export { substitutePort, envKey, openProcAttemptLog } from "./proc/supervisor.ts";
 export { readLastLines, tailFile } from "./logs/tail.ts";
@@ -587,6 +606,35 @@ function applyLocalRouteProjection(record: StackRecord): void {
     endpoint.localUrl = `https://${endpoint.reservedName}`;
     record.env[directUrlKey(endpoint.name)] = endpoint.url;
     record.env[localUrlKey(endpoint.name)] = endpoint.localUrl;
+  }
+  syncSharedProjection(record);
+}
+
+/**
+ * Project shared-hostname holdership into this record: the holder's contract
+ * endpoint carries the stable public URL; every non-holder sheds it. Reads
+ * the durable shared store, so a record self-heals its stale projection on
+ * its own next mutation after losing a claim it wasn't told about.
+ */
+function syncSharedProjection(record: StackRecord): void {
+  for (const shared of listSharedHostnames()) {
+    const url = `https://${shared.hostname}${shared.path ?? ""}`;
+    if (shared.holder?.project === record.project) {
+      const endpoint = record.endpoints.find(
+        (candidate) => (candidate.alias ?? candidate.name) === shared.service,
+      );
+      if (endpoint !== undefined) {
+        endpoint.publicUrl = url;
+        record.env[urlKey(shared.service)] = url;
+      }
+      continue;
+    }
+    for (const endpoint of record.endpoints) {
+      if (endpoint.publicUrl === url) delete endpoint.publicUrl;
+    }
+    if (record.env[urlKey(shared.service)] === url) {
+      delete record.env[urlKey(shared.service)];
+    }
   }
 }
 
@@ -1160,6 +1208,7 @@ export class ComposeEngine implements IsolationEngine {
     const { repo, repoId, branch, worktreeRoot } = currentIdentity;
     let tunnel: TunnelRef | undefined;
     let tunnelDirty = false;
+    const stoppedAliases: string[] = [];
     const project = readState(worktreeRoot)?.project ?? projectName(repoId, repo, branch, worktreeRoot);
     await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
       const record = readState(worktreeRoot);
@@ -1170,6 +1219,13 @@ export class ComposeEngine implements IsolationEngine {
             "backend-not-stoppable",
             `Docker workload ${name} cannot be stopped individually; use hestia down`,
           );
+        }
+        // Shared hostnames served by this workload auto-release on stop; ones
+        // served by the stack's OTHER services must survive it.
+        for (const endpoint of record.endpoints) {
+          if ((endpoint.workload ?? endpoint.name) === name) {
+            stoppedAliases.push(endpoint.alias ?? endpoint.name);
+          }
         }
       }
       const pf = readPidfile(worktreeRoot, name);
@@ -1219,6 +1275,9 @@ export class ComposeEngine implements IsolationEngine {
         }
       }
     }));
+    for (const alias of new Set(stoppedAliases)) {
+      await this.#releaseSharedHoldings(project, alias);
+    }
     if (tunnelDirty) await this.#reconcileAdopted(tunnel);
     await this.#refreshLocalRoutes();
   }
@@ -1401,6 +1460,7 @@ export class ComposeEngine implements IsolationEngine {
       const project = record?.project ?? projectName(repoId, repo, branch, worktreeRoot);
       clearState(worktreeRoot, project);
       await this.#releaseAdmission(project);
+      await this.#releaseSharedHoldings(project);
     }));
     // mirror is gone → regen drops this stack's ingress rules; the connector
     // keeps serving the base rules and other worktrees
@@ -1412,6 +1472,16 @@ export class ComposeEngine implements IsolationEngine {
   async #releaseAdmission(project: string): Promise<void> {
     const j = readDaemonJson();
     if (j !== null) await releaseSlot(j.port, project);
+  }
+
+  /**
+   * Auto-release shared hostnames this project holds (decision: down frees
+   * them; the queue head is granted). Best-effort — the sweep reconciles a
+   * gone daemon, and the deleted mirror alone already ends routing.
+   */
+  async #releaseSharedHoldings(project: string, service?: string): Promise<void> {
+    const j = readDaemonJson();
+    if (j !== null) await releaseSharedForProject(j.port, project, service);
   }
 
   /**
@@ -1491,6 +1561,7 @@ export class ComposeEngine implements IsolationEngine {
           return;
         }
         await this.#releaseAdmission(project);
+        await this.#releaseSharedHoldings(project);
         await this.#reconcileAdopted(record.tunnel);
         await this.#refreshLocalRoutes();
         return;
@@ -1503,6 +1574,7 @@ export class ComposeEngine implements IsolationEngine {
     const projectLockRoot = projectMutationRoot(project);
     await withLock(projectLockRoot, teardownFromMirror);
     await this.#releaseAdmission(project);
+    await this.#releaseSharedHoldings(project);
     await this.#reconcileAdopted(record?.tunnel);
     await this.#refreshLocalRoutes();
   }
@@ -1529,10 +1601,143 @@ export class ComposeEngine implements IsolationEngine {
     }
     await ensureDaemon();
     await this.#refreshLocalRoutes(true);
+    if (opts?.shared !== undefined) {
+      if (tunnelName === undefined) {
+        throw new HestiaError(
+          "shared-requires-named-tunnel",
+          "shared hostnames need an adopted named tunnel (stable DNS is the point) — pass --tunnel <name>",
+        );
+      }
+      return this.#exposeShared(worktreeRoot, services, tunnelName, opts);
+    }
     if (tunnelName === undefined) {
       return this.#exposeQuick(worktreeRoot, services, opts);
     }
     return this.#exposeNamed(worktreeRoot, services, tunnelName, opts);
+  }
+
+  /**
+   * Declare + claim one machine-owned shared hostname (`<name>.<zone>`).
+   * The connector restarts ONCE here (the rule is holder-independent); every
+   * later holder switch is a hestiad route-table update with zero public blip.
+   */
+  async #exposeShared(
+    worktreeRoot: string,
+    services: string[],
+    tunnelName: string,
+    opts?: ExposeOptions,
+  ): Promise<StackRecord> {
+    if (services.length !== 1) {
+      throw new HestiaError("usage", "--shared declares exactly one service per shared hostname");
+    }
+    const name = opts!.shared!;
+    assertSharedName(name);
+    const project = readState(worktreeRoot)?.project;
+    if (project === undefined) {
+      throw new HestiaError("service-not-found", "no stack in this worktree — `hestia up`/`run` something first");
+    }
+    // Same network preflight as named exposures — no locks held.
+    const adopted = await adoptTunnel(tunnelName);
+    if (adopted.connections > 0 && !isAdopted(adopted.uuid) && !opts?.force) {
+      throw new HestiaError(
+        "tunnel-busy",
+        `tunnel "${tunnelName}" already has ${adopted.connections} live edge ` +
+          `connection(s) from a foreign connector — stop the other cloudflared first (hestia's ` +
+          `connector serves your static hostnames too), or pass --force to ` +
+          `accept nondeterministic routing`,
+      );
+    }
+    const preflightRecord = readState(worktreeRoot);
+    if (preflightRecord === null) {
+      throw new HestiaError("service-not-found", "stack disappeared while preparing the shared hostname");
+    }
+    const baseRules = importBaseRules(adopted.uuid, tunnelName);
+    // A user-supplied --hostname is ANY FQDN they control (any zone); its zone
+    // is that hostname's parent. Only the derived default needs zone inference.
+    const zoneHint = opts?.zone ?? preflightRecord.tunnel?.zone ?? inferZone(baseRules);
+    let hostname: string;
+    let zone: string;
+    if (opts?.hostname !== undefined) {
+      hostname = opts.hostname.toLowerCase();
+      assertSharedHostnameFqdn(hostname);
+      zone = zoneOf(hostname) ?? zoneHint ?? hostname;
+    } else {
+      if (zoneHint === undefined) {
+        throw new HestiaError(
+          "usage",
+          "cannot infer a zone from the tunnel's existing rules — pass --zone or an explicit --hostname",
+        );
+      }
+      zone = zoneHint;
+      hostname = `${name}.${zone}`;
+    }
+    const path = normalizeSharedPath(opts?.path);
+    const selection = resolveEndpointSelection(preflightRecord, services[0]!);
+    if (selection.endpoint.kind !== undefined && selection.endpoint.kind !== "http") {
+      throw new HestiaError("usage", `public tunnels require an HTTP endpoint; ${services[0]} is ${selection.endpoint.kind}`);
+    }
+    const alias = selection.endpoint.alias ?? selection.endpoint.name;
+    // Disjointness preflight — fail BEFORE declaring so a conflict never leaves
+    // a record that breaks every later connector regen. Base/dynamic rules own
+    // a WHOLE hostname, so any path on it collides; sibling shared handles that
+    // merely share the hostname (distinct paths) do NOT — declareSharedHostname
+    // enforces the finer (hostname, path) uniqueness under the shared lock.
+    if (baseRules.some((rule) => rule.hostname === hostname)) {
+      throw new HestiaError(
+        "hostname-conflict",
+        `shared hostname ${hostname} is already claimed by the user's static rules`,
+      );
+    }
+    const dynamicConflict = collectDynamicRules(adopted.uuid).rules.find(
+      (rule) => rule.hostname === hostname,
+    );
+    if (dynamicConflict !== undefined) {
+      throw new HestiaError(
+        "hostname-conflict",
+        `shared hostname ${hostname} is already claimed by project ${dynamicConflict.project}`,
+      );
+    }
+    await assertNamedTunnelDns(hostname, adopted.uuid);
+    await declareSharedHostname({
+      name,
+      hostname,
+      path,
+      tunnelUuid: adopted.uuid,
+      zone,
+      service: alias,
+    });
+    // Claim through the daemon — the single writer for holder transitions.
+    const handle = await ensureDaemon();
+    const claim = await sharedVerb(handle.port, "claim", {
+      name,
+      project,
+      worktree: worktreeRoot,
+      waitMs: 0,
+    });
+    if (!claim.granted) {
+      throw new HestiaError(
+        "shared-held",
+        `shared hostname "${name}" is held by ${claim.holder?.project ?? "another stack"} ` +
+          `(${claim.queued.length} queued) — \`hestia claim ${name} --wait\` to queue for it`,
+      );
+    }
+    const outcome = await reconcileTunnel(
+      { name: tunnelName, uuid: adopted.uuid, credFile: adopted.credFile },
+      { force: opts?.force, readyTimeoutMs: opts?.readyTimeoutMs },
+    );
+    for (const w of outcome.warnings) process.stderr.write(`warning: ${w}\n`);
+    const final = await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
+      const record = readState(worktreeRoot);
+      if (record === null) {
+        throw new HestiaError("service-not-found", "stack disappeared while exposing (concurrent down?)");
+      }
+      applyLocalRouteProjection(record);
+      writeState(worktreeRoot, record);
+      return record;
+    }));
+    if (outcome.error !== undefined) throw outcome.error;
+    await this.#refreshLocalRoutes(true);
+    return final;
   }
 
   /** One quick tunnel per service — zero-account, URL rotates per run. */
@@ -1806,6 +2011,119 @@ export class ComposeEngine implements IsolationEngine {
     if (outcome.error !== undefined) throw outcome.error;
     await this.#refreshLocalRoutes(true);
     return final;
+  }
+
+  /** Resolve this worktree's stack + a declared shared hostname, or throw. */
+  async #sharedContext(cwd: string, name: string) {
+    assertSharedName(name);
+    const { worktreeRoot } = await getRepoInfo(cwd);
+    const record = readState(worktreeRoot);
+    if (record === null) {
+      throw new HestiaError("service-not-found", "no stack in this worktree — `hestia up`/`run` something first");
+    }
+    const shared = readSharedHostname(name);
+    if (shared === null) {
+      throw new HestiaError(
+        "shared-not-found",
+        `no shared hostname "${name}" is declared — \`hestia expose <svc> --shared ${name}\` creates one`,
+      );
+    }
+    return { worktreeRoot, record, shared };
+  }
+
+  /** Re-project shared holdership into this worktree's record after a transition. */
+  async #applySharedProjection(worktreeRoot: string, project: string): Promise<StackRecord> {
+    return withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
+      const record = readState(worktreeRoot);
+      if (record === null) {
+        throw new HestiaError("service-not-found", "stack disappeared during the shared-hostname transition");
+      }
+      applyLocalRouteProjection(record);
+      writeState(worktreeRoot, record);
+      return record;
+    }));
+  }
+
+  /**
+   * Claim a shared hostname for this worktree. Held names queue durably:
+   * `waitMs > 0` long-polls the grant; expiry answers the CLI but the queue
+   * position SURVIVES — re-running claim re-attaches to it.
+   */
+  async claimShared(
+    cwd: string,
+    name: string,
+    opts?: { waitMs?: number },
+  ): Promise<{ record: StackRecord; result: SharedClaimResult }> {
+    const { worktreeRoot, record, shared } = await this.#sharedContext(cwd, name);
+    const endpoint = record.endpoints.find(
+      (candidate) => (candidate.alias ?? candidate.name) === shared.service,
+    );
+    if (endpoint === undefined) {
+      throw new HestiaError(
+        "service-not-found",
+        `shared hostname "${name}" routes to endpoint alias "${shared.service}", which this ` +
+          `stack does not expose — \`hestia up\`/\`run\` it first`,
+      );
+    }
+    if (endpoint.kind !== undefined && endpoint.kind !== "http") {
+      throw new HestiaError("usage", `shared hostnames require an HTTP endpoint; ${shared.service} is ${endpoint.kind}`);
+    }
+    const handle = await ensureDaemon();
+    const result = await sharedVerb(handle.port, "claim", {
+      name,
+      project: record.project,
+      worktree: worktreeRoot,
+      waitMs: opts?.waitMs ?? 0,
+    });
+    if (!result.granted) {
+      const position = result.queued.findIndex((waiter) => waiter.project === record.project) + 1;
+      throw new HestiaError(
+        "shared-held",
+        `shared hostname "${name}" is held by ${result.holder?.project ?? "another stack"}` +
+          (position > 0
+            ? ` — queued durably at position ${position}/${result.queued.length}; the holder can ` +
+              `\`hestia share allow ${name}\`, or re-run \`hestia claim ${name} --wait\` to keep waiting`
+            : ""),
+        { holder: result.holder, queued: result.queued },
+      );
+    }
+    const updated = await this.#applySharedProjection(worktreeRoot, record.project);
+    await this.#refreshLocalRoutes();
+    return { record: updated, result };
+  }
+
+  /** Release a held shared hostname; the queue head is granted immediately. */
+  async releaseShared(cwd: string, name: string): Promise<StackRecord> {
+    const { worktreeRoot, record } = await this.#sharedContext(cwd, name);
+    const handle = await ensureDaemon();
+    await sharedVerb(handle.port, "release", { name, project: record.project });
+    const updated = await this.#applySharedProjection(worktreeRoot, record.project);
+    await this.#refreshLocalRoutes();
+    return updated;
+  }
+
+  /** Drop this worktree's durable queue entry without touching the holder. */
+  async cancelSharedClaim(cwd: string, name: string): Promise<void> {
+    const { record } = await this.#sharedContext(cwd, name);
+    const handle = await ensureDaemon();
+    await sharedVerb(handle.port, "cancel", { name, project: record.project });
+  }
+
+  /** Holder consents: hand the hostname to the queue head. */
+  async allowShared(cwd: string, name: string): Promise<StackRecord> {
+    const { worktreeRoot, record } = await this.#sharedContext(cwd, name);
+    const handle = await ensureDaemon();
+    await sharedVerb(handle.port, "allow", { name, project: record.project });
+    const updated = await this.#applySharedProjection(worktreeRoot, record.project);
+    await this.#refreshLocalRoutes();
+    return updated;
+  }
+
+  /** Holder declines the head request; the waiter stays durably queued. */
+  async denyShared(cwd: string, name: string): Promise<void> {
+    const { record } = await this.#sharedContext(cwd, name);
+    const handle = await ensureDaemon();
+    await sharedVerb(handle.port, "deny", { name, project: record.project });
   }
 
   async status(cwd: string): Promise<StackRecord | null> {
