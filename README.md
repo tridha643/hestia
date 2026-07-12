@@ -168,8 +168,9 @@ hestia router status
 ```
 
 Individual Docker workloads are not stoppable; use `hestia down`. Named
-volumes are retained unless `--destroy` is explicit. `doctor` is strictly
-report-only.
+volumes and project-built images are retained unless `--destroy` is explicit
+(`--destroy` removes named volumes and `--rmi local` project images; shared
+base images are left in place). `doctor` is strictly report-only.
 
 ## Development and release
 
