@@ -9,7 +9,7 @@ import { isLive, listPidfiles, procsDir } from "./proc/pidfile.ts";
 import { detectVarlock } from "./proc/resolver.ts";
 import { discoverWorkers } from "./wrangler/discover.ts";
 import { connectorPidfile, listAdopted, readAdopted } from "./tunnel/registry.ts";
-import { listTunnels } from "./tunnel/cloudflared.ts";
+import { countConnectors } from "./tunnel/cloudflared.ts";
 import { isReady } from "./tunnel/verify.ts";
 import { fetchHealth, readDaemonJson } from "./daemon/client.ts";
 import { HESTIAD_PROTOCOL_VERSION } from "./daemon/routes.ts";
@@ -279,12 +279,6 @@ async function tunnelChecks(): Promise<DoctorRow[]> {
   const rows: DoctorRow[] = [];
   const adopted = listAdopted();
   if (adopted.length === 0) return rows;
-  let tunnels: Awaited<ReturnType<typeof listTunnels>> | null = null;
-  try {
-    tunnels = await listTunnels();
-  } catch {
-    tunnels = null; // offline / no cert — degrade below
-  }
   for (const uuid of adopted) {
     const ref = readAdopted(uuid);
     const label = `tunnel:${ref?.name ?? uuid}`;
@@ -299,18 +293,22 @@ async function tunnelChecks(): Promise<DoctorRow[]> {
           : row(label, "warn", "connector running but no edge connection yet"),
       );
     }
-    if (tunnels === null) {
+    let connectors: number | null;
+    try {
+      connectors = await countConnectors(uuid);
+    } catch {
+      connectors = null; // offline / no cert — degrade below
+    }
+    if (connectors === null) {
       rows.push(row(`${label}:connectors`, "unknown", "cloudflare unreachable — cannot count connectors"));
     } else {
-      const info = tunnels.find((t) => t.id === uuid);
-      const conns = info?.connections?.length ?? 0;
       const expected = live ? 1 : 0;
-      if (conns > expected) {
+      if (connectors > expected) {
         rows.push(
           row(
             `${label}:connectors`,
             "error",
-            `${conns} connector(s) registered but hestia runs ${expected} — a foreign ` +
+            `${connectors} connector(s) registered but hestia runs ${expected} — a foreign ` +
               `replica cross-wires worktrees; stop the other cloudflared`,
           ),
         );
