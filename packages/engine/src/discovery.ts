@@ -2,11 +2,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join, relative } from "node:path";
+import { parse as parseYaml } from "yaml";
 import { HestiaError } from "@hestia/core";
 import { getRepoInfo } from "./git.ts";
 import { readState } from "./state.ts";
 import { discoverWorkers } from "./wrangler/discover.ts";
 import { tryLoadConfig } from "./config.ts";
+import { composeContainerBindings } from "./compose/override.ts";
 import {
   machineRepositoryConfigPath,
   readConfigLayer,
@@ -86,7 +88,21 @@ async function resolveComposeServices(composeFile: string, cwd: string): Promise
     }));
   } catch {
     const config = tryLoadConfig(cwd);
-    return (config?.services ?? []).map((name) => ({ name, ports: [] }));
+    if (config === null) return [];
+    try {
+      const model = parseYaml(readFileSync(config.composeFile, "utf8")) as {
+        services?: Record<string, { ports?: unknown }>;
+      } | null;
+      return Object.entries(model?.services ?? {}).map(([name, service]) => ({
+        name,
+        ports: composeContainerBindings(service.ports).map((port) => ({
+          target: String(port.target),
+          protocol: port.protocol,
+        })),
+      }));
+    } catch {
+      return config.services.map((name) => ({ name, ports: [] }));
+    }
   }
 }
 

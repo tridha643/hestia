@@ -77,6 +77,24 @@ describe("generateOverride", () => {
     expect(r.servicePorts).toEqual({ a: [8080], b: [3000] });
   });
 
+  test("ignores unresolved interpolation, ranges, and invalid target ports", () => {
+    const r = generateOverride({
+      userCompose: {
+        services: {
+          web: {
+            ports: ["${PORT:-3000}:${PORT:-3000}", "3000-3005", "0", "65536", "8080/udp"],
+          },
+        },
+      },
+      project: "p",
+      repo: "r",
+      branch: "b",
+      worktree: "/wt",
+      services: ["web"],
+    });
+    expect(r.serviceBindings.web).toEqual([{ target: 8080, protocol: "udp" }]);
+  });
+
   test("throws on an unknown service", () => {
     expect(() =>
       generateOverride({

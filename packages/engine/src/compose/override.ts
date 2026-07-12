@@ -28,24 +28,27 @@ function q(s: string): string {
  * `"54322:5432"`, `"127.0.0.1:54322:5432"`, `"5432"`, `5432`, or the long form
  * `{ target: 5432, published: 54322 }`.
  */
-function containerBindingsOf(portsEntry: unknown): Array<{ target: number; protocol: "tcp" | "udp" }> {
+export function composeContainerBindings(
+  portsEntry: unknown,
+): Array<{ target: number; protocol: "tcp" | "udp" }> {
   if (!Array.isArray(portsEntry)) return [];
   const out: Array<{ target: number; protocol: "tcp" | "udp" }> = [];
+  const validPort = (value: number): boolean => Number.isInteger(value) && value > 0 && value <= 65535;
   for (const p of portsEntry) {
-    if (typeof p === "number") {
+    if (typeof p === "number" && validPort(p)) {
       out.push({ target: p, protocol: "tcp" });
     } else if (typeof p === "string") {
       const [spec, rawProtocol = "tcp"] = p.split("/");
       const parts = spec.split(":");
       const last = parts[parts.length - 1]!;
-      const n = Number.parseInt(last, 10);
-      if (Number.isFinite(n) && (rawProtocol === "tcp" || rawProtocol === "udp")) {
+      const n = /^\d+$/.test(last) ? Number(last) : Number.NaN;
+      if (validPort(n) && (rawProtocol === "tcp" || rawProtocol === "udp")) {
         out.push({ target: n, protocol: rawProtocol });
       }
     } else if (p && typeof p === "object" && "target" in p) {
       const n = Number((p as { target: unknown }).target);
       const rawProtocol = (p as { protocol?: unknown }).protocol ?? "tcp";
-      if (Number.isFinite(n) && (rawProtocol === "tcp" || rawProtocol === "udp")) {
+      if (validPort(n) && (rawProtocol === "tcp" || rawProtocol === "udp")) {
         out.push({ target: n, protocol: rawProtocol });
       }
     }
@@ -85,7 +88,7 @@ export function generateOverride(input: OverrideInput): OverrideResult {
         ).join(", ") || "none"})`,
       );
     }
-    const bindings = containerBindingsOf(def.ports);
+    const bindings = composeContainerBindings(def.ports);
     const cports = bindings.map((binding) => binding.target);
     servicePorts[svc] = cports;
     serviceBindings[svc] = bindings;

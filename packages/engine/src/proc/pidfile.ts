@@ -149,6 +149,17 @@ export function startTimeOf(pid: number): string | null {
 
 let installedProcessLocales: string[] | undefined;
 const legacyStartTimeMatches = new Map<string, boolean>();
+const legacyMacosProcessLocales = [
+  "en_US.UTF-8",
+  "fr_FR.UTF-8",
+  "de_DE.UTF-8",
+  "es_ES.UTF-8",
+  "it_IT.UTF-8",
+  "pt_BR.UTF-8",
+  "ja_JP.UTF-8",
+  "ko_KR.UTF-8",
+  "zh_CN.UTF-8",
+];
 
 function processLocales(): string[] {
   if (installedProcessLocales !== undefined) return installedProcessLocales;
@@ -159,6 +170,7 @@ function processLocales(): string[] {
       process.env.LC_TIME,
       process.env.LANG,
       "C",
+      ...legacyMacosProcessLocales,
       ...output.split("\n"),
     ].filter((locale): locale is string => locale !== undefined && locale !== ""))];
   } catch {
