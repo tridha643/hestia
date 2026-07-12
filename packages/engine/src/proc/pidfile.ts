@@ -190,11 +190,15 @@ function plausibleProcessLocales(
   const date = new Date(canonicalStartTime);
   const recorded = normalizedLocaleText(recordedStartTime);
   const preferred = [process.env.LC_ALL, process.env.LC_TIME, process.env.LANG, "C"];
+  const legacyMacosLocales = new Set(legacyMacosProcessLocales);
   if (Number.isNaN(date.getTime())) {
     return [...new Set(preferred.filter((locale): locale is string => locale !== undefined))];
   }
   const plausible = processLocales().filter((locale) => {
-    if (preferred.includes(locale)) return true;
+    // BSD ps abbreviations do not always match Intl (for example French
+    // `jul` versus `juil.`). The bounded migration list is cheap to try, and
+    // safety still comes from exact reproduction of the full lstart string.
+    if (preferred.includes(locale) || legacyMacosLocales.has(locale)) return true;
     try {
       const languageTag = locale.replace(/\..*$/, "").replace(/@.*$/, "").replaceAll("_", "-");
       const parts = new Intl.DateTimeFormat(languageTag, {
