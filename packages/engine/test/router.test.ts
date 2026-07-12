@@ -158,6 +158,7 @@ describe("hestiad local HTTP router", () => {
     const worktree = join(home, "worktree");
     const record = sampleRecord(worktree, originPort);
     record.localRoutes = [{ service: "dashboard" }];
+    record.endpoints[0]!.publicUrl = "https://quick-example.trycloudflare.com";
     ensureDir(worktree);
     writeState(worktree, record);
     expect(mirrorDir(record.project)).toContain(home);
@@ -201,6 +202,16 @@ describe("hestiad local HTTP router", () => {
         forwardedFor: "127.0.0.1",
         forwardedUser: undefined,
         internalAuth: undefined,
+      });
+
+      const publicResponse = await fetch(`http://127.0.0.1:${routerPort}/public`, {
+        headers: { host: "quick-example.trycloudflare.com" },
+      });
+      expect(publicResponse.status).toBe(200);
+      expect(await publicResponse.json()).toMatchObject({
+        host: `127.0.0.1:${originPort}`,
+        path: "/public",
+        forwardedHost: "quick-example.trycloudflare.com",
       });
 
       const malformedHost = await new Promise<string>((resolve, reject) => {

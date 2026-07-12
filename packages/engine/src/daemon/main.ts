@@ -43,6 +43,15 @@ async function main(): Promise<void> {
     const existing = readPidfile(root, PIDFILE_NAME);
     if (existing !== null && isLive(existing)) return false;
 
+    // A pidfile without the verbatim lstart identity can never validate. If
+    // identity capture is temporarily unavailable, fail before opening any
+    // listener instead of publishing an invalid pidfile that lets every
+    // subsequent caller become another daemon.
+    const startTime = startTimeOf(process.pid);
+    if (startTime === null) {
+      throw new Error(`hestiad process identity unavailable for PID ${process.pid}`);
+    }
+
     const broker = new SessionBroker({
       // No session semantics this phase — hestiad rejects registrations until
       // the TUI/log-streaming effort defines them.
@@ -78,7 +87,6 @@ async function main(): Promise<void> {
     });
 
     // Written while still holding the lock: identity first, then discovery.
-    const startTime = startTimeOf(process.pid) ?? "";
     writePidfile(root, {
       schemaVersion: 1,
       name: PIDFILE_NAME,

@@ -54,7 +54,7 @@ let sourceStatus = "";
 let packageManagerVersion = "";
 let environment: Record<string, string> = {};
 const projects = new Set<string>();
-const PORTLESS_CLI = join(HESTIA_ROOT, "node_modules", "portless", "dist", "cli.js");
+const PORTLESS_CLI = join(HESTIA_ROOT, "dist", "assets", "portless", "dist", "cli.js");
 let portlessPort = 0;
 
 function commandExists(command: string): boolean {
@@ -214,6 +214,14 @@ function copyModemEnvironment(worktree: string): void {
   chmodSync(destination, 0o600);
 }
 
+function prepareHestiaRuntimeIgnore(worktree: string): void {
+  const ignorePath = join(worktree, ".gitignore");
+  const source = existsSync(ignorePath) ? readFileSync(ignorePath, "utf8") : "";
+  const lines = source.split(/\r?\n/);
+  if (lines.includes(".hestia/")) return;
+  writeFileSync(ignorePath, `${source}${source.endsWith("\n") || source === "" ? "" : "\n"}.hestia/\n`);
+}
+
 /**
  * Current modem refs define Slack Hyperdrive bindings only in deployed
  * environments. Promote the existing binding declarations in the disposable
@@ -310,6 +318,9 @@ suite("real modem Fleet TUI", () => {
     for (const command of ["docker", "corepack", "varlock", "bun", "git"]) {
       if (!commandExists(command)) throw new Error(`real modem TUI gate requires ${command} on PATH`);
     }
+    if (!existsSync(PORTLESS_CLI) || !readFileSync(PORTLESS_CLI, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) {
+      throw new Error("real modem TUI gate requires the hardened Portless payload from `bun run build`");
+    }
     execFileSync("docker", ["info"], { stdio: "ignore", timeout: 15_000 });
     sourceStatus = git(MODEM_REPOSITORY, ["status", "--porcelain=v1", "--untracked-files=all"]);
     const packageJson = JSON.parse(
@@ -330,6 +341,8 @@ suite("real modem Fleet TUI", () => {
     git(MODEM_REPOSITORY, ["worktree", "add", "-q", "-b", branchB, worktreeB, MODEM_REF]);
     copyModemEnvironment(worktreeA);
     copyModemEnvironment(worktreeB);
+    prepareHestiaRuntimeIgnore(worktreeA);
+    prepareHestiaRuntimeIgnore(worktreeB);
     prepareLocalSlackHyperdrive(worktreeA);
     prepareLocalSlackHyperdrive(worktreeB);
     installModemDependencies(worktreeA);

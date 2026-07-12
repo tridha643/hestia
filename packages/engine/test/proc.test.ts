@@ -66,6 +66,53 @@ describe("detached spawn survives the spawning process (the Bun compat assumptio
 });
 
 describe("pidfile liveness (verbatim lstart guard)", () => {
+  test("process identity stays stable across caller locales", () => {
+    const originalLcAll = process.env.LC_ALL;
+    const originalLang = process.env.LANG;
+    try {
+      process.env.LC_ALL = "en_DK.UTF-8";
+      process.env.LANG = "en_DK.UTF-8";
+      const danishCaller = startTimeOf(process.pid);
+      process.env.LC_ALL = "C";
+      process.env.LANG = "C";
+      expect(startTimeOf(process.pid)).toBe(danishCaller);
+    } finally {
+      if (originalLcAll === undefined) delete process.env.LC_ALL;
+      else process.env.LC_ALL = originalLcAll;
+      if (originalLang === undefined) delete process.env.LANG;
+      else process.env.LANG = originalLang;
+    }
+  });
+
+  test("pre-normalization locale ordering remains live during upgrade", () => {
+    const canonical = startTimeOf(process.pid)!;
+    const [weekday, month, day, time, year] = canonical.split(/\s+/);
+    const legacyLocaleOrder = `${weekday} ${day} ${month} ${time} ${year}`;
+    expect(isLive({ pid: process.pid, startTime: legacyLocaleOrder })).toBe(true);
+  });
+
+  test("translated pre-normalization locale remains live during upgrade", () => {
+    const locale = "fr_FR.UTF-8";
+    const parent = `
+      const { spawn } = require("node:child_process");
+      const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore", env: process.env });
+      child.unref();
+      console.log(child.pid);
+    `;
+    const pid = Number(execFileSync("bun", ["-e", parent], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: locale, LANG: locale },
+    }).trim());
+    cleanupPgids.push(pid);
+    const translated = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: locale, LANG: locale },
+    }).trim();
+    expect(translated).not.toBe(startTimeOf(pid));
+    expect(isLive({ pid, startTime: translated })).toBe(true);
+    process.kill(-pid, "SIGKILL");
+  });
+
   test("live process matches; wrong startTime reads as dead", () => {
     const out = execFileSync(
       "bun",

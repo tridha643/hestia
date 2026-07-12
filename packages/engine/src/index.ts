@@ -1534,7 +1534,7 @@ export class ComposeEngine implements IsolationEngine {
     if (project === undefined) {
       throw new HestiaError("service-not-found", "no stack in this worktree — `hestia up`/`run` something first");
     }
-    return withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
+    const exposed = await withLock(worktreeRoot, () => withLock(projectMutationRoot(project), async () => {
       const record = readState(worktreeRoot);
       if (record === null) {
         throw new HestiaError(
@@ -1646,6 +1646,8 @@ export class ComposeEngine implements IsolationEngine {
       writeState(worktreeRoot, record);
       return record;
     }));
+    await this.#refreshLocalRoutes(true);
+    return exposed;
   }
 
   /**
@@ -1791,6 +1793,7 @@ export class ComposeEngine implements IsolationEngine {
       return record;
     }));
     if (outcome.error !== undefined) throw outcome.error;
+    await this.#refreshLocalRoutes(true);
     return final;
   }
 

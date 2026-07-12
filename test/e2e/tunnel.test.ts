@@ -419,7 +419,11 @@ describe.if(process.env.HESTIA_E2E_TUNNEL === "1")("real quick tunnel through th
       const deadline = Date.now() + 90_000;
       while (Date.now() < deadline && marker === undefined) {
         try {
-          const ip = execFileSync("dig", ["+short", host, "A"], {
+          // Query Cloudflare's recursive resolver directly. On macOS, plain
+          // `dig` still uses the configured system resolver and can observe
+          // the same negative cache as curl after the first quick-tunnel
+          // NXDOMAIN, despite bypassing Bun's own lookup cache.
+          const ip = execFileSync("dig", ["+short", "@1.1.1.1", host, "A"], {
             encoding: "utf8",
             timeout: 10_000,
           })

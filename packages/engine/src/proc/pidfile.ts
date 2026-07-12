@@ -125,15 +125,120 @@ export function procSpecFingerprint(spec: ProcSpec): string {
  * post-spawn and re-read on every liveness check; both reads run on the same
  * host so the platform's `lstart` format never has to be parsed.
  */
-export function startTimeOf(pid: number): string | null {
+function readProcessStartTime(
+  pid: number,
+  env: NodeJS.ProcessEnv,
+): string | null {
   try {
     const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf8",
+      env,
     }).trim();
     return out === "" ? null : out;
   } catch {
     return null;
   }
+}
+
+export function startTimeOf(pid: number): string | null {
+  // BSD ps localizes lstart. Daemons launched from a TUI and later inspected
+  // from a shell can otherwise render the same instant differently, defeating
+  // the verbatim identity guard and allowing duplicate supervisors.
+  return readProcessStartTime(pid, { ...process.env, LC_ALL: "C", LANG: "C" });
+}
+
+let installedProcessLocales: string[] | undefined;
+const legacyStartTimeMatches = new Map<string, boolean>();
+
+function processLocales(): string[] {
+  if (installedProcessLocales !== undefined) return installedProcessLocales;
+  try {
+    const output = execFileSync("locale", ["-a"], { encoding: "utf8" });
+    installedProcessLocales = [...new Set([
+      process.env.LC_ALL,
+      process.env.LC_TIME,
+      process.env.LANG,
+      "C",
+      ...output.split("\n"),
+    ].filter((locale): locale is string => locale !== undefined && locale !== ""))];
+  } catch {
+    installedProcessLocales = ["C"];
+  }
+  return installedProcessLocales;
+}
+
+function normalizedLocaleText(value: string): string {
+  return value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function plausibleProcessLocales(
+  canonicalStartTime: string,
+  recordedStartTime: string,
+): string[] {
+  const date = new Date(canonicalStartTime);
+  const recorded = normalizedLocaleText(recordedStartTime);
+  const preferred = [process.env.LC_ALL, process.env.LC_TIME, process.env.LANG, "C"];
+  if (Number.isNaN(date.getTime())) {
+    return [...new Set(preferred.filter((locale): locale is string => locale !== undefined))];
+  }
+  const plausible = processLocales().filter((locale) => {
+    if (preferred.includes(locale)) return true;
+    try {
+      const languageTag = locale.replace(/\..*$/, "").replace(/@.*$/, "").replaceAll("_", "-");
+      const parts = new Intl.DateTimeFormat(languageTag, {
+        weekday: "short",
+        month: "short",
+      }).formatToParts(date);
+      const words = parts
+        .filter((part) => part.type === "weekday" || part.type === "month")
+        .map((part) => normalizedLocaleText(part.value))
+        .filter(Boolean);
+      return words.length === 2 && words.every((word) => recorded.includes(word));
+    } catch {
+      return false;
+    }
+  });
+  return [...new Set(plausible)];
+}
+
+function legacyLocalizedStartTimeMatches(
+  pid: number,
+  canonicalStartTime: string,
+  recordedStartTime: string,
+): boolean {
+  const cacheKey = `${pid}\0${canonicalStartTime}\0${recordedStartTime}`;
+  const cached = legacyStartTimeMatches.get(cacheKey);
+  if (cached !== undefined) return cached;
+  let matched = false;
+  for (const locale of plausibleProcessLocales(canonicalStartTime, recordedStartTime)) {
+    const localized = readProcessStartTime(pid, {
+      ...process.env,
+      LC_ALL: locale,
+      LANG: locale,
+    });
+    if (localized !== null && processStartTimeMatches(localized, recordedStartTime)) {
+      matched = true;
+      break;
+    }
+  }
+  if (legacyStartTimeMatches.size >= 512) {
+    const oldest = legacyStartTimeMatches.keys().next().value;
+    if (oldest !== undefined) legacyStartTimeMatches.delete(oldest);
+  }
+  legacyStartTimeMatches.set(cacheKey, matched);
+  return matched;
+}
+
+function processStartTimeMatches(current: string, recorded: string): boolean {
+  if (current === recorded) return true;
+  // Pre-normalization pidfiles can contain the same BSD lstart fields in a
+  // locale-dependent order (`Sat 11 Jul` instead of `Sat Jul 11`). Preserve
+  // upgrade safety without accepting a different instant: every complete
+  // token must still match, and future writes always use the canonical form.
+  const currentTokens = current.split(/\s+/);
+  const recordedTokens = recorded.split(/\s+/);
+  if (currentTokens.length !== 5 || recordedTokens.length !== 5) return false;
+  return currentTokens.toSorted().join("\0") === recordedTokens.toSorted().join("\0");
 }
 
 /** Live means: pid exists AND it is still the same process we spawned. */
@@ -143,5 +248,8 @@ export function isLive(pf: Pick<Pidfile, "pid" | "startTime">): boolean {
   } catch {
     return false;
   }
-  return startTimeOf(pf.pid) === pf.startTime;
+  const current = startTimeOf(pf.pid);
+  if (current !== null && processStartTimeMatches(current, pf.startTime)) return true;
+  return current !== null &&
+    legacyLocalizedStartTimeMatches(pf.pid, current, pf.startTime);
 }

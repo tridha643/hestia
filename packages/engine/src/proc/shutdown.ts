@@ -1,4 +1,4 @@
-import { isLive, startTimeOf, type Pidfile } from "./pidfile.ts";
+import { isLive, type Pidfile } from "./pidfile.ts";
 import { processTree } from "./ports.ts";
 
 const GRACE_MS = 10_000;
@@ -31,7 +31,7 @@ function groupsOf(t: StopTarget): Set<number> {
     for (const row of processTree(t.pid)) groups.add(row.pgid);
   } else {
     for (const c of t.children ?? []) {
-      if (startTimeOf(c.pid) === c.startTime) groups.add(c.pgid);
+      if (isLive(c)) groups.add(c.pgid);
     }
   }
   return groups;
@@ -43,7 +43,7 @@ function liveIdentities(
   return [
     { pid: t.pid, startTime: t.startTime },
     ...(t.children ?? []),
-  ].filter((c) => startTimeOf(c.pid) === c.startTime);
+  ].filter(isLive);
 }
 
 async function waitAllDead(t: StopTarget, timeoutMs: number): Promise<boolean> {

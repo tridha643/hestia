@@ -4,15 +4,25 @@ import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
 import { HestiaError } from "@hestia/core";
 import { ensureDir, hestiaHome } from "../state.ts";
 import { startTimeOf } from "../proc/pidfile.ts";
 import { writeAtomicJsonFile } from "../atomic-json-file.ts";
+import { ensureDaemon } from "../daemon/ensure.ts";
+import { withLock } from "../proc/lock.ts";
+import {
+  HESTIA_PORTLESS_VERSION,
+  expectedPortlessPayloadProvenance,
+  portlessPayloadProvenanceIsCurrent,
+} from "./portless-payload.ts";
 
 const pexec = promisify(execFile);
-export const HESTIA_PORTLESS_VERSION = "0.15.1";
+export { HESTIA_PORTLESS_VERSION };
 const PORTLESS_LAUNCHD_PLIST = "/Library/LaunchDaemons/sh.portless.proxy.plist";
 const HESTIA_ROUTER_INSTALL_DIR = "/Library/Application Support/Hestia/router";
+const HESTIA_ROUTER_STAGED_DIR = "/Library/Application Support/Hestia/router.next";
+const HESTIA_ROUTER_PREVIOUS_DIR = "/Library/Application Support/Hestia/router.previous";
 const HESTIA_ROUTER_BUN = join(HESTIA_ROUTER_INSTALL_DIR, "bun");
 const HESTIA_ROUTER_PORTLESS = join(HESTIA_ROUTER_INSTALL_DIR, "portless");
 const HESTIA_ROUTER_CLI = join(HESTIA_ROUTER_PORTLESS, "dist", "cli.js");
@@ -29,18 +39,31 @@ export function hestiaPortlessAliasesPath(): string {
 }
 
 function portlessCliPath(): string {
-  const bundled = join(dirname(fileURLToPath(import.meta.url)), "assets", "portless", "dist", "cli.js");
-  if (existsSync(bundled)) return bundled;
-  const workspaceBuild = join(process.cwd(), "dist", "assets", "portless", "dist", "cli.js");
-  if (existsSync(workspaceBuild)) return workspaceBuild;
-  const development = join(dirname(fileURLToPath(import.meta.resolve("portless"))), "cli.js");
-  if (!readFileSync(development, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) {
-    throw new HestiaError(
-      "router-version-unsupported",
-      "development Portless is not hardened; run bun run build and retry through dist/cli.js",
-    );
+  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const bundled = join(moduleDirectory, "assets", "portless", "dist", "cli.js");
+  if (existsSync(bundled) && portlessPayloadRootIsCurrent(dirname(dirname(bundled)))) return bundled;
+  const workspaceBuild = join(moduleDirectory, "..", "..", "..", "..", "dist", "assets", "portless", "dist", "cli.js");
+  if (existsSync(workspaceBuild) && portlessPayloadRootIsCurrent(dirname(dirname(workspaceBuild)))) {
+    return workspaceBuild;
   }
-  return development;
+  throw new HestiaError(
+    "router-version-unsupported",
+    "current hardened Portless payload is unavailable; run bun run build and retry",
+  );
+}
+
+function portlessPayloadRootIsCurrent(root: string): boolean {
+  try {
+    return portlessPayloadProvenanceIsCurrent(
+      JSON.parse(readFileSync(join(root, "provenance.json"), "utf8")),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function installedPortlessPayloadIsCurrent(): boolean {
+  return portlessPayloadRootIsCurrent(HESTIA_ROUTER_PORTLESS);
 }
 
 function xmlEscape(value: string): string {
@@ -181,14 +204,28 @@ async function runRootCommand(command: string, args: string[], interactive: bool
   }
 }
 
-async function prepareHardenedPortlessPayload(interactive: boolean): Promise<void> {
+async function prepareHardenedPortlessPayloadAt(
+  installDir: string,
+  interactive: boolean,
+): Promise<void> {
   const packageRoot = dirname(dirname(portlessCliPath()));
-  await runRootCommand("mkdir", ["-p", HESTIA_ROUTER_INSTALL_DIR], interactive);
-  await runRootCommand("rm", ["-rf", HESTIA_ROUTER_PORTLESS], interactive);
-  await runRootCommand("ditto", [packageRoot, HESTIA_ROUTER_PORTLESS], interactive);
-  await runRootCommand("cp", [process.execPath, HESTIA_ROUTER_BUN], interactive);
-  await runRootCommand("chown", ["-R", "root:wheel", HESTIA_ROUTER_INSTALL_DIR], interactive);
-  await runRootCommand("chmod", ["-R", "go-w", HESTIA_ROUTER_INSTALL_DIR], interactive);
+  const portlessDir = join(installDir, "portless");
+  const bunPath = join(installDir, "bun");
+  const provenanceSource = join(dirname(hestiaPortlessAliasesPath()), "payload-provenance.json");
+  ensureDir(dirname(provenanceSource));
+  writeAtomicJsonFile(provenanceSource, expectedPortlessPayloadProvenance());
+  await runRootCommand("mkdir", ["-p", installDir], interactive);
+  await runRootCommand("rm", ["-rf", portlessDir], interactive);
+  await runRootCommand("ditto", [packageRoot, portlessDir], interactive);
+  await runRootCommand("cp", [provenanceSource, join(portlessDir, "provenance.json")], interactive);
+  await runRootCommand("cp", [process.execPath, bunPath], interactive);
+  await runRootCommand("chown", ["-R", "root:wheel", installDir], interactive);
+  await runRootCommand("chmod", ["-R", "go-w", installDir], interactive);
+  rmSync(provenanceSource, { force: true });
+}
+
+async function prepareHardenedPortlessPayload(interactive: boolean): Promise<void> {
+  await prepareHardenedPortlessPayloadAt(HESTIA_ROUTER_INSTALL_DIR, interactive);
 }
 
 async function runHardenedPortlessService(
@@ -316,11 +353,114 @@ async function waitForInstalledHestiaRouter(timeoutMs = 10_000): Promise<HestiaR
   return status;
 }
 
+async function waitForRunningHestiaRouter(timeoutMs = 10_000): Promise<HestiaRouterStatus> {
+  const deadline = Date.now() + timeoutMs;
+  let status = await readHestiaRouterStatus();
+  while (Date.now() < deadline && !(status.installed && status.running)) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    status = await readHestiaRouterStatus();
+  }
+  if (!(status.installed && status.running)) {
+    throw new HestiaError(
+      "router-unreachable",
+      "Router payload upgrade did not produce a running, Hestia-owned service",
+    );
+  }
+  return status;
+}
+
+async function returnWithCurrentDaemon(status: HestiaRouterStatus): Promise<HestiaRouterStatus> {
+  await ensureDaemon();
+  return status;
+}
+
+async function upgradeHardenedPortlessPayloadUnlocked(
+  interactive: boolean,
+): Promise<HestiaRouterStatus> {
+  const stagedPortless = join(HESTIA_ROUTER_STAGED_DIR, "portless");
+  const stagedBun = join(HESTIA_ROUTER_STAGED_DIR, "bun");
+  const previousPortless = join(HESTIA_ROUTER_PREVIOUS_DIR, "portless");
+  const previousBun = join(HESTIA_ROUTER_PREVIOUS_DIR, "bun");
+  let preservePrevious = false;
+  try {
+    await runRootCommand("rm", ["-rf", HESTIA_ROUTER_STAGED_DIR, HESTIA_ROUTER_PREVIOUS_DIR], interactive);
+    await prepareHardenedPortlessPayloadAt(HESTIA_ROUTER_STAGED_DIR, interactive);
+    await runRootCommand("mkdir", ["-p", HESTIA_ROUTER_PREVIOUS_DIR], interactive);
+    await runRootCommand("ditto", [HESTIA_ROUTER_PORTLESS, previousPortless], interactive);
+    await runRootCommand("cp", [HESTIA_ROUTER_BUN, previousBun], interactive);
+    await runHardenedPortlessService("uninstall", interactive);
+    try {
+      await runRootCommand("rm", ["-rf", HESTIA_ROUTER_PORTLESS], interactive);
+      await runRootCommand("ditto", [stagedPortless, HESTIA_ROUTER_PORTLESS], interactive);
+      await runRootCommand("cp", [stagedBun, HESTIA_ROUTER_BUN], interactive);
+      await runRootCommand("chown", ["-R", "root:wheel", HESTIA_ROUTER_INSTALL_DIR], interactive);
+      await runRootCommand("chmod", ["-R", "go-w", HESTIA_ROUTER_INSTALL_DIR], interactive);
+      await runHardenedPortlessService("install", interactive);
+      return await waitForRunningHestiaRouter();
+    } catch (upgradeError) {
+      await runHardenedPortlessService("uninstall", interactive).catch(() => {});
+      try {
+        await runRootCommand("rm", ["-rf", HESTIA_ROUTER_PORTLESS], interactive);
+        await runRootCommand("ditto", [previousPortless, HESTIA_ROUTER_PORTLESS], interactive);
+        await runRootCommand("cp", [previousBun, HESTIA_ROUTER_BUN], interactive);
+        await runRootCommand("chown", ["-R", "root:wheel", HESTIA_ROUTER_INSTALL_DIR], interactive);
+        await runRootCommand("chmod", ["-R", "go-w", HESTIA_ROUTER_INSTALL_DIR], interactive);
+        await runHardenedPortlessService("install", interactive);
+        await waitForRunningHestiaRouter();
+      } catch (restoreError) {
+        preservePrevious = true;
+        throw new Error(
+          `new payload failed (${(upgradeError as Error).message}); previous payload restore failed ` +
+          `(${(restoreError as Error).message})`,
+        );
+      }
+      throw upgradeError;
+    }
+  } finally {
+    await runRootCommand("rm", ["-rf", HESTIA_ROUTER_STAGED_DIR], interactive, true);
+    if (!preservePrevious) {
+      await runRootCommand("rm", ["-rf", HESTIA_ROUTER_PREVIOUS_DIR], interactive, true);
+    }
+  }
+}
+
+async function upgradeHardenedPortlessPayload(
+  interactive: boolean,
+): Promise<HestiaRouterStatus> {
+  const uid = process.getuid?.() ?? 501;
+  const lockRoot = join(tmpdir(), `hestia-${uid}`, "router-payload-upgrade");
+  return withLock(
+    lockRoot,
+    () => upgradeHardenedPortlessPayloadUnlocked(interactive),
+    120_000,
+  );
+}
+
 /** Install the trusted Portless service; non-interactive mode never waits for sudo. */
 export async function installHestiaRouter(interactive: boolean): Promise<HestiaRouterStatus> {
   const ownership = requireHestiaServiceOwnership("install");
   const existing = await readHestiaRouterStatus();
-  if (ownership === "hestia" && existing.running && existing.trusted) return existing;
+  const payloadCurrent = ownership === "hestia" && installedPortlessPayloadIsCurrent();
+  if (ownership === "hestia" && existing.running && existing.trusted && payloadCurrent) {
+    return returnWithCurrentDaemon(existing);
+  }
+  if (ownership === "hestia" && existing.running && !payloadCurrent) {
+    if (interactive && !process.stdin.isTTY) {
+      throw new HestiaError("router-privilege-required", "Router install: --interactive requires a TTY");
+    }
+    if (!interactive) requireNonInteractivePrivilege();
+    try {
+      let upgraded = await upgradeHardenedPortlessPayload(interactive);
+      if (!upgraded.trusted) {
+        await trustHestiaPortlessCa(interactive);
+        upgraded = await waitForInstalledHestiaRouter();
+      }
+      return returnWithCurrentDaemon(upgraded);
+    } catch (error) {
+      const detail = (error as { stderr?: string; message?: string }).stderr ?? (error as Error).message;
+      throw new HestiaError("router-unreachable", `Router payload upgrade failed: ${detail.trim()}`);
+    }
+  }
   if (ownership === "hestia" && existing.running) {
     if (interactive && !process.stdin.isTTY) {
       throw new HestiaError("router-privilege-required", "Router install: --interactive requires a TTY");
@@ -333,7 +473,7 @@ export async function installHestiaRouter(interactive: boolean): Promise<HestiaR
     }
     const trusted = await readHestiaRouterStatus();
     if (!trusted.trusted) throw new HestiaError("router-unreachable", "Router trust failed: CA remains untrusted");
-    return trusted;
+    return returnWithCurrentDaemon(trusted);
   }
   if (await loopbackPortIsBusy(443)) {
     throw new HestiaError("router-port-busy", "Router install: port 443 is already owned by another process");
@@ -362,7 +502,7 @@ export async function installHestiaRouter(interactive: boolean): Promise<HestiaR
     }
     throw new HestiaError("router-unreachable", `Router install failed: ${detail.trim()}`);
   }
-  return waitForInstalledHestiaRouter();
+  return returnWithCurrentDaemon(await waitForInstalledHestiaRouter());
 }
 
 /** Uninstall the Hestia-owned Portless service; non-interactive mode never waits for sudo. */

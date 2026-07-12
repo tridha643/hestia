@@ -324,25 +324,48 @@ export class HestiaLocalHttpRouter {
           project: record.project,
           service: { ...service, publishedPort },
         });
+        if (endpoint.publicUrl !== undefined) {
+          try {
+            const publicUrl = new URL(endpoint.publicUrl);
+            if (publicUrl.protocol === "https:" || publicUrl.protocol === "http:") {
+              targets.set(publicUrl.hostname.toLowerCase(), {
+                hostname: publicUrl.hostname.toLowerCase(),
+                project: record.project,
+                service: { ...service, publishedPort },
+              });
+            }
+          } catch {
+            // Stack parsing validates structure, not URL syntax. Ignore a
+            // malformed legacy public URL instead of disabling all routes.
+          }
+        }
       }
       for (const exposure of record.tunnel?.exposures ?? []) {
-        const hostname = exposure.keepHostHeader
-          ? exposure.hostname
-          : internalEndpointAuthority(record.project, exposure.alias ?? exposure.service);
         const originalService = record.services.find((service) => service.name === exposure.service);
         const selectedBinding = originalService?.bindings?.find((binding) =>
           `${binding.target}/${binding.protocol}` === exposure.binding);
-        targets.set(hostname, {
-          hostname,
-          project: record.project,
-          service: originalService === undefined ? undefined : {
-            ...originalService,
-            publishedPort: selectedBinding?.publishedPort ?? originalService.publishedPort,
-          },
-        });
+        const hostnames = exposure.keepHostHeader
+          ? [exposure.hostname]
+          : [
+              exposure.hostname,
+              internalEndpointAuthority(record.project, exposure.alias ?? exposure.service),
+            ];
+        for (const hostname of hostnames) {
+          targets.set(hostname, {
+            hostname,
+            project: record.project,
+            service: originalService === undefined ? undefined : {
+              ...originalService,
+              publishedPort: selectedBinding?.publishedPort ?? originalService.publishedPort,
+            },
+          });
+        }
       }
     }
-    reconcilePortlessAliases([...targets.keys()], this.port);
+    reconcilePortlessAliases(
+      [...targets.keys()].filter((hostname) => hostname.endsWith(".localhost")),
+      this.port,
+    );
     for (const [hostname, target] of this.#targets) {
       if (targets.get(hostname) !== target) target.agent?.destroy();
     }

@@ -12,7 +12,7 @@ import { readMirrorState } from "../state.ts";
 import { FleetMonitor } from "./fleet-monitor.ts";
 import { SlotLedger, resolveMaxStacks } from "./slots.ts";
 
-export const HESTIAD_PROTOCOL_VERSION = 4;
+export const HESTIAD_PROTOCOL_VERSION = 5;
 const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_LOG_STREAMS = 16;
 const MAX_LOG_TAIL = 200;

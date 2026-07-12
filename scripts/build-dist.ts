@@ -1,11 +1,14 @@
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import {
+  HESTIA_PORTLESS_PATCH_SHA256,
+  HESTIA_PORTLESS_VERSION,
+  expectedPortlessPayloadProvenance,
+} from "../packages/engine/src/router/portless-payload.ts";
 
 const root = dirname(import.meta.dir);
 const dist = join(root, "dist");
-const expectedPortlessVersion = "0.15.1";
-const expectedPatchSha256 = "8b31085f9991c9df1fde89c21bb9fc0d8f310b9a440556a5144969181eca7e05";
 const runtimeExternals = ["@opentui/core", "@opentui/react", "react", "portless"];
 
 rmSync(dist, { recursive: true, force: true });
@@ -34,12 +37,12 @@ const portlessRoot = join(root, "node_modules", "portless");
 const portlessPackage = JSON.parse(readFileSync(join(portlessRoot, "package.json"), "utf8")) as {
   version?: string;
 };
-if (portlessPackage.version !== expectedPortlessVersion) {
-  throw new Error(`expected Portless ${expectedPortlessVersion}, found ${String(portlessPackage.version)}`);
+if (portlessPackage.version !== HESTIA_PORTLESS_VERSION) {
+  throw new Error(`expected Portless ${HESTIA_PORTLESS_VERSION}, found ${String(portlessPackage.version)}`);
 }
-const patchPath = join(root, "patches", `portless@${expectedPortlessVersion}.patch`);
+const patchPath = join(root, "patches", `portless@${HESTIA_PORTLESS_VERSION}.patch`);
 const patchSha256 = createHash("sha256").update(readFileSync(patchPath)).digest("hex");
-if (patchSha256 !== expectedPatchSha256) {
+if (patchSha256 !== HESTIA_PORTLESS_PATCH_SHA256) {
   throw new Error(`Portless patch checksum mismatch: ${patchSha256}`);
 }
 const assetRoot = join(dist, "assets", "portless");
@@ -48,7 +51,15 @@ cpSync(join(portlessRoot, "dist"), join(assetRoot, "dist"), { recursive: true })
 cpSync(join(portlessRoot, "package.json"), join(assetRoot, "package.json"));
 cpSync(patchPath, join(assetRoot, "hestia-hardening.patch"));
 const hardenedCli = join(assetRoot, "dist", "cli.js");
-if (!readFileSync(hardenedCli, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) {
+if (readFileSync(hardenedCli, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) {
+  const exactPatchPresent = Bun.spawnSync(
+    ["patch", "-R", "--dry-run", "-p1", "-i", patchPath],
+    { cwd: assetRoot, stdout: "pipe", stderr: "pipe" },
+  );
+  if (exactPatchPresent.exitCode !== 0) {
+    throw new Error("Portless dependency contains an unknown or stale hardening patch");
+  }
+} else {
   const patched = Bun.spawnSync(["patch", "-p1", "-i", patchPath], {
     cwd: assetRoot,
     stdout: "pipe",
@@ -61,11 +72,10 @@ if (!readFileSync(hardenedCli, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) 
 if (!readFileSync(hardenedCli, "utf8").includes("HESTIA_PORTLESS_ROUTES_PATH")) {
   throw new Error("Portless payload is missing Hestia hardening after patch application");
 }
-writeFileSync(join(assetRoot, "provenance.json"), JSON.stringify({
-  package: "portless",
-  version: expectedPortlessVersion,
-  patchSha256,
-}, null, 2) + "\n");
+writeFileSync(
+  join(assetRoot, "provenance.json"),
+  JSON.stringify(expectedPortlessPayloadProvenance(), null, 2) + "\n",
+);
 
 for (const executable of ["cli.js", "daemon.js", "proc-relay.js"]) {
   const path = join(dist, executable);
