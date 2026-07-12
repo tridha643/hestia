@@ -40,12 +40,15 @@ jobs:
           "$BUN_INSTALL/bin/hestia" version --json
           "$BUN_INSTALL/bin/hestia" skill path
       - if: inputs.tag == 'next'
-        run: npm publish "${{ steps.pack.outputs.tarball }}" --tag next --provenance --access public
+        run: |
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > "$RUNNER_TEMP/npmrc"
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/npmrc" npm publish "${{ steps.pack.outputs.tarball }}" --tag next --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - if: inputs.tag == 'latest'
         run: |
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > "$RUNNER_TEMP/npmrc"
           VERSION="$(bun -e 'console.log((await Bun.file("package.json").json()).version)')"
-          npm dist-tag add "@tridha643/hestia@$VERSION" latest
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/npmrc" npm dist-tag add "@tridha643/hestia@$VERSION" latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
