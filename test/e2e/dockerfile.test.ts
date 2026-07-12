@@ -12,6 +12,7 @@ const cli = join(import.meta.dir, "..", "..", "packages", "cli", "src", "index.t
 suite("Dockerfile workload end-to-end", () => {
   let root: string;
   let home: string;
+  let project = "";
 
   const run = (args: string[]): string => execFileSync("bun", [cli, ...args], {
     cwd: root,
@@ -50,11 +51,30 @@ suite("Dockerfile workload end-to-end", () => {
 
   test("builds the generated Compose fragment and publishes a configured alias", async () => {
     const record = JSON.parse(run(["up", "--no-daemon", "--json"])) as {
+      project: string;
       endpoints: Array<{ name: string; url?: string }>;
     };
+    project = record.project;
     const endpoint = record.endpoints.find((candidate) => candidate.name === "dashboard");
     expect(endpoint?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     const response = await fetch(endpoint!.url!, { signal: AbortSignal.timeout(5_000) });
     expect(response.status).toBe(200);
+  }, 180_000);
+
+  test("down --destroy removes the built image", () => {
+    expect(project).not.toBe("");
+    const builtBefore = execFileSync(
+      "docker",
+      ["images", "-q", "--filter", `reference=${project}-*`],
+      { encoding: "utf8" },
+    ).trim();
+    expect(builtBefore).not.toBe("");
+    run(["down", "--destroy"]);
+    const builtAfter = execFileSync(
+      "docker",
+      ["images", "-q", "--filter", `reference=${project}-*`],
+      { encoding: "utf8" },
+    ).trim();
+    expect(builtAfter).toBe("");
   }, 180_000);
 });

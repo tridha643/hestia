@@ -318,7 +318,7 @@ export interface UpOptions extends AdmitOptions {
 }
 
 export interface DownOptions {
-  /** Also remove named volumes (data loss). Default keeps them. */
+  /** Also remove named volumes and project-built images (data loss). Default keeps them. */
   destroy?: boolean;
   /** Refuse teardown if this named project has since been recreated. */
   expectedStack?: Pick<StackRecord, "repoId" | "worktree" | "createdAt">;

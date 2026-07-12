@@ -140,13 +140,13 @@ export class DaemonFleetSource {
     await engine.releaseShared(worktree, name);
   }
 
-  /** Tear down one managed project while always retaining named volumes. */
+  /** Tear down one managed project, destroying named volumes and project-built images. */
   down(stack: FleetStackView): Promise<void> {
     if (stack.createdAt === undefined) {
       return Promise.reject(new Error(`stack ${stack.project} has no stable incarnation timestamp`));
     }
     return engine.downProject(stack.project, {
-      destroy: false,
+      destroy: true,
       expectedStack: {
         repoId: stack.repoId,
         worktree: stack.worktree,

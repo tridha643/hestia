@@ -135,7 +135,7 @@ export async function composeDown(
   destroy: boolean,
 ): Promise<void> {
   const rest = ["down", "--remove-orphans"];
-  if (destroy) rest.push("-v");
+  if (destroy) rest.push("-v", "--rmi", "local");
   await docker(ctx, rest);
 }
 

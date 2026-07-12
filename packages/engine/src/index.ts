@@ -1450,7 +1450,7 @@ export class ComposeEngine implements IsolationEngine {
           // Recorded compose services but the override is gone — tear down by
           // project label alone, same as the mirror path (needs no files).
           const rest = ["compose", "-p", project, "down", "--remove-orphans"];
-          if (opts?.destroy) rest.push("-v");
+          if (opts?.destroy) rest.push("-v", "--rmi", "local");
           await pexec("docker", rest, { timeout: 180_000 });
         }
         // else: the repo has a compose file but this stack never composed
@@ -1523,7 +1523,7 @@ export class ComposeEngine implements IsolationEngine {
       }
       try {
         const rest = ["compose", "-p", project, "down", "--remove-orphans"];
-        if (opts?.destroy) rest.push("-v");
+        if (opts?.destroy) rest.push("-v", "--rmi", "local");
         await pexec("docker", rest, { timeout: 180_000 });
       } catch (err) {
         if (fresh?.composeFile !== undefined) {

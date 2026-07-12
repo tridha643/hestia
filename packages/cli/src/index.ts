@@ -41,7 +41,7 @@ import {
 } from "@hestia/core";
 
 /** The published version + npm coordinates (kept in sync with package.json at release). */
-const CLI_VERSION = "1.2.0";
+const CLI_VERSION = "1.3.0";
 const PACKAGE_NAME = "@tridha643/hestia";
 
 /**
@@ -481,7 +481,8 @@ usage:
         health. Exit 1 only on error-level rows; never mutates anything
   hestia stop <name> [--json]             stop one supervised proc (idempotent)
   hestia down [--destroy] [--project <name>] [--json]
-        tear down procs + containers (--destroy also removes volumes);
+        tear down procs + containers (--destroy also removes volumes
+        and project-built images);
         --project works from the mirror after the worktree is deleted
   hestia status [--json]                  show this worktree's stack
   hestia env  [--json]                    print the injected env (export lines)

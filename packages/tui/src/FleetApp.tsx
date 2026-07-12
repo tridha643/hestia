@@ -53,7 +53,7 @@ const HELP_ROWS: Array<[keys: string, action: string]> = [
   ["y · Y", "yank endpoint URL · stack env block"],
   ["c l p", "yank direct / local / public URL"],
   ["s", "shared hostnames (claim, allow, deny, release)"],
-  ["D · d", "doctor report · down stack (volumes retained)"],
+  ["D · d", "doctor report · down stack (removes volumes + images)"],
   ["1 2 0", "split / stacked / auto layout"],
   ["q", "quit · mouse click and wheel work everywhere"],
 ];
@@ -380,7 +380,7 @@ export function FleetApp({
         void source.down(confirmed).then(() => {
           dispatch({ type: "down-pending", pending: false });
           dispatch({ type: "confirm-down" });
-          showToast(`${project} is down; named volumes retained`);
+          showToast(`${project} is down; volumes and project images removed`);
         }).catch((error) => {
           dispatch({ type: "down-pending", pending: false });
           showToast(`down failed: ${(error as Error).message}`);
@@ -788,7 +788,7 @@ export function FleetApp({
             <text fg={fleetTheme.text}>{sanitizeFleetTerminalText(state.confirmDown.project)}</text>
           </box>
           <box style={{ height: 1 }} />
-          <text fg={fleetTheme.warning}>Named volumes are retained.</text>
+          <text fg={fleetTheme.warning}>Removes named volumes and project-built images (data loss).</text>
           <text fg={fleetTheme.danger}>
             {state.downPending ? "Tearing down…" : "Press Enter or d to confirm; Esc cancels."}
           </text>

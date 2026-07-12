@@ -131,7 +131,7 @@ describe("FleetApp", () => {
     }
   });
 
-  test("down confirmation consumes keys, cancels, then confirms without destroy", async () => {
+  test("down confirmation consumes keys, cancels, then confirms destructive down", async () => {
     const source = new FakeFleetSource();
     const setup = await testRender(
       <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
@@ -146,17 +146,17 @@ describe("FleetApp", () => {
       await act(async () => {
         await setup.mockInput.typeText("d");
       });
-      await setup.waitForFrame((candidate) => candidate.includes("Named volumes are retained"));
+      await setup.waitForFrame((candidate) => candidate.includes("Removes named volumes and project-built images"));
       await act(async () => {
         await setup.mockInput.pressKeys(["ESCAPE", "x"], 30);
       });
-      await setup.waitForFrame((candidate) => !candidate.includes("Named volumes are retained"));
+      await setup.waitForFrame((candidate) => !candidate.includes("Removes named volumes and project-built images"));
       await act(async () => {
         await setup.mockInput.typeText("d");
       });
-      await setup.waitForFrame((candidate) => candidate.includes("Named volumes are retained"));
+      await setup.waitForFrame((candidate) => candidate.includes("Removes named volumes and project-built images"));
       await act(async () => setup.mockInput.pressEnter());
-      await setup.waitForFrame((candidate) => candidate.includes("named volumes retained"));
+      await setup.waitForFrame((candidate) => candidate.includes("volumes and project images removed"));
       expect(source.downs).toEqual(["modem-alpha"]);
     } finally {
       await act(async () => setup.renderer.destroy());
