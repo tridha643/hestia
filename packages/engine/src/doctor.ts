@@ -11,6 +11,7 @@ import { detectVarlock } from "./proc/resolver.ts";
 import { discoverWorkers } from "./wrangler/discover.ts";
 import { connectorPidfile, listAdopted, readAdopted } from "./tunnel/registry.ts";
 import { countConnectors } from "./tunnel/cloudflared.ts";
+import { listLocalHestiaConnectors } from "./tunnel/orphans.ts";
 import { isReady } from "./tunnel/verify.ts";
 import { fetchHealth, readDaemonJson } from "./daemon/client.ts";
 import { HESTIAD_PROTOCOL_VERSION } from "./daemon/routes.ts";
@@ -300,19 +301,34 @@ async function tunnelChecks(): Promise<DoctorRow[]> {
     } catch {
       connectors = null; // offline / no cert — degrade below
     }
+    const local = listLocalHestiaConnectors(uuid);
+    const localOrphans = live && pf !== null
+      ? local.filter((p) => p.pgid !== pf.pgid && p.pid !== pf.pid)
+      : local;
+    if (localOrphans.length > 0) {
+      rows.push(
+        row(
+          `${label}:local-orphans`,
+          "error",
+          `${localOrphans.length} untracked hestia connector(s) still running ` +
+            `(pids ${localOrphans.map((p) => p.pid).join(", ")}) — the daemon sweep ` +
+            `or next hestia command reaps them; do not start another cloudflared`,
+        ),
+      );
+    }
     if (connectors === null) {
       rows.push(row(`${label}:connectors`, "unknown", "cloudflare unreachable — cannot count connectors"));
     } else {
       const expected = live ? 1 : 0;
       if (connectors > expected) {
-        rows.push(
-          row(
-            `${label}:connectors`,
-            "error",
-            `${connectors} connector(s) registered but hestia runs ${expected} — a foreign ` +
-              `replica cross-wires worktrees; stop the other cloudflared`,
-          ),
-        );
+        const detail = localOrphans.length > 0
+          ? `${connectors} connector(s) registered but hestia runs ${expected} — ` +
+            `${localOrphans.length} are local hestia-owned orphans (auto-reaped on next sweep); ` +
+            `any remainder is a foreign replica`
+          : `${connectors} connector(s) registered but hestia runs ${expected} — a foreign ` +
+            `replica cross-wires worktrees; stop the other cloudflared (only processes whose ` +
+            `argv lacks ~/.hestia/tunnel/<uuid>/ are truly foreign)`;
+        rows.push(row(`${label}:connectors`, "error", detail));
       }
     }
   }

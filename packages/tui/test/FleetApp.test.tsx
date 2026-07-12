@@ -212,7 +212,7 @@ describe("FleetApp", () => {
     }
   });
 
-  test("mouse clicks select a stack row", async () => {
+  test("keyboard navigation selects the next stack row", async () => {
     const source = new FakeFleetSource();
     const setup = await testRender(
       <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
@@ -225,11 +225,12 @@ describe("FleetApp", () => {
       });
       await setup.waitForFrame((candidate) => candidate.includes("Workloads — alpha"));
       await act(async () => {
-        await setup.mockMouse.click(2, 8);
+        await setup.mockInput.typeText("j");
         await setup.flush();
       });
       const frame = await setup.waitForFrame((candidate) => candidate.includes("Workloads — beta"));
       expect(frame).toContain("ingest");
+      expect(frame).toContain("● beta");
     } finally {
       await act(async () => setup.renderer.destroy());
     }
@@ -301,10 +302,126 @@ describe("FleetApp", () => {
         source.start();
         await setup.flush();
       });
-      const frame = await setup.waitForFrame((candidate) => candidate.includes("Hestia Fleet — modem"));
-      expect(frame).toContain("Hestia Fleet — modem");
+      const frame = await setup.waitForFrame((candidate) => candidate.includes("Hestia Fleet") && candidate.includes("modem"));
+      expect(frame).toContain("Hestia Fleet");
+      expect(frame).toContain("modem");
       expect(frame).toContain("/Users/tri/conductor/workspaces/modem/salem");
       expect(frame).not.toContain("secret");
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test("mouse click selects a stack row", async () => {
+    const source = new FakeFleetSource();
+    const setup = await testRender(
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
+      { width: 120, height: 28 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("Workloads — alpha"));
+      // header(1) + context(2) + sidebar border(1) + title(1) → rows begin at y=5
+      await act(async () => {
+        await setup.mockMouse.click(6, 6);
+      });
+      const frame = await setup.waitForFrame((candidate) => candidate.includes("Workloads — beta"));
+      expect(frame).toContain("ingest");
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test(", and . step between stacks from any pane focus", async () => {
+    const source = new FakeFleetSource();
+    const setup = await testRender(
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
+      { width: 120, height: 28 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("Workloads — alpha"));
+      await act(async () => {
+        await setup.mockInput.typeText(".");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("Workloads — beta"));
+      await act(async () => {
+        await setup.mockInput.typeText(",");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("Workloads — alpha"));
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test("f pauses log follow and f or G resumes it", async () => {
+    const source = new FakeFleetSource();
+    const setup = await testRender(
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
+      { width: 120, height: 28 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("following"));
+      await act(async () => {
+        await setup.mockInput.typeText("f");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("paused"));
+      await act(async () => {
+        await setup.mockInput.typeText("G");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("following"));
+    } finally {
+      await act(async () => setup.renderer.destroy());
+    }
+  });
+
+  test("Y yanks the stack env block rebuilt from the fleet projection", async () => {
+    const withPublished: FleetSnapshot = {
+      ...snapshot(),
+      stacks: snapshot().stacks.map((stack, index) => index !== 0 ? stack : {
+        ...stack,
+        services: [{
+          name: "dashboard",
+          backend: "proc" as const,
+          state: "healthy" as const,
+          publishedPort: 4100,
+          endpoint: {
+            name: "dashboard",
+            host: "127.0.0.1",
+            port: 4100,
+            url: "http://127.0.0.1:4100",
+            publicUrl: "https://alpha.dev.example.com",
+          },
+        }],
+      }),
+    };
+    const source = new FakeFleetSource(withPublished);
+    const setup = await testRender(
+      <FleetApp source={source as unknown as DaemonFleetSource} preferredProject="modem-alpha" invokingRepository={invokingRepository} onQuit={() => {}} />,
+      { width: 130, height: 28 },
+    );
+    try {
+      await act(async () => {
+        source.start();
+        await setup.flush();
+      });
+      const frame = await setup.waitForFrame((candidate) => candidate.includes("dashboard ready"));
+      // endpoints with a public URL advertise it inline
+      expect(frame).toContain("pub");
+      await act(async () => {
+        await setup.mockInput.typeText("Y");
+      });
+      await setup.waitForFrame((candidate) => candidate.includes("env block (3 keys)"));
     } finally {
       await act(async () => setup.renderer.destroy());
     }

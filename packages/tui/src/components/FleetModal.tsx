@@ -13,8 +13,8 @@ export function FleetModal({
   terminalHeight: number;
   children: ReactNode;
 }) {
-  const width = Math.min(72, Math.max(30, terminalWidth - 4));
-  const height = Math.min(18, Math.max(7, terminalHeight - 4));
+  const width = Math.min(78, Math.max(36, terminalWidth - 4));
+  const height = Math.min(22, Math.max(8, terminalHeight - 4));
   return (
     <>
       <box style={{ position: "absolute", top: 0, left: 0, width: terminalWidth, height: terminalHeight, zIndex: 50 }} />
@@ -35,7 +35,12 @@ export function FleetModal({
           paddingTop: 1,
         }}
       >
-        <text fg={fleetTheme.accent}>{title}</text>
+        <box style={{ height: 1, flexDirection: "row" }}>
+          <box style={{ flexGrow: 1 }}>
+            <text fg={fleetTheme.accent}>{title}</text>
+          </box>
+          <text fg={fleetTheme.faint}>Esc closes</text>
+        </box>
         <box style={{ height: 1 }} />
         {children}
       </box>

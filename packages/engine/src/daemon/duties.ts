@@ -5,6 +5,7 @@ import {
   readAdopted,
   reconcileTunnel,
 } from "../tunnel/registry.ts";
+import { reapOrphanConnectors } from "../tunnel/orphans.ts";
 import type { Admission } from "./routes.ts";
 import type { SharedArbiter } from "./shared-arbiter.ts";
 
@@ -51,7 +52,15 @@ export function startDuties(
       for (const uuid of listAdopted()) {
         try {
           const pf = connectorPidfile(uuid);
-          if (pf !== null && isLive(pf)) continue; // healthy — CLI ops keep config current
+          if (pf !== null && isLive(pf)) {
+            // Config is kept current by CLI ops; still reap untracked replicas
+            // so a lost-pidfile storm cannot leave HA cross-wiring in place.
+            const { reapedGroups } = await reapOrphanConnectors(uuid, pf);
+            if (reapedGroups > 0) {
+              log(`sweep: reaped ${reapedGroups} orphan connector group(s) for ${uuid}`);
+            }
+            continue;
+          }
           const ref = readAdopted(uuid);
           if (ref === null) continue;
           if (ref.reconstructed) {
@@ -63,6 +72,10 @@ export function startDuties(
           const outcome = await reconcileTunnel(ref);
           if (outcome.restarted) {
             log(`sweep: connector for ${ref.name} (${uuid}) revived (ready=${outcome.ready})`);
+          } else {
+            for (const w of outcome.warnings) {
+              if (w.includes("reaped")) log(`sweep: ${w}`);
+            }
           }
         } catch (err) {
           log(`sweep: connector revival for ${uuid} failed: ${(err as Error).message}`);

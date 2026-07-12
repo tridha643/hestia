@@ -198,6 +198,11 @@ issues, resolve the ones that are safe to resolve:
       `.gitignore`.
     - `orphan-mirror:<project>` for a worktree path that no longer exists —
       `hestia down --project <project>`.
+    - `tunnel:<name>:local-orphans` — Hestia-owned replicas whose argv still
+      contains `~/.hestia/tunnel/<uuid>/` after a lost pidfile. The daemon
+      sweep / next reconcile reaps them automatically; do **not** start another
+      `cloudflared`, and do **not** treat other Conductor worktrees as needing
+      their own connector (one machine-global connector serves every worktree).
     - `launchd` referencing a stale/missing binary path — `hestia daemon
       install` (idempotent; only rewrites the plist, doesn't touch running
       workloads).
@@ -212,15 +217,11 @@ issues, resolve the ones that are safe to resolve:
       exact `wildcardTarget` CNAME the human needs to add at their provider.
 - **Investigate, then ask before acting** (machine-wide, shared across other
   worktrees/repos, hard to reverse):
-    - `tunnel:<uuid>:connectors` reporting N registered vs 0 run by Hestia —
-      this means foreign `cloudflared` processes (possibly from other active
-      Conductor workspaces, or leaked from a different repo's own test suite,
-      e.g. hestia's own e2e fixtures under `.../test/fixtures/tunnel-stub/`)
-      are registered against the same tunnel. Identify them with `ps aux |
-      grep cloudflared` and `cloudflared tunnel list`, but do **not** kill any
-      of them without the user's explicit go-ahead — one of those processes
-      may belong to another live workspace. Report the count, PIDs, and ages
-      found, and let the human decide what to stop.
+    - `tunnel:<name>:connectors` reporting N registered vs 0/1 run by Hestia
+      **with no local-orphans row** — a truly foreign connector (argv lacks the
+      hestia tunnel path, e.g. `cloudflared tunnel run --token …` or a hand-run
+      `tunnel run`). Identify with `ps -Ao pid,lstart,command | grep cloudflared`
+      and ask the human before killing anything Hestia did not start.
 
 ## Inspect and finish
 
@@ -257,7 +258,7 @@ workloads can. Named volumes are retained unless `--destroy` is explicit.
 | `proc-ready-timeout` | inspect logs; use `--no-port` only for non-servers |
 | `stack-limit` | down an owned stack or retry with `--wait=120` |
 | `dns-route-required` | `cloudflared tunnel route dns <uuid> '*.<zone>'` once, then retry |
-| `tunnel-busy` | stop the foreign connector; do not kill processes Hestia did not start — identify via `ps aux \| grep cloudflared` + `cloudflared tunnel list`, then confirm with the human before killing anything (see "Post-up health sweep") |
+| `tunnel-busy` | stop the foreign connector; hestia-owned orphans (`~/.hestia/tunnel/<uuid>/` in argv) are auto-reaped — only confirm with the human before killing processes whose argv lacks that path |
 | `route-origin-unavailable` | restart the workload through Hestia |
 | `backend-not-stoppable` | use `hestia down` for Docker workloads |
 | `shared-not-found` | `hestia share list` for declared names; `expose <svc> --shared <name>` declares one |

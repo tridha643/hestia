@@ -253,8 +253,11 @@ launchd agent so hestiad — and the adopted tunnel — survive reboots.
   connectors on one named tunnel are HA replicas that Cloudflare load-balances
   nondeterministically across worktrees (the original modem pain). Hestia owns
   the single connector; the takeover preflight refuses to become connector #2
-  (`tunnel-busy`, `--force` to override) and hestia never kills processes it
-  didn't spawn.
+  (`tunnel-busy`, `--force` to override). Hestia never kills processes it did
+  not spawn — except untracked **hestia-owned** orphans whose argv still
+  contains `~/.hestia/tunnel/<uuid>/` (lost-pidfile revival storms); those are
+  reaped on every reconcile/daemon sweep. Truly foreign cloudflareds (no hestia
+  tunnel path in argv) still require a human.
 - **Hestia never creates or deletes tunnels, and mutates by UUID only** —
   it adopts an existing named tunnel (`tunnel list` → uuid, cred JSON from
   `~/.cloudflared/<uuid>.json`); `route dns` targets the uuid, never the name.

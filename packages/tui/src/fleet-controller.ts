@@ -1,7 +1,9 @@
 import type { FleetSnapshot, FleetStackView } from "@hestia/core";
+import { serviceEndpoints } from "./fleet-endpoints.ts";
+import type { FleetLayoutMode } from "./fleet-layout.ts";
 
 export type FleetFocus = "stacks" | "services" | "logs" | "filter";
-export type FleetLayoutMode = "auto" | "split" | "stack";
+export type { FleetLayoutMode };
 
 export interface FleetSelection {
   project?: string;
@@ -36,7 +38,7 @@ export type FleetUiAction =
   | { type: "layout"; layout: FleetLayoutMode }
   | { type: "filter"; filter: string; snapshot?: FleetSnapshot }
   | { type: "follow"; follow: boolean }
-  | { type: "scroll-logs"; delta: number }
+  | { type: "scroll-logs"; delta: number; maxOffset?: number }
   | { type: "new-lines"; count: number; maxOffset?: number }
   | { type: "help"; open: boolean }
   | { type: "doctor"; open: boolean }
@@ -94,7 +96,7 @@ export function reconcileFleetSelection(
     ?? snapshot.stacks[0]!;
   const service = stack.services.find((candidate) => candidate.name === previous.service)
     ?? stack.services[0];
-  const endpoints = service?.endpoints ?? (service?.endpoint === undefined ? [] : [service.endpoint]);
+  const endpoints = service === undefined ? [] : serviceEndpoints(service);
   const endpoint = endpoints.find((candidate) => candidate.name === previous.endpoint);
   return { project: stack.project, service: service?.name, endpoint: endpoint?.name };
 }
@@ -194,7 +196,8 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
         (candidate) => candidate.project === state.selection.project,
       );
       const service = stack?.services.find((candidate) => candidate.name === action.service);
-      if (!service?.endpoints?.some((endpoint) => endpoint.name === action.endpoint)) return state;
+      if (service === undefined ||
+        !serviceEndpoints(service).some((endpoint) => endpoint.name === action.endpoint)) return state;
       return {
         ...state,
         focus: "services",
@@ -221,11 +224,17 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
       logOffset: action.follow ? 0 : state.logOffset,
       unseenLines: action.follow ? 0 : state.unseenLines,
     };
-    case "scroll-logs": return {
-      ...state,
-      follow: action.delta > 0 ? state.follow : false,
-      logOffset: Math.max(0, state.logOffset - action.delta),
-    };
+    case "scroll-logs": {
+      const offset = Math.min(
+        action.maxOffset ?? Number.MAX_SAFE_INTEGER,
+        Math.max(0, state.logOffset - action.delta),
+      );
+      // Scrolling DOWN onto the tail resumes following (lazydocker-style);
+      // an up-scroll clamped to 0 (short log) must still pause.
+      return action.delta > 0 && offset === 0
+        ? { ...state, follow: true, logOffset: 0, unseenLines: 0 }
+        : { ...state, follow: action.delta > 0 ? state.follow : false, logOffset: offset };
+    }
     case "new-lines": return state.follow
       ? state
       : {

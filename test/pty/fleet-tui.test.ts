@@ -162,10 +162,10 @@ describe("hestia tui PTY", () => {
         env: { ...process.env, ...environment },
       });
       try {
-        await session.waitForText("Hestia Fleet —", { timeout: 10_000 });
+        await session.waitForText("Hestia Fleet", { timeout: 10_000 });
         await session.press(exitKey as "q" | ["ctrl", "c"]);
         const restored = await session.waitForText("__HESTIA_PRIMARY_SCREEN__", { timeout: 5_000 });
-        expect(restored).not.toContain("Hestia Fleet —");
+        expect(restored).not.toContain("Hestia Fleet");
       } finally {
         session.close();
       }

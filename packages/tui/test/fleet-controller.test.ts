@@ -66,6 +66,24 @@ describe("Fleet selection reducer", () => {
     expect(state.unseenLines).toBe(0);
   });
 
+  test("clamps log scrolling to the wrapped-row ceiling and re-follows at the tail", () => {
+    let state = createFleetUiState();
+    state = reduceFleetUiState(state, { type: "scroll-logs", delta: -100, maxOffset: 10 });
+    expect(state.logOffset).toBe(10);
+    expect(state.follow).toBe(false);
+    state = reduceFleetUiState(state, { type: "scroll-logs", delta: 4, maxOffset: 10 });
+    expect(state.logOffset).toBe(6);
+    expect(state.follow).toBe(false);
+    state = reduceFleetUiState(state, { type: "scroll-logs", delta: 6, maxOffset: 10 });
+    expect(state.logOffset).toBe(0);
+    expect(state.follow).toBe(true);
+    expect(state.unseenLines).toBe(0);
+    // An up-scroll clamped to 0 (log shorter than the viewport) still pauses.
+    state = reduceFleetUiState(state, { type: "scroll-logs", delta: -3, maxOffset: 0 });
+    expect(state.logOffset).toBe(0);
+    expect(state.follow).toBe(false);
+  });
+
   test("filters only the daemon-projected managed rows", () => {
     expect(visibleFleetStacks(snapshot, "ingest").map((stack) => stack.project))
       .toEqual(["modem-beta"]);
@@ -141,10 +159,15 @@ describe("shared hostname overlay reducer", () => {
 });
 
 describe("terminal text sanitization", () => {
-  test("removes OSC52, CSI, DCS, carriage return, and backspace controls", () => {
-    const malicious = "safe\x1b]52;c;ZXZpbA==\x07\x1b[2J\x1bPpayload\x1b\\\rX\bY";
+  test("removes OSC52, CSI, DCS, and backspace controls", () => {
+    const malicious = "safe\x1b]52;c;ZXZpbA==\x07\x1b[2J\x1bPpayload\x1b\\X\bY";
     const sanitized = sanitizeFleetTerminalText(malicious);
     expect(sanitized).toBe("safeXY");
     expect(sanitized).not.toContain("\x1b");
+  });
+
+  test("collapses carriage-return overwrites used by progress loggers", () => {
+    expect(sanitizeFleetTerminalText("Building...\rBuilding... done")).toBe("Building... done");
+    expect(sanitizeFleetTerminalText("safe\rold\rnew")).toBe("new");
   });
 });
