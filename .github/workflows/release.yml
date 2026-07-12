@@ -30,13 +30,13 @@ jobs:
       - run: npm pack --dry-run
       - id: pack
         run: |
-          TARBALL="$(npm pack --json | bun -e 'const x=await Bun.stdin.json(); console.log(x[0].filename)')"
+          TARBALL="$PWD/$(npm pack --json | bun -e 'const x=await Bun.stdin.json(); console.log(x[0].filename)')"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           shasum -a 256 "$TARBALL"
       - run: |
           export BUN_INSTALL="$RUNNER_TEMP/bun-home"
           mkdir -p "$BUN_INSTALL"
-          bun add --global "./${{ steps.pack.outputs.tarball }}"
+          bun add --global "${{ steps.pack.outputs.tarball }}"
           hestia version --json
           hestia skill path
       - if: inputs.tag == 'next'
