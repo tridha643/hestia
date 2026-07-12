@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { resolveCname } from "node:dns/promises";
+import { resolve4, resolve6, resolveCname } from "node:dns/promises";
 import { stringify as stringifyYaml } from "yaml";
 import {
   STATE_SCHEMA_VERSION,
@@ -639,6 +639,17 @@ async function assertNamedTunnelDns(hostname: string, tunnelUuid: string): Promi
   try {
     const records = (await resolveCname(hostname)).map((record) => record.replace(/\.$/, "").toLowerCase());
     if (records.includes(expected.toLowerCase())) return;
+  } catch {}
+  // A cfargotunnel.com target only serves traffic when the record is proxied,
+  // and Cloudflare flattens proxied CNAMEs: public DNS answers with edge
+  // A/AAAA records and the target is unrecoverable. Any successful resolution
+  // therefore means the wildcard exists; end-to-end routing is confirmed by
+  // the connector verify step after start.
+  try {
+    if ((await resolve4(hostname)).length > 0) return;
+  } catch {}
+  try {
+    if ((await resolve6(hostname)).length > 0) return;
   } catch {}
   throw new HestiaError(
     "dns-route-required",
@@ -1673,8 +1684,8 @@ export class ComposeEngine implements IsolationEngine {
     if (adopted.connections > 0 && !isAdopted(adopted.uuid) && !opts?.force) {
       throw new HestiaError(
         "tunnel-busy",
-        `tunnel "${tunnelName}" already has ${adopted.connections} live ` +
-          `connector(s) — stop the other cloudflared first (hestia's ` +
+        `tunnel "${tunnelName}" already has ${adopted.connections} live edge ` +
+          `connection(s) from a foreign connector — stop the other cloudflared first (hestia's ` +
           `connector serves your static hostnames too), or pass --force to ` +
           `accept nondeterministic routing`,
       );
