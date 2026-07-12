@@ -19,6 +19,7 @@ import {
   importBaseRules,
 } from "./ingress.ts";
 import { listSharedHostnames } from "./shared.ts";
+import { reapOrphanConnectors } from "./orphans.ts";
 import { pollReady } from "./verify.ts";
 import { writeAtomicJsonFile, writeAtomicTextFile } from "../atomic-json-file.ts";
 
@@ -241,6 +242,15 @@ export async function reconcileTunnel(
 
     const pf = readPidfile(dir, CONNECTOR);
     const live = pf !== null && isLive(pf);
+    // Reap untracked hestia-owned replicas BEFORE the live short-circuit —
+    // a lost pidfile + 15s revival loop is how N connectors accumulate, and
+    // doctor fails until they are gone even when one tracked connector is fine.
+    const { reapedGroups } = await reapOrphanConnectors(ref.uuid, live ? pf : undefined);
+    if (reapedGroups > 0) {
+      warnings.push(
+        `reaped ${reapedGroups} orphan hestia connector process group(s) for this tunnel`,
+      );
+    }
     const currentConfig = existsSync(cfgPath)
       ? readFileSync(cfgPath, "utf8")
       : null;

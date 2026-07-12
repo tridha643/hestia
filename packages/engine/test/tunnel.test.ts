@@ -18,6 +18,10 @@ import {
   ledgerHas,
 } from "../src/tunnel/registry.ts";
 import {
+  hestiaTunnelMarker,
+  parseLocalHestiaConnectors,
+} from "../src/tunnel/orphans.ts";
+import {
   internalEndpointAuthority,
   publicGatewaySocketPath,
 } from "../src/router/local-http-router.ts";
@@ -235,5 +239,45 @@ describe("hostname ledger + mirror-derived rules", () => {
     ]);
     // other uuids see nothing
     expect(collectDynamicRules("some-other-uuid").rules).toEqual([]);
+  });
+});
+
+describe("parseLocalHestiaConnectors", () => {
+  const uuid = "657d6e71-33a6-4105-992c-5fc00a575dd1";
+  const marker = `/Users/x/.hestia/tunnel/${uuid}`;
+
+  test("selects hestia-config cloudflareds and ignores token/foreign/editor rows", () => {
+    const ps = [
+      `  943   929 cloudflared tunnel --config ${marker}/config.yml --metrics 127.0.0.1:1 run ${uuid}`,
+      ` 2643  2619 /opt/homebrew/bin/cloudflared tunnel --config ${marker}/config.yml run ${uuid}`,
+      ` 5238     1 /opt/homebrew/bin/cloudflared tunnel run --token REDACTED-TOKEN-VALUE`,
+      ` 9999  9999 vim ${marker}/config.yml`,
+      ` 1111  1111 cloudflared tunnel --config /tmp/other/config.yml run other-uuid`,
+      `not a process line`,
+    ].join("\n");
+    const rows = parseLocalHestiaConnectors(ps, marker);
+    expect(rows).toEqual([
+      {
+        pid: 943,
+        pgid: 929,
+        command: `cloudflared tunnel --config ${marker}/config.yml --metrics 127.0.0.1:1 run ${uuid}`,
+      },
+      {
+        pid: 2643,
+        pgid: 2619,
+        command: `/opt/homebrew/bin/cloudflared tunnel --config ${marker}/config.yml run ${uuid}`,
+      },
+    ]);
+  });
+
+  test("hestiaTunnelMarker nests under HESTIA_HOME", () => {
+    const prev = process.env.HESTIA_HOME;
+    process.env.HESTIA_HOME = "/tmp/hestia-home-x";
+    try {
+      expect(hestiaTunnelMarker("abc")).toBe("/tmp/hestia-home-x/tunnel/abc");
+    } finally {
+      if (prev === undefined) delete process.env.HESTIA_HOME;
+      else process.env.HESTIA_HOME = prev;
+    }
   });
 });

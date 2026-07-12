@@ -533,7 +533,7 @@ services = ["dashboard", "modem-ingest", "modem-slack"]
       await session.press("enter");
       await waitForSnapshot(
         session,
-        (frame) => !frame.includes(`Services — ${branchA}`) && frame.includes(branchB),
+        (frame) => !frame.includes(`Workloads — ${branchA}`) && frame.includes(branchB),
         180_000,
       );
 

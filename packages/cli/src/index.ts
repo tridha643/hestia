@@ -41,7 +41,7 @@ import {
 } from "@hestia/core";
 
 /** The published version + npm coordinates (kept in sync with package.json at release). */
-const CLI_VERSION = "1.1.0";
+const CLI_VERSION = "1.2.0";
 const PACKAGE_NAME = "@tridha643/hestia";
 
 /**
