@@ -97,7 +97,7 @@ describe("hestia tui PTY", () => {
     }
   });
 
-  test("renders, resizes, reconnects, streams logs, and confirms safe down", async () => {
+  test("renders, resizes, reconnects, streams logs, and confirms destructive down", async () => {
     const session = await launchTerminal({
       command: "bun",
       args: [CLI, "tui"],
@@ -129,7 +129,7 @@ describe("hestia tui PTY", () => {
       await waitForSnapshot(session, (snapshot) => snapshot.includes("Workloads — pty-a"));
 
       await session.press("d");
-      await session.waitForText("Named volumes are retained", { timeout: 3_000 });
+      await session.waitForText("Removes named volumes and project-built images", { timeout: 3_000 });
       await session.press("esc");
       frame = await waitForSnapshot(session, (snapshot) => !snapshot.includes("Confirm stack down"));
       expect(frame).toContain("pty-a");
@@ -141,7 +141,7 @@ describe("hestia tui PTY", () => {
         (snapshot) => !snapshot.includes("Workloads — pty-a") && snapshot.includes("Workloads — pty-b"),
         15_000,
       );
-      expect(frame).toContain("named volumes retained");
+      expect(frame).toContain("volumes and project images removed");
 
       await session.press("q");
       await session.waitIdle({ timeout: 2_000 });

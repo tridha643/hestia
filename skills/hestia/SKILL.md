@@ -240,7 +240,8 @@ JSON/NDJSON commands.
 Run `down` before switching or deleting the branch. After deletion, use the
 recorded project with `hestia down --project <project>`. Docker workloads
 cannot be stopped individually (`backend-not-stoppable`); proc/Wrangler
-workloads can. Named volumes are retained unless `--destroy` is explicit.
+workloads can. Named volumes and project-built images are retained unless
+`--destroy` is explicit (it adds `-v --rmi local`; shared base images stay).
 
 ## Stable error remedies
 
