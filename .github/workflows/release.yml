@@ -37,8 +37,8 @@ jobs:
           export BUN_INSTALL="$RUNNER_TEMP/bun-home"
           mkdir -p "$BUN_INSTALL"
           bun add --global "${{ steps.pack.outputs.tarball }}"
-          hestia version --json
-          hestia skill path
+          "$BUN_INSTALL/bin/hestia" version --json
+          "$BUN_INSTALL/bin/hestia" skill path
       - if: inputs.tag == 'next'
         run: npm publish "${{ steps.pack.outputs.tarball }}" --tag next --provenance --access public
         env:
