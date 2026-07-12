@@ -2,6 +2,10 @@
   "name": "@tridha643/hestia",
   "version": "1.0.0",
   "description": "Per-worktree isolated development stacks for humans and coding agents",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tridha643/hestia"
+  },
   "type": "module",
   "workspaces": ["packages/*"],
   "bin": {
