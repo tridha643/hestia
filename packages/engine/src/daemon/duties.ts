@@ -9,7 +9,24 @@ import { reapOrphanConnectors } from "../tunnel/orphans.ts";
 import type { Admission } from "./routes.ts";
 import type { SharedArbiter } from "./shared-arbiter.ts";
 
-const SWEEP_INTERVAL_MS = 15_000;
+const DEFAULT_SWEEP_INTERVAL_MS = 15_000;
+const MAX_TIMER_INTERVAL_MS = 2_147_483_647;
+
+/** Resolve the daemon sweep cadence; unsafe or malformed overrides fall back visibly. */
+export function resolveSweepIntervalMs(): { intervalMs: number; warnings: string[] } {
+  const value = process.env.HESTIA_SWEEP_INTERVAL_MS;
+  if (value === undefined) return { intervalMs: DEFAULT_SWEEP_INTERVAL_MS, warnings: [] };
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed >= 100 && parsed <= MAX_TIMER_INTERVAL_MS) {
+    return { intervalMs: parsed, warnings: [] };
+  }
+  return {
+    intervalMs: DEFAULT_SWEEP_INTERVAL_MS,
+    warnings: [
+      `invalid HESTIA_SWEEP_INTERVAL_MS=${JSON.stringify(value)} — using default ${DEFAULT_SWEEP_INTERVAL_MS}`,
+    ],
+  };
+}
 
 /**
  * The daemon's standing duties, on one overlap-guarded interval:
@@ -28,6 +45,10 @@ export function startDuties(
   opts?: { intervalMs?: number; log?: (line: string) => void; shared?: SharedArbiter },
 ): () => void {
   const log = opts?.log ?? ((line) => console.error(line));
+  const cadence = opts?.intervalMs === undefined
+    ? resolveSweepIntervalMs()
+    : { intervalMs: opts.intervalMs, warnings: [] };
+  for (const warning of cadence.warnings) log(`sweep: ${warning}`);
   let running = false;
 
   const tick = async () => {
@@ -44,7 +65,13 @@ export function startDuties(
           // pump() just refreshed the cached occupancy — live ∪ reserved is
           // the "still occupying a slot" set that keeps a holder's claim.
           const state = admission.healthSnapshot();
-          await opts.shared.sweep(new Set([...state.live, ...state.reserved]));
+          const releases = await opts.shared.sweep(new Set([...state.live, ...state.reserved]));
+          for (const release of releases) {
+            log(
+              `sweep: auto-released shared hostname "${release.name}" — holder ` +
+                `${release.project} ${release.reason}, granting queue head`,
+            );
+          }
         } catch (err) {
           log(`sweep: shared-hostname sweep failed: ${(err as Error).message}`);
         }
@@ -86,7 +113,7 @@ export function startDuties(
     }
   };
 
-  const timer = setInterval(tick, opts?.intervalMs ?? SWEEP_INTERVAL_MS);
+  const timer = setInterval(tick, cadence.intervalMs);
   void tick(); // first pass immediately — reboot revival shouldn't wait a tick
   return () => clearInterval(timer);
 }

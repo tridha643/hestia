@@ -349,6 +349,22 @@ describe("hestiad admission + supervision (daemon e2e)", () => {
     return (JSON.parse(runCli(wt, ["status", "--json"]).stdout) as { project: string }).project;
   }
 
+  function procGroup(wt: string, name: string): number {
+    const pidfile = JSON.parse(
+      readFileSync(join(wt, ".hestia", "procs", `${name}.json`), "utf8"),
+    ) as { pgid: number };
+    return pidfile.pgid;
+  }
+
+  async function waitForSharedHolder(project: string | undefined, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (sharedFile().holder?.project === project) return;
+      await Bun.sleep(100);
+    }
+    throw new Error(`shared holder did not become ${project ?? "unclaimed"}`);
+  }
+
   test(
     "expose --shared declares + claims a stable hostname routed through the gateway",
     async () => {
@@ -423,24 +439,36 @@ describe("hestiad admission + supervision (daemon e2e)", () => {
   );
 
   test(
-    "down auto-releases to the queue head; a fully released hostname answers 503 unclaimed",
+    "dead shared origins auto-release without restarting the connector",
     async () => {
-      // wtC queues behind wtB, then wtB goes down → automatic grant
+      env.HESTIA_SWEEP_INTERVAL_MS = "500";
+      expect(runCli(tmpRoot, ["daemon", "stop"]).code).toBe(0);
+      expect(runCli(tmpRoot, ["daemon", "start"]).code).toBe(0);
+      const projectB = projectOf(wtB);
+      const projectC = projectOf(wtC);
+      const connectorBefore = connectorPid();
       const waiter = Bun.spawn(
         ["bun", CLI, "claim", "dmn-shared", "--wait", "60", "--json"],
         { cwd: wtC, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...env } },
       );
       await new Promise((r) => setTimeout(r, 1_500));
-      expect(runCli(wtB, ["down"]).code).toBe(0);
+      expect(sharedFile().queue?.[0]?.project).toBe(projectC);
+
+      // web2 keeps wtB in the admission occupancy set, so this exercises the
+      // dead-origin probe rather than the dead-stack fallback.
+      process.kill(-procGroup(wtB, "web"), "SIGKILL");
+      await waitForSharedHolder(projectC);
       expect(await waiter.exited).toBe(0);
-      expect(sharedFile().holder?.project).toBe(projectOf(wtC));
+      expect(sharedFile().holder?.project).not.toBe(projectB);
+      expect(connectorPid()).toBe(connectorBefore);
       const back = await gatewayGet("dmn-shared.stub.test");
       expect(back.status).toBe(200);
       expect(JSON.parse(back.body).marker).toBe("C");
 
-      // explicit release with an empty queue → unclaimed, 503 with the remedy
-      expect(runCli(wtC, ["release", "dmn-shared", "--json"]).code).toBe(0);
-      expect(sharedFile().holder).toBeUndefined();
+      // wtC's web2 keeps its slot occupied too; with no queue, the same dead-
+      // origin path clears the holder and restores the unclaimed remedy.
+      process.kill(-procGroup(wtC, "web"), "SIGKILL");
+      await waitForSharedHolder(undefined);
       const unclaimed = await gatewayGet("dmn-shared.stub.test");
       expect(unclaimed.status).toBe(503);
       expect(unclaimed.body).toContain("hestia claim dmn-shared");

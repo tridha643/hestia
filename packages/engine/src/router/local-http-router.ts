@@ -1,15 +1,11 @@
-import { execFile } from "node:child_process";
 import { Agent, createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createConnection, createServer as createNetServer, type Socket } from "node:net";
-import { promisify } from "node:util";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { chmodSync, lstatSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { slug, type ServiceRecord, type StackRecord } from "@hestia/core";
-import { isLive } from "../proc/pidfile.ts";
-import { inspectPort } from "../proc/ports.ts";
 import { hestiaHome, parseStackRecord } from "../state.ts";
 import {
   effectiveLocalRouteServices,
@@ -22,8 +18,8 @@ import {
 } from "./router-config.ts";
 import { reconcilePortlessAliases } from "./portless-adapter.ts";
 import { listSharedHostnames, sharedPathMatches } from "../tunnel/shared.ts";
+import { resolveSharedContractOrigin, verifyLocalRouterTarget } from "./origin-liveness.ts";
 
-const pexec = promisify(execFile);
 const ROUTE_REFRESH_MS = 1_000;
 const MAX_MIRROR_BYTES = 2 * 1024 * 1024;
 const MAX_REQUEST_HEADER_BYTES = 64 * 1024;
@@ -36,6 +32,7 @@ interface LocalRouterTarget {
   hostname: string;
   project: string;
   service?: ServiceRecord;
+  sharedHolder?: string;
   agent?: Agent;
 }
 
@@ -127,54 +124,6 @@ function forwardedHeaders(request: IncomingMessage, originPort: number): Incomin
   const remote = request.socket.remoteAddress;
   if (remote) headers["x-forwarded-for"] = remote;
   return headers;
-}
-
-async function verifyDockerRouteTarget(target: LocalRouterTarget, port: number): Promise<boolean> {
-  try {
-    const service = target.service!;
-    const args = [
-      "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Ports}}",
-      "--filter", `label=dev.hestia.stack=${target.project}`,
-      "--filter", `label=com.docker.compose.service=${service.name}`,
-    ];
-    const { stdout } = await pexec("docker", args, { timeout: 2_000 });
-    return stdout.split("\n").some((line) => {
-      const [id, ports = ""] = line.split("\t");
-      const identityMatches = service.containerId === undefined || id?.startsWith(service.containerId);
-      return identityMatches && new RegExp(`(?:127\\.0\\.0\\.1|0\\.0\\.0\\.0):${port}->`).test(ports);
-    });
-  } catch {
-    return false;
-  }
-}
-
-async function verifyLocalRouterTarget(target: LocalRouterTarget): Promise<number | null> {
-  const service = target.service;
-  const port = service?.publishedPort;
-  if (service === undefined || port === undefined || service.backend === "tunnel") return null;
-  if (service.backend === "docker") {
-    return await verifyDockerRouteTarget(target, port) ? port : null;
-  }
-  if (service.pid === undefined || service.startTime === undefined) return null;
-  if (!isLive({ pid: service.pid, startTime: service.startTime })) return null;
-  try {
-    return (await inspectPort(service.pid, port)).ownerIsMember ? port : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Verify one persisted service still owns its direct loopback origin. */
-export async function verifyStackServiceOrigin(
-  record: StackRecord,
-  service: ServiceRecord,
-  publishedPort = service.publishedPort,
-): Promise<boolean> {
-  return await verifyLocalRouterTarget({
-    hostname: "",
-    project: record.project,
-    service: { ...service, publishedPort },
-  }) !== null;
 }
 
 function targetIdentity(target: LocalRouterTarget): string {
@@ -402,25 +351,17 @@ export class HestiaLocalHttpRouter {
       let target: LocalRouterTarget | undefined;
       if (holder !== undefined) {
         const stack = records.find((record) => record.project === holder.project);
-        const endpoint = stack?.endpoints.find(
-          (candidate) => (candidate.alias ?? candidate.name) === holder.service,
-        );
-        const service = stack?.services.find(
-          (candidate) => candidate.name === (endpoint?.workload ?? endpoint?.name),
-        );
-        const binding = service?.bindings?.find(
-          (candidate) => `${candidate.target}/${candidate.protocol}` === endpoint?.binding,
-        );
-        const publishedPort = binding?.publishedPort ?? service?.publishedPort;
+        const service = stack === undefined
+          ? undefined
+          : resolveSharedContractOrigin(stack, holder.service);
         const candidate: LocalRouterTarget = {
           hostname,
           project: holder.project,
+          sharedHolder: holder.project,
           // Holder without a resolvable live origin keeps a target so requests
           // answer 503 "origin unavailable" instead of 404 — the claim is real,
           // the stack is just down (it re-`up`s straight back into service).
-          service: service === undefined || service.backend === "tunnel" || publishedPort === undefined
-            ? undefined
-            : { ...service, publishedPort },
+          service,
         };
         // Reuse the prior entry's target object (and its keep-alive agent) when
         // nothing material changed, so long-lived connections aren't churned.
@@ -527,7 +468,10 @@ export class HestiaLocalHttpRouter {
         };
       }
       if (entry.target?.service?.publishedPort === undefined) {
-        return { status: 503, message: "Hestia route origin unavailable" };
+        return {
+          status: 503,
+          message: `Hestia route origin unavailable — held by ${entry.target?.project ?? "unknown"}`,
+        };
       }
       return { target: entry.target };
     }
@@ -547,7 +491,8 @@ export class HestiaLocalHttpRouter {
     const target = match.target;
     const port = target.service!.publishedPort!;
     if (await verifyLocalRouterTarget(target) !== port) {
-      return sendRouterResponse(response, 503, "Hestia route origin unavailable");
+      const suffix = target.sharedHolder === undefined ? "" : ` — held by ${target.sharedHolder}`;
+      return sendRouterResponse(response, 503, `Hestia route origin unavailable${suffix}`);
     }
     const proxy = httpRequest({
       hostname: "127.0.0.1",
@@ -568,10 +513,11 @@ export class HestiaLocalHttpRouter {
     proxy.on("error", (error) => {
       if (!response.headersSent) {
         const ownershipFailure = error instanceof OriginOwnershipError;
+        const suffix = target.sharedHolder === undefined ? "" : ` — held by ${target.sharedHolder}`;
         sendRouterResponse(
           response,
           ownershipFailure ? 503 : 502,
-          ownershipFailure ? "Hestia route origin unavailable" : "Hestia route origin failed",
+          ownershipFailure ? `Hestia route origin unavailable${suffix}` : "Hestia route origin failed",
         );
       }
       else response.destroy();

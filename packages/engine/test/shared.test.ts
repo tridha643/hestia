@@ -16,7 +16,11 @@ import {
   updateSharedHostname,
 } from "../src/tunnel/shared.ts";
 import { generateMergedConfig } from "../src/tunnel/ingress.ts";
-import { SharedArbiter } from "../src/daemon/shared-arbiter.ts";
+import { startTimeOf } from "../src/proc/pidfile.ts";
+import {
+  ORIGIN_DEAD_RELEASE_STRIKES,
+  SharedArbiter,
+} from "../src/daemon/shared-arbiter.ts";
 
 let home: string;
 const savedEnv: Record<string, string | undefined> = {};
@@ -35,7 +39,7 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-function writeMirror(project: string): void {
+function writeMirror(project: string, overrides: Partial<StackRecord> = {}): void {
   const dir = join(home, "stacks", project);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
@@ -50,8 +54,25 @@ function writeMirror(project: string): void {
       env: {},
       endpoints: [],
       createdAt: "2026-01-01T00:00:00.000Z",
+      ...overrides,
     } satisfies Partial<StackRecord> & { project: string }),
   );
+}
+
+function writeMirrorPidfile(project: string, name: string): void {
+  const dir = join(home, "stacks", project, "procs");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.json`), JSON.stringify({
+    name,
+    pid: process.pid,
+    pgid: process.pid,
+    startTime: startTimeOf(process.pid)!,
+    argv: ["test"],
+    specFingerprint: "test",
+    logPath: "/dev/null",
+    signal: "term",
+    backend: "proc",
+  }));
 }
 
 const DECLARATION = {
@@ -363,6 +384,192 @@ describe("shared arbiter", () => {
     rmSync(join(home, "stacks", "p-c"), { recursive: true, force: true });
     await arbiter.sweep(new Set(["p-a"]));
     expect(readSharedHostname("tri-slack")?.holder).toBeUndefined();
+  });
+
+  test("releases an occupied holder only after three dead-origin strikes", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a");
+    writeMirror("p-b");
+    const arbiter = new SharedArbiter({ probeHolderOrigin: async () => "dead" });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    await arbiter.request("tri-slack", { project: "p-b", worktree: "/wt/b" }, 0);
+
+    for (let strike = 1; strike < ORIGIN_DEAD_RELEASE_STRIKES; strike += 1) {
+      expect(await arbiter.sweep(new Set(["p-a"]))).toEqual([]);
+      expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-a");
+    }
+    expect(await arbiter.sweep(new Set(["p-a"]))).toEqual([{
+      name: "tri-slack", project: "p-a", reason: "origin-dead",
+    }]);
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-b");
+  });
+
+  test("live resets dead strikes while unknown preserves them without advancing", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a");
+    let origin: "live" | "dead" | "unknown" = "dead";
+    const arbiter = new SharedArbiter({ probeHolderOrigin: async () => origin });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+
+    await arbiter.sweep(new Set(["p-a"]));
+    await arbiter.sweep(new Set(["p-a"]));
+    origin = "live";
+    await arbiter.sweep(new Set(["p-a"]));
+    origin = "dead";
+    await arbiter.sweep(new Set(["p-a"]));
+    await arbiter.sweep(new Set(["p-a"]));
+    origin = "unknown";
+    expect(await arbiter.sweep(new Set(["p-a"]))).toEqual([]);
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-a");
+    origin = "dead";
+    expect((await arbiter.sweep(new Set(["p-a"])))[0]?.reason).toBe("origin-dead");
+  });
+
+  test("non-occupied stacks preserve ownership when a resolvable origin probe is unknown", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a", {
+      services: [{
+        name: "slack", backend: "proc", state: "healthy", publishedPort: 4100,
+        pid: process.pid, startTime: "test identity",
+      }],
+      endpoints: [{ name: "slack", host: "127.0.0.1", port: 4100 }],
+    });
+    const arbiter = new SharedArbiter({ probeHolderOrigin: async () => "unknown" });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    for (let tick = 0; tick < ORIGIN_DEAD_RELEASE_STRIKES + 1; tick += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-a");
+  });
+
+  test("non-occupied stacks preserve an unresolved contract while another proc is live", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a", {
+      services: [{
+        name: "other", backend: "proc", state: "healthy", publishedPort: 4100,
+        pid: process.pid, startTime: startTimeOf(process.pid)!,
+      }],
+      endpoints: [],
+    });
+    const arbiter = new SharedArbiter();
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    for (let tick = 0; tick < ORIGIN_DEAD_RELEASE_STRIKES + 1; tick += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-a");
+  });
+
+  test("non-occupied stacks preserve a live pre-state-write mirrored pidfile", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a", { services: [{
+      name: "malformed", backend: "proc", state: "healthy", pid: 0, startTime: "invalid",
+    }] });
+    writeMirrorPidfile("p-a", "starting-web");
+    const arbiter = new SharedArbiter();
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    for (let tick = 0; tick < ORIGIN_DEAD_RELEASE_STRIKES + 1; tick += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-a");
+  });
+
+  test("debounces dead stacks, protects startup, and contains corrupt mirrors", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a", { state: "starting" });
+    const arbiter = new SharedArbiter({ probeHolderOrigin: async () => "dead" });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    for (let tick = 0; tick < ORIGIN_DEAD_RELEASE_STRIKES + 1; tick += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-a");
+
+    writeMirror("p-a", { state: "up" });
+    for (let strike = 1; strike < ORIGIN_DEAD_RELEASE_STRIKES; strike += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect((await arbiter.sweep(new Set()))[0]?.reason).toBe("stack-dead");
+
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    writeFileSync(join(home, "stacks", "p-a", "stack.json"), "{broken");
+    for (let strike = 1; strike < ORIGIN_DEAD_RELEASE_STRIKES; strike += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect((await arbiter.sweep(new Set()))[0]?.reason).toBe("stack-dead");
+  });
+
+  test("contains parseable nested mirror corruption per holder", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a", { state: "up" });
+    const arbiter = new SharedArbiter();
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    const path = join(home, "stacks", "p-a", "stack.json");
+    const malformed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    delete malformed.starter;
+    malformed.services = [{
+      name: "slack", backend: "proc", state: "healthy", publishedPort: 4100,
+      pid: 0, startTime: "invalid",
+    }];
+    malformed.endpoints = [{ name: "slack", host: "127.0.0.1", port: 4100 }];
+    writeFileSync(path, JSON.stringify(malformed));
+    for (let strike = 1; strike < ORIGIN_DEAD_RELEASE_STRIKES; strike += 1) {
+      expect(await arbiter.sweep(new Set())).toEqual([]);
+    }
+    expect((await arbiter.sweep(new Set()))[0]?.reason).toBe("stack-dead");
+  });
+
+  test("a holder handoff resets strikes for the new holder incarnation", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a");
+    writeMirror("p-b");
+    const arbiter = new SharedArbiter({ probeHolderOrigin: async () => "dead" });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    await arbiter.request("tri-slack", { project: "p-b", worktree: "/wt/b" }, 0);
+    await arbiter.sweep(new Set(["p-a"]));
+    await arbiter.sweep(new Set(["p-a"]));
+    await arbiter.allow("tri-slack", "p-a");
+    expect(await arbiter.sweep(new Set(["p-b"]))).toEqual([]);
+    expect(readSharedHostname("tri-slack")?.holder?.project).toBe("p-b");
+  });
+
+  test("does not prune a waiter whose mirror appears during the holder probe", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a");
+    let beginProbe!: () => void;
+    let finishProbe!: () => void;
+    const probing = new Promise<void>((resolve) => { beginProbe = resolve; });
+    const finish = new Promise<void>((resolve) => { finishProbe = resolve; });
+    const arbiter = new SharedArbiter({
+      probeHolderOrigin: async () => {
+        beginProbe();
+        await finish;
+        return "live";
+      },
+    });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    await arbiter.request("tri-slack", { project: "p-b", worktree: "/wt/b" }, 0);
+
+    const sweep = arbiter.sweep(new Set(["p-a"]));
+    await probing;
+    writeMirror("p-b");
+    finishProbe();
+    await sweep;
+    expect(readSharedHostname("tri-slack")?.queue?.map((waiter) => waiter.project)).toEqual(["p-b"]);
+  });
+
+  test("probes the current holder contract after a re-declaration changes future grants", async () => {
+    await declareSharedHostname(DECLARATION);
+    writeMirror("p-a");
+    const probedContracts: string[] = [];
+    const arbiter = new SharedArbiter({
+      probeHolderOrigin: async (_mirror, contractService) => {
+        probedContracts.push(contractService);
+        return "live";
+      },
+    });
+    await arbiter.request("tri-slack", { project: "p-a", worktree: "/wt/a" }, 0);
+    await declareSharedHostname({ ...DECLARATION, service: "slack-v2" });
+    await arbiter.sweep(new Set(["p-a"]));
+    expect(probedContracts).toEqual(["slack"]);
   });
 
   test("unknown names surface shared-not-found", async () => {

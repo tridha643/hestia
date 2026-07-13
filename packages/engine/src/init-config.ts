@@ -53,6 +53,7 @@ function inferredWorkload(report: DiscoveryReport, name: string): ConfiguredWork
     wranglerConfig: workload.source === "wrangler" && workload.definitionPath !== undefined
       ? relative(report.repository.worktree, workload.definitionPath)
       : undefined,
+    env: {},
     endpoints: {},
   };
 }
@@ -99,6 +100,7 @@ function applyRequest(
     command: request.kind === "proc" ? request.command : undefined,
     port: request.kind === "proc" ? request.port ?? "auto" : undefined,
     wranglerConfig: request.kind === "wrangler" ? request.file ?? "wrangler.toml" : undefined,
+    env: existing?.env ?? {},
     endpoints: existing?.endpoints ?? {},
   };
 }
@@ -123,7 +125,12 @@ export async function initializeRepositoryConfig(
       workloads: Object.fromEntries(
         Object.entries(layer.config.workloads).map(([name, workload]) => [
           name,
-          { ...workload, command: workload.command?.slice(), endpoints: { ...workload.endpoints } },
+          {
+            ...workload,
+            command: workload.command?.slice(),
+            env: { ...workload.env },
+            endpoints: { ...workload.endpoints },
+          },
         ]),
       ),
     };

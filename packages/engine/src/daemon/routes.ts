@@ -14,10 +14,10 @@ import { FleetMonitor } from "./fleet-monitor.ts";
 import { SharedArbiter } from "./shared-arbiter.ts";
 import { SlotLedger, resolveMaxStacks } from "./slots.ts";
 
-export const HESTIAD_PROTOCOL_VERSION = 5;
+export const HESTIAD_PROTOCOL_VERSION = 6;
 const MAX_JSON_BODY_BYTES = 16 * 1024;
 const MAX_LOG_STREAMS = 16;
-const MAX_LOG_TAIL = 200;
+const MAX_LOG_TAIL = 2_000;
 
 export interface AcquireResult {
   granted: boolean;
@@ -165,10 +165,12 @@ export class Admission {
   }
 
   async #pump(): Promise<void> {
-    if (this.#queue.length === 0) return;
     const { maxStacks } = resolveMaxStacks();
     const occupancy = await this.ledger.occupancy();
     this.#cache(occupancy);
+    // Duties consume the cached live/reserved view even when no admission
+    // waiter exists, so every sweep must refresh occupancy before returning.
+    if (this.#queue.length === 0) return;
     let used = occupancy.live.length + occupancy.reserved.length;
     const granted: Waiter[] = [];
     for (const waiter of this.#queue) {

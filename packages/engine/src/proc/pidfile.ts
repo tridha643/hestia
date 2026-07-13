@@ -68,7 +68,8 @@ function parsePidfile(source: string, path: string): Pidfile {
   if (pidfile.schemaVersion !== undefined && pidfile.schemaVersion !== STATE_SCHEMA_VERSION) {
     throw new HestiaError("state-corrupt", `invalid pidfile ${path}: unsupported schemaVersion`, { path });
   }
-  if (typeof pidfile.name !== "string" || !Number.isInteger(pidfile.pid) ||
+  if (typeof pidfile.name !== "string" || !Number.isSafeInteger(pidfile.pid) ||
+    (pidfile.pid as number) <= 0 ||
     typeof pidfile.startTime !== "string" || typeof pidfile.logPath !== "string") {
     throw new HestiaError("state-corrupt", `invalid pidfile ${path}: missing process identity`, { path });
   }
@@ -92,13 +93,30 @@ export function removePidfile(worktreeRoot: string, name: string): void {
 }
 
 export function listPidfiles(dir: string): Pidfile[] {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => {
-      const path = join(dir, f);
-      return parsePidfile(readFileSync(path, "utf8"), path);
-    });
+  const scan = scanPidfiles(dir);
+  if (scan.errors[0] !== undefined) throw scan.errors[0];
+  return scan.pidfiles;
+}
+
+export interface PidfileScanResult {
+  pidfiles: Pidfile[];
+  errors: Error[];
+}
+
+/** Parse pidfiles independently so machine-wide sweeps can contain one corrupt entry. */
+export function scanPidfiles(dir: string): PidfileScanResult {
+  if (!existsSync(dir)) return { pidfiles: [], errors: [] };
+  const pidfiles: Pidfile[] = [];
+  const errors: Error[] = [];
+  for (const file of readdirSync(dir).filter((candidate) => candidate.endsWith(".json"))) {
+    const path = join(dir, file);
+    try {
+      pidfiles.push(parsePidfile(readFileSync(path, "utf8"), path));
+    } catch (error) {
+      errors.push(error as Error);
+    }
+  }
+  return { pidfiles, errors };
 }
 
 /** Stable spawn-intent hash used for idempotent replacement without persisting secrets. */
@@ -113,6 +131,7 @@ export function procSpecFingerprint(spec: ProcSpec): string {
     backend: spec.backend ?? "proc",
     resolver: spec.varlock ? "varlock" : "direct",
     inspectorPort: spec.inspectorPort ?? null,
+    healthPath: spec.healthPath ?? null,
     configPath: spec.configPath ?? null,
     originService: spec.originService ?? null,
     originEndpoint: spec.originEndpoint ?? null,
@@ -125,19 +144,30 @@ export function procSpecFingerprint(spec: ProcSpec): string {
  * post-spawn and re-read on every liveness check; both reads run on the same
  * host so the platform's `lstart` format never has to be parsed.
  */
-function readProcessStartTime(
+export type ProcessIdentityLiveness = "live" | "dead" | "unknown";
+
+type ProcessStartTimeRead =
+  | { status: "ok"; value: string | null }
+  | { status: "error" };
+
+function probeProcessStartTime(
   pid: number,
   env: NodeJS.ProcessEnv,
-): string | null {
+): ProcessStartTimeRead {
   try {
     const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf8",
       env,
     }).trim();
-    return out === "" ? null : out;
+    return { status: "ok", value: out === "" ? null : out };
   } catch {
-    return null;
+    return { status: "error" };
   }
+}
+
+function readProcessStartTime(pid: number, env: NodeJS.ProcessEnv): string | null {
+  const result = probeProcessStartTime(pid, env);
+  return result.status === "ok" ? result.value : null;
 }
 
 export function startTimeOf(pid: number): string | null {
@@ -217,32 +247,46 @@ function plausibleProcessLocales(
   return [...new Set(plausible)];
 }
 
-function legacyLocalizedStartTimeMatches(
+function probeLegacyLocalizedStartTime(
   pid: number,
   canonicalStartTime: string,
   recordedStartTime: string,
-): boolean {
+): ProcessIdentityLiveness {
   const cacheKey = `${pid}\0${canonicalStartTime}\0${recordedStartTime}`;
   const cached = legacyStartTimeMatches.get(cacheKey);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return cached ? "live" : "dead";
   let matched = false;
+  let readFailed = false;
   for (const locale of plausibleProcessLocales(canonicalStartTime, recordedStartTime)) {
-    const localized = readProcessStartTime(pid, {
+    const read = probeProcessStartTime(pid, {
       ...process.env,
       LC_ALL: locale,
       LANG: locale,
     });
-    if (localized !== null && processStartTimeMatches(localized, recordedStartTime)) {
+    if (read.status === "error") {
+      readFailed = true;
+      continue;
+    }
+    if (read.value !== null && processStartTimeMatches(read.value, recordedStartTime)) {
       matched = true;
       break;
     }
   }
+  if (!matched && readFailed) return "unknown";
   if (legacyStartTimeMatches.size >= 512) {
     const oldest = legacyStartTimeMatches.keys().next().value;
     if (oldest !== undefined) legacyStartTimeMatches.delete(oldest);
   }
   legacyStartTimeMatches.set(cacheKey, matched);
-  return matched;
+  return matched ? "live" : "dead";
+}
+
+function legacyLocalizedStartTimeMatches(
+  pid: number,
+  canonicalStartTime: string,
+  recordedStartTime: string,
+): boolean {
+  return probeLegacyLocalizedStartTime(pid, canonicalStartTime, recordedStartTime) === "live";
 }
 
 function processStartTimeMatches(current: string, recorded: string): boolean {
@@ -268,4 +312,27 @@ export function isLive(pf: Pick<Pidfile, "pid" | "startTime">): boolean {
   if (current !== null && processStartTimeMatches(current, pf.startTime)) return true;
   return current !== null &&
     legacyLocalizedStartTimeMatches(pf.pid, current, pf.startTime);
+}
+
+/** Probe PID+lstart identity without collapsing process-inspection failures into death. */
+export function probeProcessIdentity(
+  pf: Pick<Pidfile, "pid" | "startTime">,
+): ProcessIdentityLiveness {
+  try {
+    process.kill(pf.pid, 0);
+  } catch (error) {
+    return (error as { code?: string }).code === "ESRCH" ? "dead" : "unknown";
+  }
+  let current: string;
+  try {
+    current = execFileSync("ps", ["-o", "lstart=", "-p", String(pf.pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C", LANG: "C" },
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+  if (current === "") return "dead";
+  if (processStartTimeMatches(current, pf.startTime)) return "live";
+  return probeLegacyLocalizedStartTime(pf.pid, current, pf.startTime);
 }

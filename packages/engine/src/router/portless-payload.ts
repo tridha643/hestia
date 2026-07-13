@@ -2,7 +2,7 @@
 export const HESTIA_PORTLESS_VERSION = "0.15.1";
 
 /** SHA-256 of the exact Hestia hardening patch bundled into Portless. */
-export const HESTIA_PORTLESS_PATCH_SHA256 = "9ca94ca771ce502769a2c7cbe3bb4fe8d54dc847ff9f7e3e2b34abf728618690";
+export const HESTIA_PORTLESS_PATCH_SHA256 = "7d969a7e8bc556d0e866accc836b06e237f567b68d3d7fb7eaed5b0378fbc2d6";
 
 export interface PortlessPayloadProvenance {
   package: "portless";

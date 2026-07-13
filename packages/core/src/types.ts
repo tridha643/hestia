@@ -118,6 +118,8 @@ export interface ProcSpec {
   /** Shutdown signal for the process group. Default "term"; wrangler uses "int". */
   signal?: "term" | "int";
   readyTimeoutMs?: number;
+  /** Optional HTTP path that must return 2xx after port ownership is proven. */
+  healthPath?: string;
   /** Prefix the spawn with the repo's varlock resolver (composition, not integration). */
   varlock?: boolean;
   backend?: "proc" | "wrangler" | "tunnel";

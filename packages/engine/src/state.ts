@@ -150,6 +150,20 @@ export function readMirrorState(project: string): StackRecord | null {
   return record;
 }
 
+/** Contained mirror read used by machine-wide sweeps that must survive corrupt peers. */
+export type SafeMirrorStateRead =
+  | { status: "ok"; record: StackRecord | null }
+  | { status: "error"; error: Error };
+
+/** Read one stack mirror without letting corrupt state abort a machine-wide sweep. */
+export function readMirrorStateSafe(project: string): SafeMirrorStateRead {
+  try {
+    return { status: "ok", record: readMirrorState(project) };
+  } catch (error) {
+    return { status: "error", error: error as Error };
+  }
+}
+
 export function clearState(worktreeRoot: string, project: string): void {
   const p = statePath(worktreeRoot);
   if (existsSync(p)) rmSync(p);

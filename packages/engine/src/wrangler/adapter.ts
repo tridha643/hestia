@@ -4,6 +4,7 @@ import { dirname, join, relative } from "node:path";
 import { connect } from "node:net";
 import { HestiaError, type ProcSpec } from "@hestia/core";
 import { allocatePort } from "../proc/ports.ts";
+import { detectVarlock } from "../proc/resolver.ts";
 import { discoverWorkers, filterWorkers, type WorkerConfig } from "./discover.ts";
 
 /** Per-worktree private dev registry — the isolation mechanism itself. */
@@ -176,6 +177,7 @@ export async function planWorkers(
       );
     }
     const inspectorPort = await allocatePort();
+    const workerCwd = dirname(w.configPath);
     specs.push({
       name: w.name!,
       // wrangler binary invoked directly — modem's package dev scripts use
@@ -197,9 +199,10 @@ export async function planWorkers(
         WRANGLER_REGISTRY_PATH: registry,
         MINIFLARE_REGISTRY_PATH: registry,
       },
+      cwd: relative(worktreeRoot, workerCwd),
       port: "auto",
       signal: "int",
-      varlock: opts.varlock,
+      varlock: opts.varlock && detectVarlock(worktreeRoot, workerCwd) !== null,
       backend: "wrangler",
       inspectorPort,
       configPath: w.configPath,

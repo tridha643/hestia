@@ -79,9 +79,9 @@ import {
   internalEndpointAuthority,
   publicGatewaySocketPath,
   resolvedLocalRouteHostname,
-  verifyStackServiceOrigin,
 } from "./router/local-http-router.ts";
-import { detectVarlock } from "./proc/resolver.ts";
+import { verifyStackServiceOrigin } from "./router/origin-liveness.ts";
+import { resolveConfiguredEnvironment } from "./configured-workload-environment.ts";
 import { planWorkers, privateRegistryDir } from "./wrangler/adapter.ts";
 import {
   globalGainWarnings,
@@ -1018,12 +1018,31 @@ export class ComposeEngine implements IsolationEngine {
         }
       }
 
+      // Compose endpoints exist before host workloads, so their ephemeral
+      // fields can be consumed by configured worker environment templates.
+      applyConfiguredEndpoints(record, configuredWorkloads);
+      if (opts?.workers || configuredWorkers.length > 0) {
+        const configuredFilters = configuredWorkers.map(([name, workload]) => workload.wranglerConfig ?? name);
+        const explicitFilters = Array.isArray(opts?.workers) ? opts.workers : [];
+        await this.#upWorkers(worktreeRoot, record, configuredWorkloads, {
+          ...opts,
+          workers: opts?.workers === true ? true : [...new Set([...explicitFilters, ...configuredFilters])],
+        });
+      }
+
+      // Workers bind in parallel to establish their private service registry.
+      // Publish their aliases before dependent procs such as a web frontend.
+      applyConfiguredEndpoints(record, configuredWorkloads);
+
       for (const [name, workload] of configuredProcs) {
-        const command = workload.command!;
         const configuredSpec: ProcSpec = {
           name,
-          argv: command,
+          argv: workload.command!,
+          cwd: workload.cwd,
+          env: resolveConfiguredEnvironment(worktreeRoot, workload.env, record),
           port: workload.port ?? "auto",
+          varlock: workload.varlock,
+          healthPath: workload.healthPath,
           backend: "proc",
         };
         const clash = record.services.find((service) => service.name === name && service.backend === "docker");
@@ -1048,20 +1067,10 @@ export class ComposeEngine implements IsolationEngine {
           (pidfile) => mirrorPidfile(record.project, pidfile),
         );
         recordProc(record, result.record);
+        applyConfiguredEndpoints(record, configuredWorkloads);
         writeState(worktreeRoot, record);
         if (result.error !== undefined) throw result.error;
       }
-
-      if (opts?.workers || configuredWorkers.length > 0) {
-        const configuredFilters = configuredWorkers.map(([name, workload]) => workload.wranglerConfig ?? name);
-        const explicitFilters = Array.isArray(opts?.workers) ? opts.workers : [];
-        await this.#upWorkers(worktreeRoot, record, {
-          ...opts,
-          workers: opts?.workers === true ? true : [...new Set([...explicitFilters, ...configuredFilters])],
-        });
-      }
-
-      applyConfiguredEndpoints(record, configuredWorkloads);
 
       record.state = "up";
       delete record.starter; // no longer provisional — services carry the slot
@@ -1075,17 +1084,32 @@ export class ComposeEngine implements IsolationEngine {
   async #upWorkers(
     worktreeRoot: string,
     record: StackRecord,
+    configuredWorkloads: Record<string, ConfiguredWorkload>,
     opts: UpOptions,
   ): Promise<void> {
     const plan = await planWorkers(worktreeRoot, {
       filter: Array.isArray(opts.workers) ? opts.workers : [],
       allowRemote: opts.allowRemote ?? false,
       force: opts.force ?? false,
-      varlock: !opts.noVarlock && detectVarlock(worktreeRoot) !== null,
+      varlock: !opts.noVarlock,
     });
     for (const w of plan.warnings) process.stderr.write(`warning: ${w}\n`);
 
     for (const spec of plan.specs) {
+      const configured = Object.entries(configuredWorkloads).find(([name, workload]) =>
+        workload.source === "wrangler" &&
+        (name === spec.name ||
+          (workload.wranglerConfig !== undefined && resolve(worktreeRoot, workload.wranglerConfig) === spec.configPath))
+      )?.[1];
+      if (configured !== undefined && configured.source === "wrangler") {
+        spec.cwd = configured.cwd ?? spec.cwd;
+        spec.varlock = configured.varlock ?? spec.varlock;
+        spec.healthPath = configured.healthPath;
+        spec.env = {
+          ...spec.env,
+          ...resolveConfiguredEnvironment(worktreeRoot, configured.env, record),
+        };
+      }
       const clash = record.services.find(
         (s) => s.name === spec.name && s.backend === "docker",
       );

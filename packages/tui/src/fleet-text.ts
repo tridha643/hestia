@@ -1,5 +1,10 @@
 import stringWidth from "string-width";
 
+/** Measure terminal text in display cells rather than JavaScript code units. */
+export function fleetTextWidth(text: string): number {
+  return stringWidth(text);
+}
+
 /** Crop terminal text by display cells rather than JavaScript code-unit length. */
 export function fitFleetText(text: string, width: number): string {
   if (width <= 0) return "";

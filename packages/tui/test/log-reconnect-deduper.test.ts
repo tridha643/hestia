@@ -46,4 +46,14 @@ describe("ReconnectLogDeduper", () => {
     deduper.beginReconnect();
     expect(texts(deduper.push(line("unrelated")))).toEqual(["unrelated"]);
   });
+
+  test("handles a 1,000-line repeated backfill without replaying or rescanning prefixes", () => {
+    const deduper = new ReconnectLogDeduper(1_000);
+    for (let index = 0; index < 1_000; index += 1) deduper.push(line("heartbeat"));
+    deduper.beginReconnect();
+    for (let index = 0; index < 1_000; index += 1) {
+      expect(deduper.push(line("heartbeat"))).toEqual([]);
+    }
+    expect(texts(deduper.push(line("fresh")))).toEqual(["fresh"]);
+  });
 });

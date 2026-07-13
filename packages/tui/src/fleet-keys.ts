@@ -57,3 +57,23 @@ export function isScrollTopKey(key: FleetKeyEvent): boolean {
 export function isDoctorKey(key: FleetKeyEvent): boolean {
   return isShiftedKey(key, "d");
 }
+
+/** Full-page upward log scroll. */
+export function isPageUpKey(key: FleetKeyEvent): boolean {
+  return key.name.toLowerCase() === "pageup";
+}
+
+/** Full-page downward log scroll. */
+export function isPageDownKey(key: FleetKeyEvent): boolean {
+  return key.name.toLowerCase() === "pagedown";
+}
+
+/** Half-page upward log scroll, matching common terminal viewers. */
+export function isHalfPageUpKey(key: FleetKeyEvent): boolean {
+  return key.ctrl === true && key.name.toLowerCase() === "u";
+}
+
+/** Half-page downward log scroll, matching common terminal viewers. */
+export function isHalfPageDownKey(key: FleetKeyEvent): boolean {
+  return key.ctrl === true && key.name.toLowerCase() === "d";
+}

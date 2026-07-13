@@ -84,6 +84,23 @@ describe("Fleet selection reducer", () => {
     expect(state.follow).toBe(false);
   });
 
+  test("clamps workload scrolling and resets it when the selected stack changes", () => {
+    let state = createFleetUiState();
+    state = reduceFleetUiState(state, { type: "scroll-services", delta: 100, maxOffset: 7 });
+    expect(state.serviceOffset).toBe(7);
+    expect(state.serviceOffsetManual).toBe(true);
+    state = reduceFleetUiState(state, {
+      type: "reconcile",
+      snapshot,
+      preferredProject: "modem-alpha",
+    });
+    expect(state.serviceOffset).toBe(0);
+    expect(state.serviceOffsetManual).toBe(false);
+    state = reduceFleetUiState(state, { type: "scroll-services", delta: 5, maxOffset: 7 });
+    state = reduceFleetUiState(state, { type: "move-stack", delta: 1, snapshot });
+    expect(state.serviceOffset).toBe(0);
+  });
+
   test("filters only the daemon-projected managed rows", () => {
     expect(visibleFleetStacks(snapshot, "ingest").map((stack) => stack.project))
       .toEqual(["modem-beta"]);

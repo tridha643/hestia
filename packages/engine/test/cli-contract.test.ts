@@ -21,7 +21,7 @@ describe("stable CLI contract", () => {
     expect(JSON.parse(result.stdout)).toEqual({
       cliVersion: "1.3.0",
       stateSchema: 1,
-      daemonProtocol: 5,
+      daemonProtocol: 6,
       runtime: "bun",
     });
   });

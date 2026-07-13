@@ -111,7 +111,12 @@ function sameEndpoint(left: ConfiguredEndpoint, right: ConfiguredEndpoint): bool
 }
 
 function cloneWorkload(workload: ConfiguredWorkload): ConfiguredWorkload {
-  return { ...workload, command: workload.command?.slice(), endpoints: { ...workload.endpoints } };
+  return {
+    ...workload,
+    command: workload.command?.slice(),
+    env: { ...workload.env },
+    endpoints: { ...workload.endpoints },
+  };
 }
 
 function mergeConfigLayers(
@@ -144,6 +149,10 @@ function mergeConfigLayers(
       conflicts.push(`machine workload ${name} cannot replace committed source ${committed.source} with ${overlay.source}`);
       continue;
     }
+    committed.cwd = overlay.cwd ?? committed.cwd;
+    committed.varlock = overlay.varlock ?? committed.varlock;
+    committed.healthPath = overlay.healthPath ?? committed.healthPath;
+    committed.env = { ...committed.env, ...overlay.env };
     for (const [alias, endpoint] of Object.entries(overlay.endpoints)) {
       const existing = committed.endpoints[alias];
       if (existing !== undefined && !sameEndpoint(existing, endpoint)) {

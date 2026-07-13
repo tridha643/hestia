@@ -1,15 +1,69 @@
 import {
   HestiaError,
+  type StackRecord,
   type SharedClaimResult,
-  type SharedClaimWaiter,
   type SharedHostnameRecord,
 } from "@hestia/core";
-import { readMirrorState } from "../state.ts";
+import { probeProcessIdentity, scanPidfiles } from "../proc/pidfile.ts";
+import { mirrorProcsDir, readMirrorStateSafe } from "../state.ts";
+import {
+  probeSharedHolderOrigin,
+  resolveSharedContractOrigin,
+  type OriginLiveness,
+} from "../router/origin-liveness.ts";
 import {
   listSharedHostnames,
   readSharedHostname,
   updateSharedHostname,
 } from "../tunnel/shared.ts";
+
+/** Consecutive dead-origin observations required before a shared holder is released. */
+export const ORIGIN_DEAD_RELEASE_STRIKES = 3;
+
+/** Machine-observed cause for an automatic shared-hostname release. */
+export type SharedSweepReleaseReason = "stack-gone" | "stack-dead" | "origin-dead";
+
+/** Automatic shared-hostname release reported to daemon duties. */
+export interface SharedSweepRelease {
+  name: string;
+  project: string;
+  reason: SharedSweepReleaseReason;
+}
+
+/** Injectable shared-hostname arbiter effects for daemon wiring and deterministic tests. */
+export interface SharedArbiterOptions {
+  onChange?: () => void | Promise<void>;
+  probeHolderOrigin?: (mirror: StackRecord, contractService: string) => Promise<OriginLiveness>;
+}
+
+function probeMirrorProcessOccupancy(mirror: StackRecord): OriginLiveness {
+  const identities: Array<{ pid: number; startTime: string }> = [];
+  let malformed = false;
+  for (const service of [...mirror.services, ...(mirror.auxiliary ?? [])].filter(
+    (candidate) => candidate.backend === "proc" || candidate.backend === "wrangler",
+  )) {
+    if (service.pid === undefined && service.startTime === undefined) continue;
+    if (!Number.isSafeInteger(service.pid) || service.pid! <= 0 || typeof service.startTime !== "string") {
+      malformed = true;
+      continue;
+    }
+    identities.push({ pid: service.pid!, startTime: service.startTime });
+  }
+  const pidfileScan = scanPidfiles(mirrorProcsDir(mirror.project));
+  malformed ||= pidfileScan.errors.length > 0;
+  identities.push(...pidfileScan.pidfiles
+    .filter((pidfile) => pidfile.backend !== "tunnel")
+    .map((pidfile) => ({ pid: pidfile.pid, startTime: pidfile.startTime })));
+  let unknown = false;
+  for (const identityRecord of identities) {
+    const identity = probeProcessIdentity(identityRecord);
+    if (identity === "live") return "live";
+    if (identity === "unknown") unknown = true;
+  }
+  if (unknown) return "unknown";
+  if (malformed) throw new Error("Shared holder mirror has an invalid process identity");
+  return "dead";
+}
 
 /**
  * Consent-based arbitration for shared hostnames. ALL authority lives in the
@@ -28,8 +82,17 @@ export class SharedArbiter {
   #mutex: Promise<unknown> = Promise.resolve();
   /** name\0project → resolvers for CLIs long-polling that grant. */
   #polls = new Map<string, Array<{ resolve(result: SharedClaimResult): void; timer: ReturnType<typeof setTimeout> }>>();
+  #deadOriginStrikes = new Map<string, { holderKey: string; strikes: number }>();
+  readonly #onChange?: () => void | Promise<void>;
+  readonly #probeHolderOrigin: SharedArbiterOptions["probeHolderOrigin"];
 
-  constructor(private readonly onChange?: () => void | Promise<void>) {}
+  constructor(onChangeOrOptions?: (() => void | Promise<void>) | SharedArbiterOptions) {
+    const options = typeof onChangeOrOptions === "function"
+      ? { onChange: onChangeOrOptions }
+      : onChangeOrOptions;
+    this.#onChange = options?.onChange;
+    this.#probeHolderOrigin = options?.probeHolderOrigin ?? probeSharedHolderOrigin;
+  }
 
   #locked<T>(fn: () => Promise<T>): Promise<T> {
     const next = this.#mutex.then(fn, fn);
@@ -39,7 +102,7 @@ export class SharedArbiter {
 
   async #notify(): Promise<void> {
     try {
-      await this.onChange?.();
+      await this.#onChange?.();
     } catch {
       // The 1s route refresh is the safety net; a failed push is not fatal.
     }
@@ -71,7 +134,10 @@ export class SharedArbiter {
         delete next.holder;
         return next;
       }
-      if (readMirrorState(head.project) === null) continue; // dead waiter — drop
+      const mirror = readMirrorStateSafe(head.project);
+      // A corrupt mirror is preserved for repair; only a cleanly absent mirror
+      // proves the waiter is dead. A granted-but-not-exposed claimant is valid.
+      if (mirror.status === "ok" && mirror.record === null) continue;
       return {
         ...record,
         holder: {
@@ -245,40 +311,144 @@ export class SharedArbiter {
   }
 
   /**
-   * Sweep duty: release holders whose stack is no longer occupying a slot
-   * (crashed without a down) and prune queue entries with no mirror left.
+   * Sweep duty: debounce-release holders whose stack or exposed origin died,
+   * immediately release cleanly removed stacks, and prune mirrorless waiters.
    * `occupied` = the admission view's live ∪ reserved projects.
    */
-  async sweep(occupied: ReadonlySet<string>): Promise<void> {
+  async sweep(occupied: ReadonlySet<string>): Promise<SharedSweepRelease[]> {
     let changed = false;
+    const releases: SharedSweepRelease[] = [];
     for (const record of listSharedHostnames()) {
-      const holderDead = record.holder !== undefined &&
-        !occupied.has(record.holder.project) &&
-        readMirrorState(record.holder.project) === null;
+      const holder = record.holder;
+      const holderMirror = holder === undefined ? undefined : readMirrorStateSafe(holder.project);
+      const deadWaiterProjects = new Set((record.queue ?? []).flatMap((waiter) => {
+        const mirror = readMirrorStateSafe(waiter.project);
+        return mirror.status === "ok" && mirror.record === null ? [waiter.project] : [];
+      }));
       const deadWaiters = (record.queue ?? []).filter(
-        (waiter) => readMirrorState(waiter.project) === null,
+        (waiter) => deadWaiterProjects.has(waiter.project),
       );
-      if (!holderDead && deadWaiters.length === 0) continue;
+      let releaseReason: SharedSweepReleaseReason | undefined;
+      if (holder !== undefined && holderMirror !== undefined) {
+        const holderKey = `${holder.project}\0${holder.at}`;
+        const holderOccupied = occupied.has(holder.project);
+        if (holderMirror.status === "error") {
+          // Deliberate recovery policy: a persistently corrupt holder mirror
+          // cannot resolve or verify its contract origin, so three sweeps
+          // release it. Transient Docker/lsof probe failures remain unknown.
+          if (this.#recordDeadStrike(record.name, holderKey)) releaseReason = "stack-dead";
+        } else {
+          try {
+            const mirror = holderMirror.record;
+            if (mirror === null) {
+              if (!holderOccupied) releaseReason = "stack-gone";
+              else this.#deadOriginStrikes.delete(record.name);
+            } else {
+              const protectedState = mirror.state === "starting" || mirror.state === "queued";
+              if (!protectedState && mirror.starter !== undefined && (
+                typeof mirror.starter !== "object" || mirror.starter === null ||
+                !Number.isSafeInteger(mirror.starter.pid) || mirror.starter.pid <= 0 ||
+                typeof mirror.starter.startTime !== "string"
+              )) {
+                throw new Error("Shared holder mirror has an invalid starter identity");
+              }
+              const starterLiveness = protectedState || mirror.starter === undefined
+                ? "dead"
+                : probeProcessIdentity(mirror.starter);
+              const protectedStartup = protectedState || starterLiveness === "live";
+              if (protectedStartup) {
+                this.#deadOriginStrikes.delete(record.name);
+              } else if (starterLiveness === "unknown") {
+                this.#retainStrikeForHolder(record.name, holderKey);
+              } else if (!holderOccupied) {
+                const contractOrigin = resolveSharedContractOrigin(mirror, holder.service);
+                if (contractOrigin === undefined) {
+                  const processOccupancy = probeMirrorProcessOccupancy(mirror);
+                  if (processOccupancy === "live") {
+                    this.#deadOriginStrikes.delete(record.name);
+                  } else if (processOccupancy === "unknown") {
+                    this.#retainStrikeForHolder(record.name, holderKey);
+                  } else if (this.#recordDeadStrike(record.name, holderKey)) {
+                    releaseReason = "stack-dead";
+                  }
+                } else {
+                  const origin = await this.#probeHolderOrigin!(mirror, holder.service);
+                  if (origin === "live") {
+                    this.#deadOriginStrikes.delete(record.name);
+                  } else if (origin === "dead") {
+                    if (this.#recordDeadStrike(record.name, holderKey)) releaseReason = "stack-dead";
+                  } else {
+                    this.#retainStrikeForHolder(record.name, holderKey);
+                  }
+                }
+              } else {
+                const origin = await this.#probeHolderOrigin!(mirror, holder.service);
+                if (origin === "live") {
+                  this.#deadOriginStrikes.delete(record.name);
+                } else if (origin === "dead") {
+                  if (this.#recordDeadStrike(record.name, holderKey)) releaseReason = "origin-dead";
+                } else {
+                  this.#retainStrikeForHolder(record.name, holderKey);
+                }
+              }
+            }
+          } catch {
+            // parseStackRecord is intentionally shallow for compatibility;
+            // malformed nested starter/service/endpoint fields are contained
+            // per holder and follow the corrupt-mirror debounce policy.
+            if (this.#recordDeadStrike(record.name, holderKey)) releaseReason = "stack-dead";
+          }
+        }
+      } else {
+        this.#deadOriginStrikes.delete(record.name);
+      }
+      if (releaseReason === undefined && deadWaiters.length === 0) continue;
+      let released = false;
       const updated = await this.#locked(() =>
         updateSharedHostname(record.name, (candidate) => {
           const pruned: SharedHostnameRecord = {
             ...candidate,
             queue: (candidate.queue ?? []).filter(
-              (waiter) => readMirrorState(waiter.project) !== null,
+              (waiter) => {
+                if (!deadWaiterProjects.has(waiter.project)) return true;
+                const freshMirror = readMirrorStateSafe(waiter.project);
+                return freshMirror.status === "error" || freshMirror.record !== null;
+              },
             ),
           };
-          const currentHolderDead = pruned.holder !== undefined &&
-            !occupied.has(pruned.holder.project) &&
-            readMirrorState(pruned.holder.project) === null;
-          return currentHolderDead ? this.#grantNext(pruned) : pruned;
+          const holderMatches = releaseReason !== undefined &&
+            pruned.holder?.project === holder?.project &&
+            pruned.holder?.at === holder?.at;
+          if (!holderMatches) return pruned;
+          released = true;
+          return this.#grantNext(pruned);
         }),
       );
       if (updated === null) continue;
-      changed = true;
+      changed ||= released || deadWaiters.length > 0;
+      if (released && holder !== undefined && releaseReason !== undefined) {
+        releases.push({ name: record.name, project: holder.project, reason: releaseReason });
+        this.#deadOriginStrikes.delete(record.name);
+      }
       if (updated.holder !== undefined && updated.holder.project !== record.holder?.project) {
         this.#wake(updated.name, updated.holder.project, this.#result(updated, true));
       }
     }
     if (changed) await this.#notify();
+    return releases;
+  }
+
+  #recordDeadStrike(name: string, holderKey: string): boolean {
+    const previous = this.#deadOriginStrikes.get(name);
+    const strikes = previous?.holderKey === holderKey ? previous.strikes + 1 : 1;
+    this.#deadOriginStrikes.set(name, { holderKey, strikes });
+    return strikes >= ORIGIN_DEAD_RELEASE_STRIKES;
+  }
+
+  #retainStrikeForHolder(name: string, holderKey: string): void {
+    const previous = this.#deadOriginStrikes.get(name);
+    if (previous?.holderKey !== holderKey) {
+      this.#deadOriginStrikes.set(name, { holderKey, strikes: 0 });
+    }
   }
 }
