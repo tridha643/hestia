@@ -14,7 +14,7 @@ import {
 } from "../src/index.ts";
 import { startProc } from "../src/proc/supervisor.ts";
 import { stopProcTree } from "../src/proc/shutdown.ts";
-import { readPidfile } from "../src/proc/pidfile.ts";
+import { probeProcessIdentity, readPidfile } from "../src/proc/pidfile.ts";
 import { RotatingLogWriter } from "../src/proc/proc-relay.ts";
 
 const tmpDirs: string[] = [];
@@ -66,6 +66,13 @@ describe("detached spawn survives the spawning process (the Bun compat assumptio
 });
 
 describe("pidfile liveness (verbatim lstart guard)", () => {
+  test("tri-state identity distinguishes live processes from clean mismatches", () => {
+    const startTime = startTimeOf(process.pid)!;
+    expect(probeProcessIdentity({ pid: process.pid, startTime })).toBe("live");
+    expect(probeProcessIdentity({ pid: process.pid, startTime: "wrong start" })).toBe("dead");
+    expect(probeProcessIdentity({ pid: 999_999_999, startTime: "gone" })).toBe("dead");
+  });
+
   test("process identity stays stable across caller locales", () => {
     const originalLcAll = process.env.LC_ALL;
     const originalLang = process.env.LANG;

@@ -1,6 +1,7 @@
 import type { FleetLogRow } from "../fleet-log-rows.ts";
-import { fitFleetText, padFleetText } from "../fleet-text.ts";
+import { fitFleetText, fleetTextWidth, padFleetText } from "../fleet-text.ts";
 import { fleetTheme } from "../fleet-theme.ts";
+import { fleetMouseScrollDelta } from "../fleet-scroll.ts";
 
 /** Render only visible selected-service log rows; the host owns wrapping and offsets. */
 export function LogPane({
@@ -30,15 +31,21 @@ export function LogPane({
   const end = Math.max(0, rows.length - clamped);
   const start = Math.max(0, end - viewportRows);
   const visible = rows.slice(start, end);
-  const title = fitFleetText(`Logs — ${label}`, Math.max(8, width - 28));
+  const position = visible.length === 0 ? "0/0" : `${start + 1}–${end}/${rows.length}`;
+  const rawStatus = follow ? "following" : `paused · ${position}${unseen > 0 ? ` · ${unseen} new` : ""}`;
+  const headerWidth = Math.max(1, width - 4);
+  const status = fitFleetText(rawStatus, Math.max(1, headerWidth - Math.min(8, headerWidth - 1)));
+  const titleWidth = Math.max(0, headerWidth - fleetTextWidth(status));
+  const title = fitFleetText(`Logs — ${label}`, titleWidth);
 
   return (
     <box
       onMouseScroll={(event) => {
-        if (event.button !== 4 && event.button !== 5) return;
+        const delta = fleetMouseScrollDelta(event);
+        if (delta === undefined) return;
         event.preventDefault();
         event.stopPropagation();
-        onScroll?.(event.button === 4 ? -3 : 3);
+        onScroll?.(delta);
       }}
       style={{
         height: "100%",
@@ -51,10 +58,10 @@ export function LogPane({
     >
       <box style={{ height: 1, paddingLeft: 1, paddingRight: 1, flexDirection: "row", backgroundColor: fleetTheme.panelAlt }}>
         <text fg={focused ? fleetTheme.accent : fleetTheme.text}>
-          {padFleetText(title, Math.max(1, width - 24))}
+          {padFleetText(title, titleWidth)}
         </text>
         <text fg={follow ? fleetTheme.healthy : fleetTheme.warning}>
-          {follow ? "following" : `paused${unseen > 0 ? ` · ${unseen} new` : ""}`}
+          {status}
         </text>
       </box>
       {visible.length === 0 ? (

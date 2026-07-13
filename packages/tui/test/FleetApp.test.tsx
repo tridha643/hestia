@@ -375,7 +375,7 @@ describe("FleetApp", () => {
       await act(async () => {
         await setup.mockInput.typeText("f");
       });
-      await setup.waitForFrame((candidate) => candidate.includes("paused"));
+      await setup.waitForFrame((candidate) => candidate.includes("paused · 1–1/1"));
       await act(async () => {
         await setup.mockInput.typeText("G");
       });

@@ -113,15 +113,16 @@ diff --git a/dist/cli.js b/dist/cli.js
        if (autoSyncHosts) {
          syncHostsFile(cachedRoutes.map((r) => r.hostname));
        }
-@@ -4131,12 +4214,24 @@
+@@ -4131,12 +4214,25 @@
      console.warn(colors_default.yellow("fs.watch unavailable; falling back to polling for route changes"));
      pollingInterval = setInterval(reloadRoutes, POLL_INTERVAL_MS);
    }
 +  if (externalRoutesPath) {
 +    try {
-+      const externalBasename = path9.basename(externalRoutesPath);
-+      externalWatcher = fs9.watch(path9.dirname(externalRoutesPath), (_event, filename) => {
-+        if (filename && filename.toString() !== externalBasename) return;
++      // Hestia atomically publishes aliases through a temporary file rename.
++      // macOS may report only the temporary filename, so every event in this
++      // dedicated directory must schedule a reload of the canonical file.
++      externalWatcher = fs9.watch(path9.dirname(externalRoutesPath), () => {
 +        if (debounceTimer) clearTimeout(debounceTimer);
 +        debounceTimer = setTimeout(reloadRoutes, DEBOUNCE_MS);
 +      });
@@ -139,7 +140,7 @@ diff --git a/dist/cli.js b/dist/cli.js
      proxyPort,
      tld,
      tlds,
-@@ -4171,9 +4266,9 @@
+@@ -4171,9 +4267,9 @@
      redirectServer.on("error", () => {
        redirectServer = null;
      });
@@ -151,7 +152,7 @@ diff --git a/dist/cli.js b/dist/cli.js
      fs9.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
      fs9.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
      writeTlsMarker(store.dir, isTls);
-@@ -4215,10 +4310,12 @@
+@@ -4215,10 +4311,12 @@
      exiting = true;
      if (debounceTimer) clearTimeout(debounceTimer);
      if (pollingInterval) clearInterval(pollingInterval);

@@ -9,6 +9,8 @@ export class ReconnectLogDeduper {
   readonly #capacity: number;
   #history: Array<{ signature: string; line: LogLine }> = [];
   #reconnectBuffer: Array<{ signature: string; line: LogLine }> | null = null;
+  #reconnectCandidates: number[] | null = null;
+  #completedOverlap = 0;
 
   constructor(capacity = 50) {
     this.#capacity = capacity;
@@ -16,6 +18,8 @@ export class ReconnectLogDeduper {
 
   beginReconnect(): void {
     this.#reconnectBuffer = [];
+    this.#reconnectCandidates = null;
+    this.#completedOverlap = 0;
   }
 
   push(line: LogLine): LogLine[] {
@@ -26,26 +30,25 @@ export class ReconnectLogDeduper {
     }
     this.#reconnectBuffer.push(entry);
     const buffered = this.#reconnectBuffer;
-    const activeOverlapLengths: number[] = [];
-    const completedOverlapLengths: number[] = [];
-    for (let start = 0; start < this.#history.length; start += 1) {
-      const overlapLength = this.#history.length - start;
-      const compared = Math.min(buffered.length, overlapLength);
-      let matches = true;
-      for (let index = 0; index < compared; index += 1) {
-        if (buffered[index]!.signature !== this.#history[start + index]!.signature) {
-          matches = false;
-          break;
-        }
+    const index = buffered.length - 1;
+    const candidates = this.#reconnectCandidates ?? this.#history
+      .map((_candidate, start) => start)
+      .filter((start) => this.#history[start]!.signature === entry.signature);
+    const active = candidates.filter((start) => {
+      const historyIndex = start + index;
+      if (historyIndex >= this.#history.length) return false;
+      if (this.#history[historyIndex]!.signature !== entry.signature) return false;
+      if (historyIndex === this.#history.length - 1) {
+        this.#completedOverlap = Math.max(this.#completedOverlap, this.#history.length - start);
       }
-      if (!matches) continue;
-      if (buffered.length <= overlapLength) activeOverlapLengths.push(overlapLength);
-      if (buffered.length >= overlapLength) completedOverlapLengths.push(overlapLength);
-    }
-    if (activeOverlapLengths.length > 0) return [];
-    const suppressed = Math.max(0, ...completedOverlapLengths);
-    const fresh = buffered.slice(suppressed);
+      return true;
+    });
+    this.#reconnectCandidates = active;
+    if (active.length > 0) return [];
+    const fresh = buffered.slice(this.#completedOverlap);
     this.#reconnectBuffer = null;
+    this.#reconnectCandidates = null;
+    this.#completedOverlap = 0;
     this.#remember(fresh);
     return fresh.map((candidate) => candidate.line);
   }

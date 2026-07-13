@@ -15,15 +15,33 @@ import { generatePlist } from "../src/daemon/launchd.ts";
 import { readAdopted } from "../src/tunnel/registry.ts";
 import { daemonAuthHeaders } from "../src/daemon/client.ts";
 import { daemonDir } from "../src/daemon/slots.ts";
+import { resolveSweepIntervalMs } from "../src/daemon/duties.ts";
 
 let home: string;
 const savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "hestia-daemon-unit-"));
-  for (const k of ["HESTIA_HOME", "HESTIA_MAX_STACKS"]) savedEnv[k] = process.env[k];
+  for (const k of ["HESTIA_HOME", "HESTIA_MAX_STACKS", "HESTIA_SWEEP_INTERVAL_MS"]) savedEnv[k] = process.env[k];
   process.env.HESTIA_HOME = home;
   delete process.env.HESTIA_MAX_STACKS;
+  delete process.env.HESTIA_SWEEP_INTERVAL_MS;
+});
+
+describe("resolveSweepIntervalMs", () => {
+  test("accepts test cadences at 100ms or above", () => {
+    process.env.HESTIA_SWEEP_INTERVAL_MS = "500";
+    expect(resolveSweepIntervalMs()).toEqual({ intervalMs: 500, warnings: [] });
+  });
+
+  test("warns and falls back for malformed or unsafe cadences", () => {
+    for (const value of ["99", "2147483648"]) {
+      process.env.HESTIA_SWEEP_INTERVAL_MS = value;
+      const resolved = resolveSweepIntervalMs();
+      expect(resolved.intervalMs).toBe(15_000);
+      expect(resolved.warnings[0]).toContain("invalid HESTIA_SWEEP_INTERVAL_MS");
+    }
+  });
 });
 
 afterEach(() => {
@@ -216,6 +234,15 @@ describe("daemon client authentication", () => {
 });
 
 describe("Admission", () => {
+  test("pump refreshes cached occupancy even with no admission waiters", async () => {
+    writeMirror("live-a", {});
+    writeMirrorPidfile("live-a", "web", true);
+    const admission = new Admission(new SlotLedger());
+    expect(admission.healthSnapshot().live).toEqual([]);
+    await admission.pump();
+    expect(admission.healthSnapshot().live).toEqual(["live-a"]);
+  });
+
   test("grants under cap, fail-fast at cap, no-op re-grant for live project", async () => {
     process.env.HESTIA_MAX_STACKS = "1";
     const adm = new Admission(new SlotLedger(noDocker));

@@ -366,6 +366,16 @@ describe("hestiad local HTTP router", () => {
       expect((await get("/stripe/hooks")).status).toBe(503);
       // a path no handle covers is 404
       expect((await get("/other")).status).toBe(404);
+
+      record.services[0]!.pid = 999_999;
+      record.services[0]!.startTime = "dead shared origin";
+      writeState(worktree, record);
+      await router.refreshRoutes();
+      const unavailable = await get("/slack/events");
+      expect(unavailable.status).toBe(503);
+      expect((await unavailable.text()).trim()).toBe(
+        `Hestia route origin unavailable — held by ${record.project}`,
+      );
     } finally {
       await new Promise<void>((resolve) => origin.close(() => resolve()));
       router.stop();

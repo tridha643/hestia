@@ -1,6 +1,7 @@
 import { memo } from "react";
 import type { FleetServiceView, FleetStackView } from "@hestia/core";
-import { endpointReach, serviceEndpoints } from "../fleet-endpoints.ts";
+import { endpointReach } from "../fleet-endpoints.ts";
+import { buildFleetServiceRows } from "../fleet-service-rows.ts";
 import { fitFleetText, padFleetText } from "../fleet-text.ts";
 import {
   backendColor,
@@ -9,6 +10,7 @@ import {
   serviceStateGlyph,
 } from "../fleet-theme.ts";
 import { sanitizeFleetTerminalText } from "../terminal-text.ts";
+import { fleetMouseScrollDelta } from "../fleet-scroll.ts";
 
 function portLabel(service: FleetServiceView): string {
   if (service.publishedPort === undefined) return "—";
@@ -21,19 +23,25 @@ export const ServicePane = memo(function ServicePane({
   uptime,
   selectedService,
   selectedEndpoint,
+  offset = 0,
+  viewportRows = 1,
   width = 80,
   focused = false,
   onSelectService,
   onSelectEndpoint,
+  onScroll,
 }: {
   stack?: FleetStackView;
   uptime?: string;
   selectedService?: string;
   selectedEndpoint?: string;
+  offset?: number;
+  viewportRows?: number;
   width?: number;
   focused?: boolean;
   onSelectService?: (service: string) => void;
   onSelectEndpoint?: (service: string, endpoint: string) => void;
+  onScroll?: (delta: number) => void;
 }) {
   const nameWidth = Math.min(24, Math.max(12, Math.floor(width * 0.28)));
   const backendWidth = 10;
@@ -45,9 +53,28 @@ export const ServicePane = memo(function ServicePane({
   const warning = stack?.warning === undefined
     ? undefined
     : sanitizeFleetTerminalText(stack.warning);
+  const rows = buildFleetServiceRows(stack);
+  const maxOffset = Math.max(0, rows.length - viewportRows);
+  const clampedOffset = Math.min(maxOffset, Math.max(0, offset));
+  const visibleRows = rows.slice(clampedOffset, clampedOffset + viewportRows);
+  const hiddenAbove = clampedOffset;
+  const hiddenBelow = Math.max(0, rows.length - clampedOffset - visibleRows.length);
+
+  const overflowIndicator = (index: number): string | undefined => {
+    const first = index === 0 && hiddenAbove > 0 ? `↑ ${hiddenAbove} more` : undefined;
+    const last = index === visibleRows.length - 1 && hiddenBelow > 0 ? `↓ ${hiddenBelow} more` : undefined;
+    return [first, last].filter(Boolean).join(" · ") || undefined;
+  };
 
   return (
     <box
+      onMouseScroll={(event) => {
+        const delta = fleetMouseScrollDelta(event);
+        if (delta === undefined) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onScroll?.(delta);
+      }}
       style={{
         height: "100%",
         width: "100%",
@@ -77,12 +104,13 @@ export const ServicePane = memo(function ServicePane({
             <text fg={fleetTheme.faint}>{padFleetText("STATE", stateWidth)}</text>
             <text fg={fleetTheme.faint}>{padFleetText("PORT", portWidth)}</text>
           </box>
-          {stack.services.flatMap((service) => {
+          {visibleRows.map((row, visibleIndex) => {
+            const service = row.service;
             const workloadSelected = service.name === selectedService && selectedEndpoint === undefined;
-            const endpoints = serviceEndpoints(service);
             const state = sanitizeFleetTerminalText(service.state);
             const workloadBg = workloadSelected ? fleetTheme.selectedBg : fleetTheme.background;
-            const workloadRow = (
+            const indicator = overflowIndicator(visibleIndex);
+            if (row.kind === "workload") return (
               <box
                 key={`workload:${service.name}`}
                 onMouseDown={(event) => {
@@ -109,41 +137,42 @@ export const ServicePane = memo(function ServicePane({
                 <text fg={fleetTheme.muted}>
                   {padFleetText(portLabel(service), portWidth)}
                 </text>
+                {indicator === undefined ? null : <text fg={fleetTheme.faint}>{indicator}</text>}
               </box>
             );
-            const endpointRows = endpoints.map((endpoint, index) => {
-              const endpointSelected = service.name === selectedService && endpoint.name === selectedEndpoint;
-              const connector = index === endpoints.length - 1 ? "└─" : "├─";
-              const kind = (endpoint.kind ?? "http").toUpperCase();
-              const reach = sanitizeFleetTerminalText(endpointReach(endpoint));
-              const aliasWidth = Math.min(18, Math.max(10, Math.floor(width * 0.22)));
-              const pub = endpoint.publicUrl === undefined ? "" : " pub";
-              const endpointBg = endpointSelected ? fleetTheme.selectedBg : fleetTheme.background;
-              return (
-                <box
-                  key={`endpoint:${service.name}:${endpoint.name}`}
-                  onMouseDown={(event) => {
-                    if (event.button !== 0) return;
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onSelectEndpoint?.(service.name, endpoint.name);
-                  }}
-                  style={{ height: 1, paddingRight: 1, flexDirection: "row", backgroundColor: endpointBg }}
-                >
-                  <text fg={fleetTheme.stripe}>{endpointSelected ? "▎" : " "}</text>
-                  <text fg={fleetTheme.faint}>{`  ${connector} `}</text>
-                  <text fg={endpointSelected ? fleetTheme.bright : fleetTheme.accent}>
-                    {padFleetText(sanitizeFleetTerminalText(endpoint.name), aliasWidth)}
-                  </text>
-                  <text fg={fleetTheme.muted}>{padFleetText(kind, 6)}</text>
-                  <text fg={fleetTheme.text}>
-                    {fitFleetText(reach, Math.max(12, width - aliasWidth - 19 - pub.length))}
-                  </text>
-                  <text fg={fleetTheme.publicBadge}>{pub}</text>
-                </box>
-              );
-            });
-            return [workloadRow, ...endpointRows];
+            const endpoint = row.endpoint;
+            const endpointSelected = service.name === selectedService && endpoint.name === selectedEndpoint;
+            const endpointCount = service.endpoints?.length ?? (service.endpoint === undefined ? 0 : 1);
+            const connector = row.endpointIndex === endpointCount - 1 ? "└─" : "├─";
+            const kind = (endpoint.kind ?? "http").toUpperCase();
+            const reach = sanitizeFleetTerminalText(endpointReach(endpoint));
+            const aliasWidth = Math.min(18, Math.max(10, Math.floor(width * 0.22)));
+            const pub = endpoint.publicUrl === undefined ? "" : " pub";
+            const endpointBg = endpointSelected ? fleetTheme.selectedBg : fleetTheme.background;
+            return (
+              <box
+                key={`endpoint:${service.name}:${endpoint.name}`}
+                onMouseDown={(event) => {
+                  if (event.button !== 0) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onSelectEndpoint?.(service.name, endpoint.name);
+                }}
+                style={{ height: 1, paddingRight: 1, flexDirection: "row", backgroundColor: endpointBg }}
+              >
+                <text fg={fleetTheme.stripe}>{endpointSelected ? "▎" : " "}</text>
+                <text fg={fleetTheme.faint}>{`  ${connector} `}</text>
+                <text fg={endpointSelected ? fleetTheme.bright : fleetTheme.accent}>
+                  {padFleetText(sanitizeFleetTerminalText(endpoint.name), aliasWidth)}
+                </text>
+                <text fg={fleetTheme.muted}>{padFleetText(kind, 6)}</text>
+                <text fg={fleetTheme.text}>
+                  {fitFleetText(reach, Math.max(12, width - aliasWidth - 19 - pub.length))}
+                </text>
+                <text fg={fleetTheme.publicBadge}>{pub}</text>
+                {indicator === undefined ? null : <text fg={fleetTheme.faint}>{indicator}</text>}
+              </box>
+            );
           })}
         </>
       ) : (

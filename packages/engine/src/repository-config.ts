@@ -12,6 +12,8 @@ export interface ConfiguredEndpoint {
   local?: boolean;
 }
 
+export type ConfiguredEnvironmentValue = string | { file: string };
+
 export interface ConfiguredWorkload {
   source: WorkloadSource;
   composeService?: string;
@@ -19,6 +21,10 @@ export interface ConfiguredWorkload {
   command?: string[];
   wranglerConfig?: string;
   port?: "auto" | "none";
+  cwd?: string;
+  varlock?: boolean;
+  healthPath?: string;
+  env: Record<string, ConfiguredEnvironmentValue>;
   endpoints: Record<string, ConfiguredEndpoint>;
 }
 
@@ -35,6 +41,26 @@ export interface ConfigLayerReadResult {
 
 const WORKLOAD_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const BINDING = /^(?:main|[1-9][0-9]{0,4})\/(?:tcp|udp)$/;
+const ENVIRONMENT_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function parseEnvironment(value: unknown, path: string): Record<string, ConfiguredEnvironmentValue> {
+  if (value === undefined) return {};
+  const environment: Record<string, ConfiguredEnvironmentValue> = {};
+  for (const [name, rawValue] of Object.entries(table(value, path))) {
+    if (!ENVIRONMENT_KEY.test(name)) throw new Error(`${path} has invalid environment key ${JSON.stringify(name)}`);
+    if (typeof rawValue === "string") {
+      environment[name] = rawValue;
+      continue;
+    }
+    const fileValue = table(rawValue, `${path}.${name}`);
+    knownKeys(fileValue, ["file"], `${path}.${name}`);
+    if (typeof fileValue.file !== "string" || !/^\.hestia\//.test(fileValue.file) || fileValue.file.includes("..")) {
+      throw new Error(`${path}.${name}.file must be a path below .hestia/`);
+    }
+    environment[name] = { file: fileValue.file };
+  }
+  return environment;
+}
 
 function emptyConfig(): RepositoryWorkloadConfig {
   return { version: 1, workloads: {} };
@@ -97,7 +123,10 @@ export function parseRepositoryWorkloadConfig(source: string, path: string): Rep
       const workload = table(rawWorkload, `workloads.${name}`);
       knownKeys(
         workload,
-        ["source", "compose_service", "dockerfile", "command", "wrangler_config", "port", "endpoints"],
+        [
+          "source", "compose_service", "dockerfile", "command", "wrangler_config", "port", "cwd", "varlock",
+          "health_path", "env", "endpoints",
+        ],
         `workloads.${name}`,
       );
       if (!(["compose", "dockerfile", "proc", "wrangler"] as unknown[]).includes(workload.source)) {
@@ -116,6 +145,19 @@ export function parseRepositoryWorkloadConfig(source: string, path: string): Rep
           throw new Error(`workloads.${name}.${key} must be a string`);
         }
       }
+      if (workload.cwd !== undefined && typeof workload.cwd !== "string") {
+        throw new Error(`workloads.${name}.cwd must be a string`);
+      }
+      if (workload.varlock !== undefined && typeof workload.varlock !== "boolean") {
+        throw new Error(`workloads.${name}.varlock must be a boolean`);
+      }
+      if (workload.health_path !== undefined &&
+        (typeof workload.health_path !== "string" || !workload.health_path.startsWith("/"))) {
+        throw new Error(`workloads.${name}.health_path must start with /`);
+      }
+      if (workload.health_path !== undefined && workload.port === "none") {
+        throw new Error(`workloads.${name}.health_path requires a port`);
+      }
       if (sourceKind === "compose" && typeof workload.compose_service !== "string") {
         throw new Error(`workloads.${name}.compose_service is required for compose`);
       }
@@ -129,6 +171,10 @@ export function parseRepositoryWorkloadConfig(source: string, path: string): Rep
         command: workload.command as string[] | undefined,
         wranglerConfig: workload.wrangler_config as string | undefined,
         port: workload.port as "auto" | "none" | undefined,
+        cwd: workload.cwd as string | undefined,
+        varlock: workload.varlock as boolean | undefined,
+        healthPath: workload.health_path as string | undefined,
+        env: parseEnvironment(workload.env, `workloads.${name}.env`),
         endpoints: parseEndpoints(workload.endpoints, `workloads.${name}.endpoints`),
       };
     }
@@ -172,6 +218,14 @@ export function renderRepositoryWorkloadConfig(config: RepositoryWorkloadConfig)
     if (workload.command !== undefined) lines.push(`command = [${workload.command.map(quote).join(", ")}]`);
     if (workload.wranglerConfig !== undefined) lines.push(`wrangler_config = ${quote(workload.wranglerConfig)}`);
     if (workload.port !== undefined) lines.push(`port = ${quote(workload.port)}`);
+    if (workload.cwd !== undefined) lines.push(`cwd = ${quote(workload.cwd)}`);
+    if (workload.varlock !== undefined) lines.push(`varlock = ${workload.varlock}`);
+    if (workload.healthPath !== undefined) lines.push(`health_path = ${quote(workload.healthPath)}`);
+    for (const key of Object.keys(workload.env).sort()) {
+      const value = workload.env[key]!;
+      const rendered = typeof value === "string" ? quote(value) : `{ file = ${quote(value.file)} }`;
+      lines.push(`env.${quote(key)} = ${rendered}`);
+    }
     lines.push("");
     for (const alias of Object.keys(workload.endpoints).sort()) {
       const endpoint = workload.endpoints[alias]!;

@@ -15,6 +15,8 @@ import {
 } from "@hestia/engine";
 import { ReconnectLogDeduper } from "./log-reconnect-deduper.ts";
 
+const FLEET_LOG_BACKFILL_LINES = 1_000;
+
 function isFleetEnvelope(value: unknown): value is FleetEnvelope {
   if (typeof value !== "object" || value === null) return false;
   const frame = value as Partial<FleetEnvelope>;
@@ -93,7 +95,7 @@ export class DaemonFleetSource {
   ): AsyncGenerator<LogLine> {
     let attempt = 0;
     let connectedBefore = false;
-    const deduper = new ReconnectLogDeduper(50);
+    const deduper = new ReconnectLogDeduper(FLEET_LOG_BACKFILL_LINES);
     while (!signal.aborted && !this.#lifetime.signal.aborted) {
       const connectedAt = Date.now();
       try {
@@ -102,7 +104,13 @@ export class DaemonFleetSource {
           deduper.beginReconnect();
         }
         connectedBefore = true;
-        for await (const line of streamDaemonServiceLogs(daemon.port, project, service, 50, signal)) {
+        for await (const line of streamDaemonServiceLogs(
+          daemon.port,
+          project,
+          service,
+          FLEET_LOG_BACKFILL_LINES,
+          signal,
+        )) {
           if (!isLogLine(line)) throw new Error("log protocol frame is invalid");
           for (const freshLine of deduper.push(line)) yield freshLine;
         }

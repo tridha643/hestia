@@ -24,7 +24,7 @@ interface PsRow {
   ppid: number;
 }
 
-function psSnapshot(): PsRow[] {
+function tryPsSnapshot(): PsRow[] | null {
   try {
     const out = execFileSync("ps", ["-A", "-o", "pid=,pgid=,ppid="], {
       encoding: "utf8",
@@ -37,17 +37,11 @@ function psSnapshot(): PsRow[] {
     }
     return rows;
   } catch {
-    return [];
+    return null;
   }
 }
 
-/**
- * The spawned root plus every live descendant, with pgids. Membership is
- * ancestry, NOT process group: env-resolver wrappers (varlock's runner) put
- * their child in a fresh group, so the group id alone loses the subtree.
- */
-export function processTree(rootPid: number): PsRow[] {
-  const rows = psSnapshot();
+function processTreeFromSnapshot(rootPid: number, rows: PsRow[]): PsRow[] {
   const byParent = new Map<number, PsRow[]>();
   for (const r of rows) {
     const list = byParent.get(r.ppid) ?? [];
@@ -66,6 +60,15 @@ export function processTree(rootPid: number): PsRow[] {
     for (const child of byParent.get(pid) ?? []) queue.push(child.pid);
   }
   return tree;
+}
+
+/**
+ * The spawned root plus every live descendant, with pgids. Membership is
+ * ancestry, NOT process group: env-resolver wrappers (varlock's runner) put
+ * their child in a fresh group, so the group id alone loses the subtree.
+ */
+export function processTree(rootPid: number): PsRow[] {
+  return processTreeFromSnapshot(rootPid, tryPsSnapshot() ?? []);
 }
 
 export interface Listener {
@@ -113,13 +116,15 @@ export async function allListeners(): Promise<Listener[]> {
       tool = "lsof";
       return parseLsof(stdout);
     } catch (err) {
-      const e = err as { code?: string; stdout?: string };
+      const e = err as { code?: string | number; stdout?: string; stderr?: string };
       // lsof exits 1 when nothing matches but still prints what it found
-      if (typeof e.stdout === "string" && e.code !== "ENOENT") {
+      if (typeof e.stdout === "string" && e.code === 1 && (e.stderr ?? "").trim() === "") {
         tool = "lsof";
         return parseLsof(e.stdout);
       }
-      if (tool === "lsof") return [];
+      // ENOENT falls through to ss. Every other lsof failure is unknown,
+      // never equivalent to a clean scan with no listeners.
+      if (e.code !== "ENOENT") throw err;
     }
   }
   try {
@@ -128,7 +133,8 @@ export async function allListeners(): Promise<Listener[]> {
     });
     tool = "ss";
     return parseSs(stdout);
-  } catch {
+  } catch (error) {
+    if ((error as { code?: string }).code !== "ENOENT") throw error;
     throw new HestiaError(
       "ownership-tool-missing",
       "neither lsof nor ss is available — cannot verify port ownership " +
@@ -162,14 +168,18 @@ export async function inspectPort(
   rootPid: number,
   port: number,
 ): Promise<PortView> {
-  const members = new Set(processTree(rootPid).map((r) => r.pid));
+  const firstSnapshot = tryPsSnapshot();
+  if (firstSnapshot === null) throw new Error("Port ownership process-tree inspection failed: ps unavailable");
+  const members = new Set(processTreeFromSnapshot(rootPid, firstSnapshot).map((r) => r.pid));
   const listeners = await allListeners();
   const owner = listeners.find((l) => l.port === port);
   // A freshly spawned relay can fork the target between the ps snapshot and
   // lsof. Re-snapshot before declaring a listener foreign; a false steal
   // would kill a correctly bound dev server and churn through all retries.
   if (owner !== undefined && !members.has(owner.pid)) {
-    for (const member of processTree(rootPid)) members.add(member.pid);
+    const secondSnapshot = tryPsSnapshot();
+    if (secondSnapshot === null) throw new Error("Port ownership process-tree recheck failed: ps unavailable");
+    for (const member of processTreeFromSnapshot(rootPid, secondSnapshot)) members.add(member.pid);
   }
   return {
     owner,

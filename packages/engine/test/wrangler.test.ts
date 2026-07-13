@@ -123,6 +123,27 @@ describe("planWorkers resource mode", () => {
     });
 
     expect(plan.specs[0]?.argv).toContain("--local");
+    expect(plan.specs[0]?.cwd).toBe("apps/ingest");
+  });
+
+  test("enables Varlock from the worker config directory", async () => {
+    const root = fixtureTree();
+    const wrangler = join(root, "node_modules", ".bin", "wrangler");
+    const varlock = join(root, "node_modules", ".bin", "varlock");
+    mkdirSync(join(wrangler, ".."), { recursive: true });
+    writeFileSync(wrangler, "#!/bin/sh\n");
+    writeFileSync(varlock, "#!/bin/sh\n");
+    writeFileSync(join(root, "apps", "ingest", ".env.schema"), "APP_ENV=development\n");
+
+    const plan = await planWorkers(root, {
+      filter: ["modem-ingest"],
+      allowRemote: false,
+      force: true,
+      varlock: true,
+    });
+
+    expect(plan.specs[0]?.varlock).toBe(true);
+    expect(plan.specs[0]?.cwd).toBe("apps/ingest");
   });
 
   test("permits declared remote bindings only after explicit opt-in", async () => {

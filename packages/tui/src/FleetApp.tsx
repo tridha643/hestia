@@ -19,6 +19,10 @@ import {
   isEnterKey,
   isEscapeKey,
   isFollowBottomKey,
+  isHalfPageDownKey,
+  isHalfPageUpKey,
+  isPageDownKey,
+  isPageUpKey,
   isPlainKey,
   isScrollTopKey,
   isShiftedKey,
@@ -31,6 +35,12 @@ import {
   stackSidebarHeight,
 } from "./fleet-layout.ts";
 import { buildFleetLogRows } from "./fleet-log-rows.ts";
+import {
+  buildFleetServiceRows,
+  ensureFleetServiceRowVisible,
+  fleetServiceRowCount,
+  selectedFleetServiceRowIndex,
+} from "./fleet-service-rows.ts";
 import { endpointReach, serviceEndpoints } from "./fleet-endpoints.ts";
 import { buildEnvBlock, formatUptime } from "./fleet-format.ts";
 import { FLEET_KEY_HINTS, fleetCapacitySummary, resolveStatusNotice } from "./fleet-status.ts";
@@ -48,7 +58,8 @@ const HELP_ROWS: Array<[keys: string, action: string]> = [
   ["j k ↑↓", "move in focused pane · Tab cycles panes"],
   [", . [ ]", "previous / next stack · service"],
   ["/", "filter stacks (Esc clears, then exits)"],
-  ["f · g G", "pause/resume follow · top / bottom of logs"],
+  ["f · g G · PgUp PgDn", "follow · top / bottom · page logs"],
+  ["^U ^D", "scroll logs by half a page"],
   ["o", "open selected endpoint in browser"],
   ["y · Y", "yank endpoint URL · stack env block"],
   ["c l p", "yank direct / local / public URL"],
@@ -84,11 +95,6 @@ function emptySnapshot(repoId: RepoId): FleetSnapshot {
 
 function selectedStack(snapshot: FleetSnapshot, project?: string): FleetStackView | undefined {
   return snapshot.stacks.find((stack) => stack.project === project);
-}
-
-function fleetServiceRowCount(stack: FleetStackView | undefined): number {
-  return stack?.services.reduce((count, service) =>
-    count + 1 + serviceEndpoints(service).length, 0) ?? 0;
 }
 
 function selectedFleetEndpoint(
@@ -299,6 +305,20 @@ export function FleetApp({
   const svcRows = fleetServiceRowCount(stack) + warningRows;
   const stackedSidebarHeight = stackSidebarHeight(stacks.length);
   const svcPaneH = servicePaneHeight(svcRows, effectiveLayout === "split" ? 14 : 12);
+  const serviceViewportRows = Math.max(1, svcPaneH - 4 - warningRows);
+  const serviceRows = useMemo(() => buildFleetServiceRows(stack), [stack]);
+  const maxServiceOffset = Math.max(0, serviceRows.length - serviceViewportRows);
+  const selectedServiceRowIndex = selectedFleetServiceRowIndex(
+    serviceRows,
+    state.selection.service,
+    state.selection.endpoint,
+  );
+  const effectiveServiceOffset = ensureFleetServiceRowVisible(
+    state.serviceOffset,
+    state.serviceOffsetManual ? -1 : selectedServiceRowIndex,
+    serviceViewportRows,
+    serviceRows.length,
+  );
   const logHeight = Math.max(
     5,
     terminal.height - headerRows - contextRows - footerRows - svcPaneH -
@@ -486,6 +506,21 @@ export function FleetApp({
     if (isScrollTopKey(key)) {
       return dispatch({ type: "scroll-logs", delta: -logRows.length, maxOffset: maxLogOffset });
     }
+    if (current.focus === "logs") {
+      if (isPageUpKey(key)) {
+        return dispatch({ type: "scroll-logs", delta: -logViewportRows, maxOffset: maxLogOffset });
+      }
+      if (isPageDownKey(key)) {
+        return dispatch({ type: "scroll-logs", delta: logViewportRows, maxOffset: maxLogOffset });
+      }
+      const halfPageRows = Math.max(1, Math.floor(logViewportRows / 2));
+      if (isHalfPageUpKey(key)) {
+        return dispatch({ type: "scroll-logs", delta: -halfPageRows, maxOffset: maxLogOffset });
+      }
+      if (isHalfPageDownKey(key)) {
+        return dispatch({ type: "scroll-logs", delta: halfPageRows, maxOffset: maxLogOffset });
+      }
+    }
     if (isDoctorKey(key)) {
       if (doctorRunning) return;
       dispatch({ type: "doctor", open: true });
@@ -572,10 +607,17 @@ export function FleetApp({
       uptime={uptime}
       selectedService={state.selection.service}
       selectedEndpoint={state.selection.endpoint}
+      offset={effectiveServiceOffset}
+      viewportRows={serviceViewportRows}
       width={logWidth}
       focused={state.focus === "services"}
       onSelectService={onSelectService}
       onSelectEndpoint={onSelectEndpoint}
+      onScroll={(delta) => dispatch({
+        type: "scroll-services",
+        delta: delta + effectiveServiceOffset - state.serviceOffset,
+        maxOffset: maxServiceOffset,
+      })}
     />
   );
   const sidebar = (width: number) => (

@@ -46,6 +46,16 @@ at `~/.hestia/repositories/<repoId>.toml`, optional committed `hestia.toml`,
 then automatic discovery. Conflicts fail rather than silently overriding a
 workload source. `.hestia/` must remain ignored.
 
+Configured proc and Wrangler workloads may declare environment values. Literal
+`${endpoint:<alias>.host}`, `${endpoint:<alias>.port}`, and
+`${endpoint:<alias>.url}` references resolve only after the producing workload
+is ready, while `{port}` resolves to the receiving process's own assigned
+port. A value shaped as `{ file = ".hestia/..." }` reads ignored local
+material into memory; Hestia refuses file inputs outside `.hestia/` and never
+persists their contents. Use `cwd` to select a package-local `.env.schema`,
+`varlock = true` to compose that package's resolver, and `health_path` when
+port ownership alone doesn't prove that the application compiled successfully.
+
 ## Run and consume structured endpoints
 
 ```bash

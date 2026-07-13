@@ -17,6 +17,9 @@ export interface FleetUiState {
   layout: FleetLayoutMode;
   filter: string;
   follow: boolean;
+  serviceOffset: number;
+  /** Explicit pane scrolling may move the selected workload row off-screen. */
+  serviceOffsetManual: boolean;
   logOffset: number;
   unseenLines: number;
   helpOpen: boolean;
@@ -38,6 +41,7 @@ export type FleetUiAction =
   | { type: "layout"; layout: FleetLayoutMode }
   | { type: "filter"; filter: string; snapshot?: FleetSnapshot }
   | { type: "follow"; follow: boolean }
+  | { type: "scroll-services"; delta: number; maxOffset: number }
   | { type: "scroll-logs"; delta: number; maxOffset?: number }
   | { type: "new-lines"; count: number; maxOffset?: number }
   | { type: "help"; open: boolean }
@@ -55,6 +59,8 @@ export function createFleetUiState(): FleetUiState {
     layout: "auto",
     filter: "",
     follow: true,
+    serviceOffset: 0,
+    serviceOffsetManual: false,
     logOffset: 0,
     unseenLines: 0,
     helpOpen: false,
@@ -115,9 +121,14 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
       const visibleSnapshot = state.filter === ""
         ? action.snapshot
         : { ...action.snapshot, stacks: visibleFleetStacks(action.snapshot, state.filter) };
+      const selection = reconcileFleetSelection(state.selection, visibleSnapshot, action.preferredProject);
+      const selectionChanged = selection.project !== state.selection.project ||
+        selection.service !== state.selection.service || selection.endpoint !== state.selection.endpoint;
       return {
         ...state,
-        selection: reconcileFleetSelection(state.selection, visibleSnapshot, action.preferredProject),
+        selection,
+        serviceOffset: selection.project === state.selection.project ? state.serviceOffset : 0,
+        serviceOffsetManual: selectionChanged ? false : state.serviceOffsetManual,
       };
     case "move-stack": {
       const stacks = visibleFleetStacks(action.snapshot, state.filter);
@@ -132,6 +143,8 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
               service: stack.services[0]?.name,
               endpoint: undefined,
             },
+            serviceOffset: 0,
+            serviceOffsetManual: false,
             follow: true,
             logOffset: 0,
             unseenLines: 0,
@@ -151,6 +164,7 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
               service: service.name,
               endpoint: undefined,
             },
+            serviceOffsetManual: false,
             follow: true,
             logOffset: 0,
             unseenLines: 0,
@@ -168,6 +182,8 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
           service: stack.services[0]?.name,
           endpoint: undefined,
         },
+        serviceOffset: 0,
+        serviceOffsetManual: false,
         follow: true,
         logOffset: 0,
         unseenLines: 0,
@@ -186,6 +202,7 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
           service: action.service,
           endpoint: undefined,
         },
+        serviceOffsetManual: false,
         follow: true,
         logOffset: 0,
         unseenLines: 0,
@@ -202,6 +219,7 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
         ...state,
         focus: "services",
         selection: { ...state.selection, service: action.service, endpoint: action.endpoint },
+        serviceOffsetManual: false,
       };
     }
     case "focus": return { ...state, focus: action.focus };
@@ -212,10 +230,15 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
         ...action.snapshot,
         stacks: visibleFleetStacks(action.snapshot, action.filter),
       };
+      const selection = reconcileFleetSelection(state.selection, visibleSnapshot);
+      const selectionChanged = selection.project !== state.selection.project ||
+        selection.service !== state.selection.service || selection.endpoint !== state.selection.endpoint;
       return {
         ...state,
         filter: action.filter,
-        selection: reconcileFleetSelection(state.selection, visibleSnapshot),
+        selection,
+        serviceOffset: selection.project === state.selection.project ? state.serviceOffset : 0,
+        serviceOffsetManual: selectionChanged ? false : state.serviceOffsetManual,
       };
     }
     case "follow": return {
@@ -223,6 +246,14 @@ export function reduceFleetUiState(state: FleetUiState, action: FleetUiAction): 
       follow: action.follow,
       logOffset: action.follow ? 0 : state.logOffset,
       unseenLines: action.follow ? 0 : state.unseenLines,
+    };
+    case "scroll-services": return {
+      ...state,
+      serviceOffset: Math.min(
+        action.maxOffset,
+        Math.max(0, state.serviceOffset + action.delta),
+      ),
+      serviceOffsetManual: true,
     };
     case "scroll-logs": {
       const offset = Math.min(

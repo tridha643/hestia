@@ -119,7 +119,7 @@ export async function startProc(
   const cwd = spec.cwd ? join(worktreeRoot, spec.cwd) : worktreeRoot;
   const wantPort = spec.port !== "none";
   const readyTimeoutMs = spec.readyTimeoutMs ?? READY_TIMEOUT_MS;
-  const varlockBin = spec.varlock ? requireVarlock(worktreeRoot) : null;
+  const varlockBin = spec.varlock ? requireVarlock(worktreeRoot, cwd) : null;
 
   let lastFailure = "";
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -127,13 +127,19 @@ export async function startProc(
     let argv = port === undefined ? spec.argv : substitutePort(spec.argv, port);
     if (varlockBin !== null) argv = wrapWithVarlock(varlockBin, argv);
 
+    const resolvedSpecEnvironment = port === undefined
+      ? spec.env
+      : Object.fromEntries(Object.entries(spec.env ?? {}).map(([name, value]) => [
+        name,
+        substitutePort([value], port)[0]!,
+      ]));
     const env: Record<string, string | undefined> = {
       ...process.env,
       ...stackEnv,
       ...(port !== undefined
         ? { PORT: String(port), [`HESTIA_${envKey(spec.name)}_PORT`]: String(port) }
         : {}),
-      ...spec.env,
+      ...resolvedSpecEnvironment,
     };
 
     const pid = await spawnOnce(argv, cwd, env, logPath, attempt);
@@ -157,7 +163,7 @@ export async function startProc(
     writePidfile(worktreeRoot, pf);
     mirrorPidfile?.(pf);
 
-    const outcome = await waitUntilReady(pf, port, readyTimeoutMs);
+    const outcome = await waitUntilReady(pf, port, readyTimeoutMs, spec.healthPath);
     const record: ServiceRecord = {
       name: spec.name,
       backend: pf.backend,
@@ -206,8 +212,9 @@ export async function startProc(
         continue;
       case "timeout": {
         record.state = "unhealthy";
-        const bound =
-          outcome.memberPorts.length > 0
+        const bound = outcome.healthPending
+          ? `it owned port ${port}, but ${spec.healthPath} never returned a 2xx response`
+          : outcome.memberPorts.length > 0
             ? `it is listening on port(s) ${outcome.memberPorts.join(", ")} instead`
             : `it never opened a listening socket (if it isn't a server, use --no-port)`;
         return {
@@ -232,12 +239,13 @@ type ReadyOutcome =
   | { kind: "ready" }
   | { kind: "exited" }
   | { kind: "stolen"; byPid: number }
-  | { kind: "timeout"; memberPorts: number[] };
+  | { kind: "timeout"; memberPorts: number[]; healthPending: boolean };
 
 async function waitUntilReady(
   pf: Pidfile,
   port: number | undefined,
   timeoutMs: number,
+  healthPath?: string,
 ): Promise<ReadyOutcome> {
   const deadline = Date.now() + timeoutMs;
 
@@ -248,15 +256,29 @@ async function waitUntilReady(
   }
 
   let memberPorts: number[] = [];
+  let ownershipProven = false;
   while (Date.now() < deadline) {
     if (!isLive(pf)) return { kind: "exited" };
-    const view = await inspectPort(pf.pgid, port);
-    memberPorts = view.memberPorts;
-    if (view.ownerIsMember) return { kind: "ready" };
-    if (view.owner !== undefined) {
-      return { kind: "stolen", byPid: view.owner.pid };
+    if (!ownershipProven) {
+      const view = await inspectPort(pf.pgid, port);
+      memberPorts = view.memberPorts;
+      if (view.ownerIsMember) ownershipProven = true;
+      else if (view.owner !== undefined) return { kind: "stolen", byPid: view.owner.pid };
+    }
+    if (ownershipProven) {
+      if (healthPath === undefined) return { kind: "ready" };
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${healthPath}`);
+        if (response.ok) return { kind: "ready" };
+      } catch {
+        // The listener can precede application readiness; keep polling.
+      }
     }
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
-  return { kind: "timeout", memberPorts };
+  return {
+    kind: "timeout",
+    memberPorts,
+    healthPending: healthPath !== undefined && ownershipProven,
+  };
 }
